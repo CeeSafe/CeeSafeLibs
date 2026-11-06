@@ -1,29 +1,7 @@
 // Public-key signatures through OpenSSL 3, for DKIM: RSA with SHA-256 (PKCS #1 v1.5) and Ed25519. Verifying
 // (`Signatures`), and signing with keys made or imported here (`Keys`, `PrivateKey`).
 
-extern "C" {
-    @effects()
-    fn pks_verify_rsa_sha256(
-        key: *u8,
-        keyLength: usize,
-        data: *u8,
-        dataLength: usize,
-        sig: *u8,
-        sigLength: usize,
-    ) -> i32;
-    @effects()
-    fn pks_verify_ed25519(key: *u8, keyLength: usize, data: *u8, dataLength: usize, sig: *u8, sigLength: usize) -> i32;
-    @effects()
-    fn pks_key_kind(key: *u8, keyLength: usize) -> i32;
-    @effects()
-    fn pks_sign(key: *u8, keyLength: usize, data: *u8, dataLength: usize, out: *mut u8, cap: usize) -> i64;
-    @effects()
-    fn pks_generate(kind: i32, bits: i32, out: *mut u8, cap: usize) -> i64;
-    @effects()
-    fn pks_public(key: *u8, keyLength: usize, out: *mut u8, cap: usize) -> i64;
-    @effects()
-    fn pks_from_pem(pem: *u8, pemLength: usize, out: *mut u8, cap: usize) -> i64;
-}
+// The OpenSSL calls (`pks_*`) are in ffi.cee.
 
 /// Why a key operation failed.
 public enum KeyError {

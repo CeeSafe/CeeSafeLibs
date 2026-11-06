@@ -1,0 +1,362 @@
+// The package's bridge to OpenSSL 3's EVP API, in CeeSafe: OpenSSL's functions declared directly, and the `pks_*`
+// functions lib.cee calls, which were a C shim (c/pkey_shim.c) until 2026-11.
+//
+// OpenSSL allocates with its own allocator, which CeeSafe's `alloc` effect does not track, so these declarations have
+// no effects, as the C shim's did; a failed allocation inside OpenSSL comes back as an error code.
+//
+// C names are global, so each OpenSSL function is declared once: those the tls package also calls are public here,
+// and tls imports them.
+//
+// No OpenSSL header is included: the prototypes below are generated as declared, with C's `long` as `i64` (LP64:
+// macOS and Linux) and OpenSSL's opaque types as `void *`. `EVP_RSA_gen(bits)`, a macro, is written out as the
+// variadic `EVP_PKEY_Q_keygen(NULL, NULL, "RSA", (size_t)bits)` it expands to.
+//
+// Verification returns 1 for a good signature, 0 for a bad one, and a negative code when the key is unusable: -1
+// unreadable, -2 an RSA key under 1024 bits (RFC 8301 forbids them), -3 out of memory. The key functions return a
+// length, or -1 for an unreadable or unsupported key, -3 out of memory, -4 output too small, -5 failed.
+
+extern "C" {
+    @effects()
+    fn d2i_PUBKEY(key: *mut void, input: *mut *u8, length: i64) -> *mut void;
+    @effects()
+    fn d2i_PublicKey(kind: i32, key: *mut void, input: *mut *u8, length: i64) -> *mut void;
+    @effects()
+    fn d2i_AutoPrivateKey(key: *mut void, input: *mut *u8, length: i64) -> *mut void;
+    @effects()
+    fn i2d_PUBKEY(key: *mut void, output: *mut *mut u8) -> i32;
+    @effects()
+    fn EVP_PKEY_new_raw_public_key(kind: i32, engine: *mut void, key: *u8, length: usize) -> *mut void;
+    @effects()
+    fn EVP_PKEY_get_raw_public_key(key: *mut void, out: *mut u8, length: *mut usize) -> i32;
+    @effects()
+    fn EVP_PKEY_get_base_id(key: *mut void) -> i32;
+    @effects()
+    fn EVP_PKEY_get_bits(key: *mut void) -> i32;
+    @effects()
+    public fn EVP_PKEY_free(key: *mut void);
+    @effects()
+    fn EVP_PKEY_Q_keygen(library: *mut void, properties: *CChar, kind: *CChar, ...) -> *mut void;
+
+    @effects()
+    fn EVP_MD_CTX_new() -> *mut void;
+    @effects()
+    fn EVP_MD_CTX_free(ctx: *mut void);
+    @effects()
+    fn EVP_sha256() -> *void;
+    @effects()
+    fn EVP_DigestVerifyInit(
+        ctx: *mut void,
+        keyContext: *mut void,
+        digest: *void,
+        engine: *mut void,
+        key: *mut void,
+    ) -> i32;
+    @effects()
+    fn EVP_DigestVerify(ctx: *mut void, signature: *u8, signatureLength: usize, data: *u8, dataLength: usize) -> i32;
+    @effects()
+    fn EVP_DigestSignInit(
+        ctx: *mut void,
+        keyContext: *mut void,
+        digest: *void,
+        engine: *mut void,
+        key: *mut void,
+    ) -> i32;
+    @effects()
+    fn EVP_DigestSign(
+        ctx: *mut void,
+        signature: *mut u8,
+        signatureLength: *mut usize,
+        data: *u8,
+        dataLength: usize,
+    ) -> i32;
+
+    @effects()
+    fn EVP_PKEY2PKCS8(key: *mut void) -> *mut void;
+    @effects()
+    fn i2d_PKCS8_PRIV_KEY_INFO(info: *mut void, output: *mut *mut u8) -> i32;
+    @effects()
+    fn PKCS8_PRIV_KEY_INFO_free(info: *mut void);
+
+    @effects()
+    public fn BIO_new_mem_buf(bytes: *void, length: i32) -> *mut void;
+    @effects()
+    public fn BIO_free(bio: *mut void) -> i32;
+    @effects()
+    public fn PEM_read_bio_PrivateKey(bio: *mut void, key: *mut void, callback: *void, arg: *mut void) -> *mut void;
+}
+
+// OpenSSL's key types (evp.h: EVP_PKEY_RSA is NID_rsaEncryption, EVP_PKEY_ED25519 NID_ED25519).
+const EVP_PKEY_RSA: i32 = 6;
+const EVP_PKEY_ED25519: i32 = 1087;
+
+const KIND_RSA: i32 = 1;
+const KIND_ED25519: i32 = 2;
+
+const PKS_BAD_KEY: i64 = -1;
+const PKS_NO_MEMORY: i64 = -3;
+const PKS_TOO_SMALL: i64 = -4;
+const PKS_FAILED: i64 = -5;
+
+const LONG_MAX: usize = 9223372036854775807;
+const INT32_MAX: usize = 2147483647;
+
+/// A DKIM p= value: SubjectPublicKeyInfo DER (the standard), or a bare RSAPublicKey (which some signers publish).
+/// Safety: `key` holds `length` bytes.
+unsafe fn rsaKey(key: *u8, length: usize) -> *mut void {
+    if (length > LONG_MAX) {
+        return 0 as *mut void;
+    }
+    var at = key;
+    let made = d2i_PUBKEY(0 as *mut void, borrow mut at as *mut *u8, truncate<i64>(length));
+    if (!made.isNull()) {
+        return made;
+    }
+    at = key;
+    return d2i_PublicKey(EVP_PKEY_RSA, 0 as *mut void, borrow mut at as *mut *u8, truncate<i64>(length));
+}
+
+/// 1 when `digest` (or, for Ed25519, null) and `pkey` verify `signature` over `data`, else 0; -3 out of memory.
+/// Safety: `pkey` is a live key, which this frees; the slices hold their lengths.
+unsafe fn verifyWith(
+    pkey: *mut void,
+    digest: *void,
+    data: *u8,
+    dataLength: usize,
+    signature: *u8,
+    signatureLength: usize,
+) -> i32 {
+    let ctx = EVP_MD_CTX_new();
+    if (ctx.isNull()) {
+        EVP_PKEY_free(pkey);
+        return -3;
+    }
+    var result = 0;
+    if (EVP_DigestVerifyInit(ctx, 0 as *mut void, digest, 0 as *mut void, pkey) == 1 &&
+        EVP_DigestVerify(ctx, signature, signatureLength, data, dataLength) == 1) {
+        result = 1;
+    }
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return result;
+}
+
+/// RSA PKCS #1 v1.5 over SHA-256. Keys under 1024 bits give -2 (RFC 8301).
+/// Safety: each pointer holds its length.
+@effects()
+unsafe fn pks_verify_rsa_sha256(
+    key: *u8,
+    keyLength: usize,
+    data: *u8,
+    dataLength: usize,
+    sig: *u8,
+    sigLength: usize,
+) -> i32 {
+    let pkey = rsaKey(key, keyLength);
+    if (pkey.isNull()) {
+        return -1;
+    }
+    if (EVP_PKEY_get_base_id(pkey) != EVP_PKEY_RSA) {
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+    if (EVP_PKEY_get_bits(pkey) < 1024) {
+        EVP_PKEY_free(pkey);
+        return -2;
+    }
+    return verifyWith(pkey, EVP_sha256(), data, dataLength, sig, sigLength);
+}
+
+/// Ed25519 (RFC 8032): `key` is the raw 32-byte public key, as DKIM's ed25519 keys are (RFC 8463).
+/// Safety: each pointer holds its length.
+@effects()
+unsafe fn pks_verify_ed25519(
+    key: *u8,
+    keyLength: usize,
+    data: *u8,
+    dataLength: usize,
+    sig: *u8,
+    sigLength: usize,
+) -> i32 {
+    if (keyLength != 32) {
+        return -1;
+    }
+    let pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, 0 as *mut void, key, keyLength);
+    if (pkey.isNull()) {
+        return -1;
+    }
+    return verifyWith(pkey, 0 as *void, data, dataLength, sig, sigLength);
+}
+
+// ---- Signing (DKIM signers): private keys are PKCS #8 DER; public keys come out in DKIM's p= form ----
+
+/// A private key from PKCS #8 (or traditional) DER; null when unreadable.
+/// Safety: `key` holds `length` bytes.
+unsafe fn privateKey(key: *u8, length: usize) -> *mut void {
+    if (length > LONG_MAX) {
+        return 0 as *mut void;
+    }
+    var at = key;
+    return d2i_AutoPrivateKey(0 as *mut void, borrow mut at as *mut *u8, truncate<i64>(length));
+}
+
+/// 1 RSA, 2 Ed25519, -1 any other kind.
+/// Safety: `pkey` is a live key.
+unsafe fn kindOf(pkey: *mut void) -> i32 {
+    let id = EVP_PKEY_get_base_id(pkey);
+    if (id == EVP_PKEY_RSA) {
+        return KIND_RSA;
+    }
+    if (id == EVP_PKEY_ED25519) {
+        return KIND_ED25519;
+    }
+    return -1;
+}
+
+/// The kind of a PKCS #8 private key: 1 RSA, 2 Ed25519, -1 unreadable or unsupported.
+/// Safety: `key` holds `keyLength` bytes.
+@effects()
+unsafe fn pks_key_kind(key: *u8, keyLength: usize) -> i32 {
+    let pkey = privateKey(key, keyLength);
+    if (pkey.isNull()) {
+        return -1;
+    }
+    let kind = kindOf(pkey);
+    EVP_PKEY_free(pkey);
+    return kind;
+}
+
+/// Signs `data`: RSA PKCS #1 v1.5 over SHA-256(data); Ed25519 over `data` itself (DKIM passes the hash, RFC 8463).
+/// The signature's length, written to `out`.
+/// Safety: `key` and `data` hold their lengths; `out` has room for `cap` bytes.
+@effects()
+unsafe fn pks_sign(key: *u8, keyLength: usize, data: *u8, dataLength: usize, out: *mut u8, cap: usize) -> i64 {
+    let pkey = privateKey(key, keyLength);
+    if (pkey.isNull()) {
+        return PKS_BAD_KEY;
+    }
+    let kind = kindOf(pkey);
+    if (kind < 0) {
+        EVP_PKEY_free(pkey);
+        return PKS_BAD_KEY;
+    }
+    let ctx = EVP_MD_CTX_new();
+    if (ctx.isNull()) {
+        EVP_PKEY_free(pkey);
+        return PKS_NO_MEMORY;
+    }
+    var result = PKS_FAILED;
+    var length: usize = 0;
+    let digest = if (kind == KIND_RSA) EVP_sha256() else 0 as *void;
+    if (EVP_DigestSignInit(ctx, 0 as *mut void, digest, 0 as *mut void, pkey) == 1 &&
+        EVP_DigestSign(ctx, 0 as *mut u8, borrow mut length as *mut usize, data, dataLength) == 1) {
+        if (length > cap) {
+            result = PKS_TOO_SMALL;
+        } else if (EVP_DigestSign(ctx, out, borrow mut length as *mut usize, data, dataLength) == 1) {
+            result = truncate<i64>(length);
+        }
+    }
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return result;
+}
+
+/// The key as PKCS #8 DER (rather than i2d_PrivateKey's PKCS #1 for RSA: one format for both kinds, and what other
+/// tools read), written to `out`; its length.
+/// Safety: `pkey` is a live key; `out` has room for `cap` bytes.
+unsafe fn writePrivate(pkey: *mut void, out: *mut u8, cap: usize) -> i64 {
+    let info = EVP_PKEY2PKCS8(pkey);
+    if (info.isNull()) {
+        return PKS_NO_MEMORY;
+    }
+    let length = i2d_PKCS8_PRIV_KEY_INFO(info, 0 as *mut *mut u8);
+    if (length <= 0) {
+        PKCS8_PRIV_KEY_INFO_free(info);
+        return PKS_FAILED;
+    }
+    if (truncate<usize>(length) > cap) {
+        PKCS8_PRIV_KEY_INFO_free(info);
+        return PKS_TOO_SMALL;
+    }
+    var at = out;
+    i2d_PKCS8_PRIV_KEY_INFO(info, borrow mut at as *mut *mut u8);
+    PKCS8_PRIV_KEY_INFO_free(info);
+    return length as i64;
+}
+
+/// A new key: kind 1 RSA of `bits` (1024 to 8192), kind 2 Ed25519. Writes its PKCS #8 DER; its length.
+/// Safety: `out` has room for `cap` bytes.
+@effects()
+unsafe fn pks_generate(kind: i32, bits: i32, out: *mut u8, cap: usize) -> i64 {
+    var pkey = 0 as *mut void;
+    if (kind == KIND_RSA) {
+        if (bits < 1024 || bits > 8192) {
+            return PKS_BAD_KEY;
+        }
+        // EVP_RSA_gen(bits).
+        pkey = EVP_PKEY_Q_keygen(0 as *mut void, 0 as *CChar, "RSA\0".ptr as *CChar, truncate<usize>(bits));
+    } else if (kind == KIND_ED25519) {
+        pkey = EVP_PKEY_Q_keygen(0 as *mut void, 0 as *CChar, "ED25519\0".ptr as *CChar);
+    } else {
+        return PKS_BAD_KEY;
+    }
+    if (pkey.isNull()) {
+        return PKS_FAILED;
+    }
+    let result = writePrivate(pkey, out, cap);
+    EVP_PKEY_free(pkey);
+    return result;
+}
+
+/// The public half as DKIM publishes it: SubjectPublicKeyInfo DER for RSA, the raw 32 bytes for Ed25519. Its length.
+/// Safety: `key` holds `keyLength` bytes; `out` has room for `cap` bytes.
+@effects()
+unsafe fn pks_public(key: *u8, keyLength: usize, out: *mut u8, cap: usize) -> i64 {
+    let pkey = privateKey(key, keyLength);
+    if (pkey.isNull()) {
+        return PKS_BAD_KEY;
+    }
+    let kind = kindOf(pkey);
+    var result = PKS_BAD_KEY;
+    if (kind == KIND_RSA) {
+        let length = i2d_PUBKEY(pkey, 0 as *mut *mut u8);
+        if (length <= 0) {
+            result = PKS_FAILED;
+        } else if (truncate<usize>(length) > cap) {
+            result = PKS_TOO_SMALL;
+        } else {
+            var at = out;
+            i2d_PUBKEY(pkey, borrow mut at as *mut *mut u8);
+            result = length as i64;
+        }
+    } else if (kind == KIND_ED25519) {
+        var length = cap;
+        result = if (EVP_PKEY_get_raw_public_key(
+            pkey,
+            out,
+            borrow mut length as *mut usize,
+        ) == 1) truncate<i64>(length) else PKS_TOO_SMALL;
+    }
+    EVP_PKEY_free(pkey);
+    return result;
+}
+
+/// A PEM private key (PKCS #8, or traditional RSA) to PKCS #8 DER, for importing existing keys; its length.
+/// Safety: `pem` holds `pemLength` bytes; `out` has room for `cap` bytes.
+@effects()
+unsafe fn pks_from_pem(pem: *u8, pemLength: usize, out: *mut u8, cap: usize) -> i64 {
+    if (pemLength > INT32_MAX) {
+        return PKS_BAD_KEY;
+    }
+    let bio = BIO_new_mem_buf(pem as *void, truncate<i32>(pemLength));
+    if (bio.isNull()) {
+        return PKS_NO_MEMORY;
+    }
+    let pkey = PEM_read_bio_PrivateKey(bio, 0 as *mut void, 0 as *void, 0 as *mut void);
+    BIO_free(bio);
+    if (pkey.isNull()) {
+        return PKS_BAD_KEY;
+    }
+    let result = if (kindOf(pkey) < 0) PKS_BAD_KEY else writePrivate(pkey, out, cap);
+    EVP_PKEY_free(pkey);
+    return result;
+}

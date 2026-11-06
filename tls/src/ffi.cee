@@ -8,6 +8,12 @@
 // command numbers of OpenSSL 3's headers. Callbacks (ALPN and SNI selection, and freeing a context's extras) are
 // `@callback` functions.
 
+// Declared once, in pkey (C names are global): the calls both packages make.
+import pkey.BIO_free;
+import pkey.BIO_new_mem_buf;
+import pkey.EVP_PKEY_free;
+import pkey.PEM_read_bio_PrivateKey;
+
 extern "C" {
     @effects(alloc)
     fn OPENSSL_init_ssl(opts: u64, settings: *void) -> i32;
@@ -136,10 +142,6 @@ extern "C" {
     fn BIO_new(method: *void) -> *mut void;
     @effects()
     fn BIO_s_mem() -> *void;
-    @effects(alloc)
-    fn BIO_new_mem_buf(bytes: *void, length: i32) -> *mut void;
-    @effects()
-    fn BIO_free(bio: *mut void) -> i32;
     @effects()
     fn BIO_ctrl(bio: *mut void, cmd: i32, larg: i64, parg: *mut void) -> i64;
     @effects()
@@ -153,12 +155,8 @@ extern "C" {
     fn PEM_read_bio_X509_AUX(bio: *mut void, x509: *mut void, callback: *void, arg: *mut void) -> *mut void;
     @effects(alloc)
     fn PEM_read_bio_X509(bio: *mut void, x509: *mut void, callback: *void, arg: *mut void) -> *mut void;
-    @effects(alloc)
-    fn PEM_read_bio_PrivateKey(bio: *mut void, key: *mut void, callback: *void, arg: *mut void) -> *mut void;
     @effects()
     fn X509_free(x509: *mut void);
-    @effects()
-    fn EVP_PKEY_free(key: *mut void);
     @effects()
     fn X509_check_private_key(x509: *mut void, key: *mut void) -> i32;
     @effects(alloc)

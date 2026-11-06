@@ -11,3 +11,4 @@ links = ["ssl", "crypto"]
 lib-dirs = ["/opt/homebrew/opt/openssl@3/lib"]
 
 [dependencies]
+pkey = { path = "../pkey" }

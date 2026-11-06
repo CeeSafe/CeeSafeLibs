@@ -1,6 +1,7 @@
 # pkey
 
-Public-key signature verification through OpenSSL 3's EVP API, for DKIM.
+Public-key signature verification through OpenSSL 3's EVP API, for DKIM. `src/ffi.cee` calls OpenSSL directly, in
+CeeSafe (no C shim, no OpenSSL headers).
 
 - `Signatures.verifyRsaSha256(key, data, signature)` checks RSA PKCS #1 v1.5 over SHA-256. The key is DER, as
   SubjectPublicKeyInfo or a bare RSAPublicKey (some DKIM keys are the latter). Keys under 1024 bits give `WeakKey`

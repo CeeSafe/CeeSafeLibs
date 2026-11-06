@@ -13,8 +13,9 @@ CeeSafe package (`ceesafe.toml`), with its own README and tests (`ceesafec test`
 | `encoding` | Hex and base64 (RFC 4648), including the URL-safe alphabet. |
 | `diskio` | File calls `lib/std` lacks: positioned reads, fsync, rename, mkdir -p, directory sync and exclusive creation. |
 
-`tls` and `pkey` link OpenSSL 3. On macOS, the manifests point at Homebrew's `openssl@3`; on Linux, install
-`libssl-dev`.
+Everything is CeeSafe: there is no C in the repository. `tls` and `pkey` call OpenSSL 3 directly (their
+`src/ffi.cee`, without OpenSSL's headers) and link `libssl` and `libcrypto`. On macOS the manifests point at
+Homebrew's `openssl@3`; on Linux, install `libssl3` (or `libssl-dev`).
 
 `repros/` holds reduced reproductions of CeeSafe compiler and runtime issues found while writing these, and
 `NOTES-ceesafe-0.14.md` records the issues met with that release.
