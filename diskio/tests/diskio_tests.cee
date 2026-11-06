@@ -1,0 +1,76 @@
+fn scratch(name: StringView) -> String {
+    var path = Directory.temporary()!;
+    path.append("/ceesafe-files-test-")!;
+    path.append(name)!;
+    return path;
+}
+
+@test
+fn writesSyncsAndReadsAtOffsets() -> Result<void, TestFailure> {
+    let dir = scratch("rw");
+    Files.makeDirectories(dir.view())!;
+    var path = String.create();
+    path.append(dir.view())!;
+    path.append("/a/b/c")!;
+    Files.makeDirectories(path.view())!;
+    path.append("/data.bin")!;
+    match (Files.remove(path.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    {
+        var f = RawFile.createNew(path.view())!;
+        f.write("hello, ".bytes())!;
+        f.write("world".bytes())!;
+        f.sync()!;
+        Check.isTrue(f.size()! == 12, "size")?;
+    }
+    match (RawFile.createNew(path.view())) {
+        Ok(_) => { return Check.fail("createNew should refuse an existing file"); }
+        Err(FileError.Exists) => {}
+        Err(_) => { return Check.fail("wrong error for an existing file"); }
+    }
+    let f = RawFile.open(path.view())!;
+    var buffer = [0u8; 5];
+    f.readExactAt(mut buffer[..], 7)!;
+    Check.isTrue(buffer[..].startsWith("world".bytes()), "read at 7")?;
+    Check.isTrue(f.readAt(mut buffer[..], 12)! == 0, "end of file")?;
+    match (f.readExactAt(mut buffer[..], 10)) {
+        Ok() => { return Check.fail("a short read should fail"); }
+        Err(_) => {}
+    }
+    return Ok();
+}
+
+@test
+fn renamesAndRemoves() -> Result<void, TestFailure> {
+    let dir = scratch("mv");
+    Files.makeDirectories(dir.view())!;
+    var from = String.create();
+    from.append(dir.view())!;
+    from.append("/from")!;
+    var to = String.create();
+    to.append(dir.view())!;
+    to.append("/to")!;
+    {
+        var f = RawFile.create(from.view())!;
+        f.write("x".bytes())!;
+    }
+    Files.rename(from.view(), to.view())!;
+    Files.syncDirectory(dir.view())!;
+    Check.isTrue(!Files.exists(from.view())!, "moved away")?;
+    Check.isTrue(Files.exists(to.view())!, "moved to")?;
+    Check.isTrue(Files.modifiedSeconds(to.view())! > 1700000000, "modified recently")?;
+    Files.remove(to.view())!;
+    Check.isTrue(!Files.exists(to.view())!, "removed")?;
+    match (RawFile.open(to.view())) {
+        Ok(_) => { return Check.fail("opened a removed file"); }
+        Err(FileError.NotFound) => {}
+        Err(_) => { return Check.fail("wrong error for a missing file"); }
+    }
+    match (RawFile.open("bad\u{0}path")) {
+        Ok(_) => { return Check.fail("a NUL in a path should be refused"); }
+        Err(_) => {}
+    }
+    return Ok();
+}

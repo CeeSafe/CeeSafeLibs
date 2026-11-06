@@ -1,0 +1,42 @@
+// DANE's TLSA records (RFC 6698), for `TlsStream.connectDaneWithin`.
+
+/// A TLSA record (RFC 6698 §2.1): what a server's certificate chain must match.
+public struct Tlsa {
+    /// 0 PKIX-TA, 1 PKIX-EE, 2 DANE-TA, 3 DANE-EE. SMTP uses only 2 and 3 (RFC 7672 §3.1).
+    public usage: u8;
+    /// 0 the whole certificate, 1 its SubjectPublicKeyInfo.
+    public selector: u8;
+    /// 0 the selected bytes themselves, 1 their SHA-256, 2 their SHA-512.
+    public matching: u8;
+    /// The certificate association data.
+    public data: Vector<u8>;
+
+    /// A record from its RDATA (RFC 6698 §2.1): usage, selector and matching type, then the data. Null when it is
+    /// shorter than four bytes.
+    public fn parse(rdata: Slice<u8>) -> Result<Tlsa?, AllocError> {
+        if (rdata.length < 4) {
+            return Ok(null);
+        }
+        var data = Vector<u8>.create();
+        data.extend(rdata[3..rdata.length])?;
+        return Ok(Some(Tlsa { usage: rdata[0], selector: rdata[1], matching: rdata[2], data: data }));
+    }
+
+    /// Whether SMTP can use the record (RFC 7672 §3.1): DANE-TA or DANE-EE, a known selector, and a known matching
+    /// type whose data has the digest's length.
+    public fn usableForSmtp(borrow this) -> bool {
+        if (this.usage != 2 && this.usage != 3) {
+            return false;
+        }
+        if (this.selector > 1) {
+            return false;
+        }
+        if (this.matching == 1) {
+            return this.data.length == 32;
+        }
+        if (this.matching == 2) {
+            return this.data.length == 64;
+        }
+        return this.matching == 0 && this.data.length > 0;
+    }
+}

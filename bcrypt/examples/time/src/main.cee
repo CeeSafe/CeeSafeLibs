@@ -1,0 +1,12 @@
+// Times one bcrypt verification at cost 12, the C# server's cost.
+import bcrypt.Bcrypt;
+
+fn main() {
+    let hash = Bcrypt.hash("password".bytes(), 12)!;
+    let start = Clock.unixMillis();
+    let ok = Bcrypt.verify("password".bytes(), hash.view());
+    Console.write("cost 12 verify: ");
+    Console.write(Clock.unixMillis() - start);
+    Console.write(" ms, ");
+    Console.writeLine(ok);
+}

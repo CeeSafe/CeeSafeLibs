@@ -1,0 +1,6 @@
+public async fn accepted(listener: borrow AsyncTcpListener) -> bool {
+    match (await listener.accept()) {
+        Ok(_) => { return true; }
+        Err(_) => { return false; }
+    }
+}

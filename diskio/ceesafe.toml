@@ -1,0 +1,8 @@
+[package]
+name = "diskio"
+version = "0.1.0"
+kind = "library"
+c = ["c/diskio_shim.c"]
+tests = ["tests"]
+
+[dependencies]

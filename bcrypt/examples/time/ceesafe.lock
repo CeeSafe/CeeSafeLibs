@@ -1,0 +1,9 @@
+# Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
+
+[[package]]
+name = "bcrypt"
+source = "path+../.."
+
+[[package]]
+name = "sha256"
+source = "path+../../../sha256"

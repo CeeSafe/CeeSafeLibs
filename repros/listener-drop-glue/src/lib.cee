@@ -1,0 +1,31 @@
+public async fn accepted(listener: borrow AsyncTcpListener) -> bool {
+    match (await listener.accept()) {
+        Ok(_) => { return true; }
+        Err(_) => { return false; }
+    }
+}
+
+public async fn many(listener: borrow AsyncTcpListener) -> Result<void, u8> {
+    return await Async.tasks(4, 1u8, async (set) => {
+        loop {
+            let stream = match (await listener.accept()) {
+                Ok(s) => s,
+                Err(_) => { return Ok(); }
+            };
+            var handoff = Vector<AsyncTcpStream>.create();
+            match (handoff.push(stream)) {
+                Ok() => {}
+                Err(_) => { continue; }
+            }
+            match (await set.spawnSend(async move () => await one(mut handoff))) {
+                Ok() => {}
+                Err(_) => { return Ok(); }
+            }
+        }
+    });
+}
+
+async fn one(handoff: borrow mut Vector<AsyncTcpStream>) -> Result<void, u8> {
+    handoff.pop();
+    return Ok();
+}

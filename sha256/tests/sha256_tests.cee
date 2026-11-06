@@ -1,0 +1,149 @@
+// Known-answer tests. Expected values come from Python's hashlib/hmac (FIPS 180-4, RFC 4231 and RFC 7914 vectors
+// among them), so they do not depend on this implementation.
+
+fn nibble(c: u8) -> u8 {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    return c - 'a' + 10;
+}
+
+/// Decodes lowercase hex into `out`, returning the number of bytes written.
+fn unhex(text: StringView, out: SliceMut<u8>) -> usize {
+    let n = text.length / 2;
+    for (i in 0..n) {
+        out[i] = nibble(text[i * 2]) * 16 + nibble(text[i * 2 + 1]);
+    }
+    return n;
+}
+
+fn expectDigest(digest: [u8; 32], hex: StringView) -> Result<void, TestFailure> {
+    var expected = [0u8; 32];
+    let n = unhex(hex, mut expected[..]);
+    Check.equalU64(32, n as u64)?;
+    return Check.equalBytes(expected[..], digest[..]);
+}
+
+fn repeated(byte: u8, count: usize) -> Vector<u8> {
+    var v = Vector<u8>.withCapacity(count)!;
+    for (i in 0..count) {
+        v.push(byte)!;
+    }
+    return v;
+}
+
+@test
+fn sha256Empty() -> Result<void, TestFailure> {
+    let empty = "";
+    return expectDigest(Sha256.hash(empty.bytes()), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
+@test
+fn sha256Abc() -> Result<void, TestFailure> {
+    let abc = "abc";
+    return expectDigest(Sha256.hash(abc.bytes()), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+@test
+fn sha256TwoBlocks() -> Result<void, TestFailure> {
+    let msg = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    return expectDigest(Sha256.hash(msg.bytes()), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+}
+
+@test
+fn sha256PaddingEdges() -> Result<void, TestFailure> {
+    let a55 = repeated('a', 55);
+    expectDigest(Sha256.hash(a55.view()), "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318")?;
+    let a56 = repeated('a', 56);
+    expectDigest(Sha256.hash(a56.view()), "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a")?;
+    let a64 = repeated('a', 64);
+    return expectDigest(Sha256.hash(a64.view()), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb");
+}
+
+@test
+fn sha256IncrementalMatchesOneShot() -> Result<void, TestFailure> {
+    var data = Vector<u8>.withCapacity(119)!;
+    for (i in 0..119) {
+        data.push(truncate<u8>(i))!;
+    }
+    let bytes = data.view();
+    // Every split point, including empty updates, gives the one-shot digest.
+    for (cut in 0..bytes.length + 1) {
+        var h = Sha256.create();
+        h.update(bytes[0..cut]);
+        h.update(bytes[cut..cut]);
+        h.update(bytes[cut..]);
+        expectDigest(h.finish(), "da18797ed7c3a777f0847f429724a2d8cd5138e6ed2895c3fa1a6d39d18f7ec6")?;
+    }
+    return Ok();
+}
+
+@test
+fn sha256Million() -> Result<void, TestFailure> {
+    let chunk = repeated('a', 1000);
+    var h = Sha256.create();
+    for (i in 0..1000) {
+        h.update(chunk.view());
+    }
+    return expectDigest(h.finish(), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+@test
+fn hmacRfc4231() -> Result<void, TestFailure> {
+    let key1 = repeated(0x0b, 20);
+    let msg1 = "Hi There";
+    expectDigest(
+        HmacSha256.mac(key1.view(), msg1.bytes()),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+    )?;
+    let key2 = "Jefe";
+    let msg2 = "what do ya want for nothing?";
+    expectDigest(
+        HmacSha256.mac(key2.bytes(), msg2.bytes()),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+    )?;
+    let key3 = repeated(0xaa, 131);
+    let msg3 = "Test Using Larger Than Block-Size Key - Hash Key First";
+    return expectDigest(
+        HmacSha256.mac(key3.view(), msg3.bytes()),
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+    );
+}
+
+@test
+fn pbkdf2Vectors() -> Result<void, TestFailure> {
+    var out = [0u8; 64];
+    var expected = [0u8; 64];
+    let p1 = "passwd";
+    let s1 = "salt";
+    pbkdf2(p1.bytes(), s1.bytes(), 1, mut out[..]);
+    unhex(
+        "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783",
+        mut expected[..],
+    );
+    Check.equalBytes(expected[..], out[..])?;
+    let p2 = "Password";
+    let s2 = "NaCl";
+    pbkdf2(p2.bytes(), s2.bytes(), 80000, mut out[..]);
+    unhex(
+        "4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56a1d425a1225833549adb841b51c9b3176a272bdebba1d078478f62b397f33c8d",
+        mut expected[..],
+    );
+    Check.equalBytes(expected[..], out[..])?;
+    var short = [0u8; 32];
+    let p3 = "pencil";
+    let s3 = "salt-4096";
+    pbkdf2(p3.bytes(), s3.bytes(), 4096, mut short[..]);
+    return expectDigest(short, "6812c9f1d4b1becccc0841efce283ab491b7b3f9f1101b492812e89921e372c1");
+}
+
+@test
+fn constantTimeCompare() -> Result<void, TestFailure> {
+    let a = "same bytes";
+    let b = "same bytes";
+    let c = "same bytez";
+    Check.isTrue(constantTimeEqual(a.bytes(), b.bytes()), "equal inputs")?;
+    Check.isTrue(!constantTimeEqual(a.bytes(), c.bytes()), "one byte differs")?;
+    let d = "same";
+    return Check.isTrue(!constantTimeEqual(a.bytes(), d.bytes()), "lengths differ");
+}

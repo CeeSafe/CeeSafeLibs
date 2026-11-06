@@ -1,0 +1,126 @@
+// Several tasks on one thread, each looping: a timed read on a TCP connection (Async.timeout around a read that
+// usually finds data at once), then a contended AsyncMutex. The mailserver's relay does this shape and, under
+// ceesafec 0.15.0, either stalls (tasks never woken) or aborts with
+//     ceesafe: a task waits on a descriptor and a wake at once
+// See CeeSafeApps/mailserver/CEESAFE_FINDINGS.md §1.4.
+
+enum E { Io, Timeout }
+
+async fn echo(listener: borrow AsyncTcpListener) -> Result<void, E> {
+    loop {
+        var stream = match (await listener.accept()) {
+            Ok(s) => s,
+            Err(_) => { return Err(E.Io); }
+        };
+        var buffer = [0u8; 256];
+        loop {
+            let n = match (await stream.read(mut buffer[..])) {
+                Ok(n) => n,
+                Err(_) => { break; }
+            };
+            if (n == 0) {
+                break;
+            }
+            match (await stream.write(buffer[0..n])) {
+                Ok() => {}
+                Err(_) => { break; }
+            }
+        }
+    }
+}
+
+async fn client(port: u16, lock: borrow AsyncMutex<Vector<u64>>, rounds: u32) -> Result<void, E> {
+    for (r in 0..rounds) {
+        let connected: Result<AsyncTcpStream, AsyncError> = await Async.timeout(
+            1000,
+            AsyncError.TimedOut,
+            async () => await AsyncTcpStream.connectTo(SocketAddress.V4([127u8, 0, 0, 1], port)),
+        );
+        var stream = match (connected) {
+            Ok(s) => s,
+            Err(_) => { return Err(E.Io); }
+        };
+        for (k in 0..20) {
+            match (await stream.write("ping\n".bytes())) {
+                Ok() => {}
+                Err(_) => { return Err(E.Io); }
+            }
+            var buffer = [0u8; 64];
+            let got: Result<usize, AsyncError> = await Async.timeout(
+                1000,
+                AsyncError.TimedOut,
+                async () => match (await stream.read(mut buffer[..])) {
+                    Ok(n) => Ok(n),
+                    Err(_) => Err(AsyncError.TimedOut),
+                },
+            );
+            match (got) {
+                Ok(_) => {}
+                Err(_) => { return Err(E.Timeout); }
+            }
+            // A blocking call, as the relay's file reads.
+            let summed: u64 = await Async.blocking(() => {
+                var t: u64 = 0;
+                for (x in 0..1000) {
+                    t += truncate<u64>(x);
+                }
+                return t;
+            });
+            if (summed == 0) {
+                return Err(E.Io);
+            }
+            var guard = match (await lock.lock()) {
+                Ok(g) => g,
+                Err(_) => { return Err(E.Io); }
+            };
+            let list = guard.data();
+            match (list.push(1)) {
+                Ok() => {}
+                Err(_) => { return Err(E.Io); }
+            }
+        }
+    }
+    return Ok();
+}
+
+async fn run() -> Result<void, E> {
+    let listener = match (AsyncTcpListener.bind("127.0.0.1", 0)) {
+        Ok(l) => l,
+        Err(_) => { return Err(E.Io); }
+    };
+    let port = match (listener.port()) {
+        Ok(p) => p,
+        Err(_) => { return Err(E.Io); }
+    };
+    let lock = match (AsyncMutex<Vector<u64>>.create(Vector<u64>.create())) {
+        Ok(l) => l,
+        Err(_) => { return Err(E.Io); }
+    };
+    let started = Clock.unixMillis();
+    let result = await Async.timeout(20000, E.Timeout, async () => await Async.scope(E.Io, (s) => {
+        s.spawn(async () => await echo(borrow listener));
+        for (i in 0..4) {
+            s.spawn(async () => {
+                await client(port, borrow lock, 50)?;
+                return Err(E.Io); // ends the scope (and the echo server) when the first client is done
+            });
+        }
+    }));
+    let elapsed = Clock.unixMillis() - started;
+    match (result) {
+        Err(E.Timeout) => { return Err(E.Timeout); }
+        _ => {}
+    }
+    if (elapsed > 15000) {
+        return Err(E.Timeout);
+    }
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok() => { Console.writeLine("ok"); }
+        Err(E.Timeout) => { Console.writeLine("STALLED: tasks were not woken within 20 s"); }
+        Err(E.Io) => { Console.writeLine("ok (finished)"); }
+    }
+}

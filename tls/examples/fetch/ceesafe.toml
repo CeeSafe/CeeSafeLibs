@@ -1,0 +1,6 @@
+[package]
+name = "fetch"
+kind = "executable"
+
+[dependencies]
+tls = { path = "../.." }

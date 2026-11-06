@@ -1,0 +1,260 @@
+// Hex (RFC 4648 §8) and base64 (RFC 4648 §4, and the URL-safe alphabet of §5), in CeeSafe.
+//
+// Encoders append to a `Vector<u8>` with one growth; the output is ASCII, so `StringView.fromUtf8` always accepts it.
+// Decoders append too, and leave the vector as it was when the input is malformed.
+
+/// Why a decoder gave up.
+public enum DecodeError {
+    /// A character outside the alphabet, misplaced padding, or a length that cannot be encoded data.
+    Invalid,
+    OutOfMemory,
+}
+
+const HEX_LOWER: StringView = "0123456789abcdef";
+const HEX_UPPER: StringView = "0123456789ABCDEF";
+const BASE64_STANDARD: StringView = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const BASE64_URL: StringView = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// The marker for a byte that is not a digit of the alphabet.
+const NOT_A_DIGIT: u8 = 0xFF;
+
+fn grown(outcome: Result<void, AllocError>) -> Result<void, DecodeError> {
+    match (outcome) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(DecodeError.OutOfMemory); }
+    }
+}
+
+fn isSpace(c: u8) -> bool => c == ' ' || c == '\t' || c == '\r' || c == '\n';
+
+/// Hexadecimal text: two digits per byte.
+public struct Hex {
+    /// Appends the lowercase hex of `data` to `out`.
+    public fn encode(data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> =>
+        Hex.encodeWith(data, out, HEX_LOWER);
+
+    /// Appends the uppercase hex of `data` to `out`.
+    public fn encodeUpper(data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> =>
+        Hex.encodeWith(data, out, HEX_UPPER);
+
+    fn encodeWith(data: Slice<u8>, out: borrow mut Vector<u8>, digits: StringView) -> Result<void, AllocError> {
+        let start = out.length;
+        out.resize(start + data.length * 2, 0)?;
+        let w = out.viewMut();
+        var at = start;
+        for (b in data) {
+            w[at] = digits[(b >> 4) as usize];
+            w[at + 1] = digits[(b & 15) as usize];
+            at += 2;
+        }
+        return Ok();
+    }
+
+    /// The value of one hex digit (either case), or `null`.
+    public fn digit(c: u8) -> u8? {
+        if (c >= '0' && c <= '9') {
+            return c - '0';
+        }
+        if (c >= 'a' && c <= 'f') {
+            return c - 'a' + 10;
+        }
+        if (c >= 'A' && c <= 'F') {
+            return c - 'A' + 10;
+        }
+        return null;
+    }
+
+    /// Appends the bytes that the hex `text` (either case, an even number of digits, nothing else) stands for.
+    public fn decode(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, DecodeError> {
+        if (text.length % 2 != 0) {
+            return Err(DecodeError.Invalid);
+        }
+        let start = out.length;
+        grown(out.resize(start + text.length / 2, 0))?;
+        let w = out.viewMut();
+        var i: usize = 0;
+        while (i < text.length) {
+            let hi = Hex.digit(text[i]);
+            let lo = Hex.digit(text[i + 1]);
+            if (hi == null || lo == null) {
+                out.truncate(start);
+                return Err(DecodeError.Invalid);
+            }
+            w[start + i / 2] = hi! * 16 + lo!;
+            i += 2;
+        }
+        return Ok();
+    }
+}
+
+/// Base64 with the standard alphabet (`+/`) or the URL-safe one (`-_`).
+public struct Base64 {
+    /// The length of the padded encoding of `n` bytes.
+    public fn encodedLength(n: usize) -> usize => (n + 2) / 3 * 4;
+
+    /// Appends the padded standard base64 of `data` to `out`.
+    public fn encode(data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> =>
+        Base64.encodeWith(data, out, BASE64_STANDARD, true);
+
+    /// Appends the URL-safe base64 of `data` to `out`, without padding (as JWTs and most URLs want).
+    public fn encodeUrl(data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> =>
+        Base64.encodeWith(data, out, BASE64_URL, false);
+
+    fn encodeWith(
+        data: Slice<u8>,
+        out: borrow mut Vector<u8>,
+        alphabet: StringView,
+        pad: bool,
+    ) -> Result<void, AllocError> {
+        let rest = data.length % 3;
+        let whole = data.length - rest;
+        var length = whole / 3 * 4;
+        if (rest != 0) {
+            length += if (pad) 4 else rest + 1;
+        }
+        let start = out.length;
+        out.resize(start + length, 0)?;
+        let w = out.viewMut();
+        var at = start;
+        var i: usize = 0;
+        while (i < whole) {
+            let n = (data[i] as u32) << 16 | (data[i + 1] as u32) << 8 | (data[i + 2] as u32);
+            w[at] = alphabet[(n >> 18) as usize];
+            w[at + 1] = alphabet[(n >> 12 & 63) as usize];
+            w[at + 2] = alphabet[(n >> 6 & 63) as usize];
+            w[at + 3] = alphabet[(n & 63) as usize];
+            at += 4;
+            i += 3;
+        }
+        if (rest == 1) {
+            let n = (data[i] as u32) << 16;
+            w[at] = alphabet[(n >> 18) as usize];
+            w[at + 1] = alphabet[(n >> 12 & 63) as usize];
+            if (pad) {
+                w[at + 2] = '=';
+                w[at + 3] = '=';
+            }
+        } else if (rest == 2) {
+            let n = (data[i] as u32) << 16 | (data[i + 1] as u32) << 8;
+            w[at] = alphabet[(n >> 18) as usize];
+            w[at + 1] = alphabet[(n >> 12 & 63) as usize];
+            w[at + 2] = alphabet[(n >> 6 & 63) as usize];
+            if (pad) {
+                w[at + 3] = '=';
+            }
+        }
+        return Ok();
+    }
+
+    /// Appends the bytes that the standard base64 `text` stands for. Padding is optional, but when present it must be
+    /// correct; nothing else (whitespace included) is accepted.
+    public fn decode(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, DecodeError> =>
+        Base64.decodeWith(text, out, false, false);
+
+    /// As `decode`, for the URL-safe alphabet.
+    public fn decodeUrl(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, DecodeError> =>
+        Base64.decodeWith(text, out, true, false);
+
+    /// As `decode`, skipping spaces, tabs, CR and LF anywhere: for MIME bodies (RFC 2045 §6.8) and folded headers.
+    public fn decodeIgnoringSpace(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, DecodeError> =>
+        Base64.decodeWith(text, out, false, true);
+
+    fn value(c: u8, url: bool) -> u8 {
+        if (c >= 'A' && c <= 'Z') {
+            return c - 'A';
+        }
+        if (c >= 'a' && c <= 'z') {
+            return c - 'a' + 26;
+        }
+        if (c >= '0' && c <= '9') {
+            return c - '0' + 52;
+        }
+        if (url) {
+            if (c == '-') {
+                return 62;
+            }
+            if (c == '_') {
+                return 63;
+            }
+        } else {
+            if (c == '+') {
+                return 62;
+            }
+            if (c == '/') {
+                return 63;
+            }
+        }
+        return NOT_A_DIGIT;
+    }
+
+    fn decodeWith(
+        text: Slice<u8>,
+        out: borrow mut Vector<u8>,
+        url: bool,
+        skipSpace: bool,
+    ) -> Result<void, DecodeError> {
+        let start = out.length;
+        // An upper bound; the vector is cut to the real length at the end.
+        grown(out.resize(start + text.length / 4 * 3 + 3, 0))?;
+        let w = out.viewMut();
+        var at = start;
+        var acc: u32 = 0;
+        var digits: usize = 0; // in the current quantum
+        var padding: usize = 0;
+        for (c in text) {
+            if (skipSpace && isSpace(c)) {
+                continue;
+            }
+            if (c == '=') {
+                // Padding completes a quantum of 2 or 3 digits, and nothing but more padding may follow it.
+                if (padding == 0 && digits < 2) {
+                    out.truncate(start);
+                    return Err(DecodeError.Invalid);
+                }
+                padding += 1;
+                if (digits + padding > 4) {
+                    out.truncate(start);
+                    return Err(DecodeError.Invalid);
+                }
+                continue;
+            }
+            if (padding > 0) {
+                out.truncate(start);
+                return Err(DecodeError.Invalid);
+            }
+            let v = Base64.value(c, url);
+            if (v == NOT_A_DIGIT) {
+                out.truncate(start);
+                return Err(DecodeError.Invalid);
+            }
+            acc = acc << 6 | (v as u32);
+            digits += 1;
+            if (digits == 4) {
+                w[at] = truncate<u8>(acc >> 16);
+                w[at + 1] = truncate<u8>(acc >> 8);
+                w[at + 2] = truncate<u8>(acc);
+                at += 3;
+                acc = 0;
+                digits = 0;
+            }
+        }
+        if (padding > 0 && digits + padding != 4) {
+            out.truncate(start);
+            return Err(DecodeError.Invalid);
+        }
+        if (digits == 1) {
+            out.truncate(start);
+            return Err(DecodeError.Invalid);
+        }
+        if (digits == 2) {
+            w[at] = truncate<u8>(acc >> 4);
+            at += 1;
+        } else if (digits == 3) {
+            w[at] = truncate<u8>(acc >> 10);
+            w[at + 1] = truncate<u8>(acc >> 2);
+            at += 2;
+        }
+        out.truncate(at);
+        return Ok();
+    }
+}

@@ -1,0 +1,120 @@
+// RFC 4648 §10 vectors, plus round-trips and malformed input.
+
+fn text(v: borrow Vector<u8>) -> StringView => StringView.fromUtf8(v.view())!;
+
+fn base64Of(data: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    Base64.encode(data.bytes(), mut out)!;
+    return out;
+}
+
+fn decodesTo(encoded: StringView, expected: StringView) -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    match (Base64.decode(encoded.bytes(), mut out)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("did not decode"); }
+    }
+    return Check.equalBytes(expected.bytes(), out.view());
+}
+
+fn rejected(encoded: StringView) -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    out.push(7)!;
+    match (Base64.decode(encoded.bytes(), mut out)) {
+        Ok() => { return Check.fail("malformed base64 was accepted"); }
+        Err(DecodeError.Invalid) => {}
+        Err(_) => { return Check.fail("wrong error"); }
+    }
+    return Check.equalU64(1, out.length as u64); // left as it was
+}
+
+@test
+fn base64Rfc4648() -> Result<void, TestFailure> {
+    let plain = ["", "f", "fo", "foo", "foob", "fooba", "foobar"];
+    let coded = ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"];
+    for (i in 0..7) {
+        let out = base64Of(plain[i]);
+        Check.isTrue(text(out) == coded[i], "encoding")?;
+        Check.equalU64(Base64.encodedLength(plain[i].length) as u64, out.length as u64)?;
+        decodesTo(coded[i], plain[i])?;
+    }
+    return Ok();
+}
+
+@test
+fn base64Variants() -> Result<void, TestFailure> {
+    decodesTo("Zm9vYg", "foob")?; // padding is optional
+    decodesTo("Zm9vYmE", "fooba")?;
+    let raw = [0xFBu8, 0xFF, 0xBF];
+    var standard = Vector<u8>.create();
+    Base64.encode(raw[..], mut standard)!;
+    Check.isTrue(text(standard) == "+/+/", "encoding")?;
+    var url = Vector<u8>.create();
+    Base64.encodeUrl(raw[..], mut url)!;
+    Check.isTrue(text(url) == "-_-_", "encoding")?;
+    var unpadded = Vector<u8>.create();
+    Base64.encodeUrl("f".bytes(), mut unpadded)!;
+    Check.isTrue(text(unpadded) == "Zg", "encoding")?;
+    var back = Vector<u8>.create();
+    Base64.decodeUrl(url.view(), mut back)!;
+    Check.equalBytes(raw[..], back.view())?;
+    var mime = Vector<u8>.create();
+    Base64.decodeIgnoringSpace("Zm9v\r\nYmFy\r\n".bytes(), mut mime)!;
+    return Check.equalBytes("foobar".bytes(), mime.view());
+}
+
+@test
+fn base64RejectsMalformed() -> Result<void, TestFailure> {
+    rejected("Z")?; // one digit carries no whole byte
+    rejected("Zm9vY")?;
+    rejected("Zg=")?; // padding present but short
+    rejected("Zg===")?;
+    rejected("=Zg=")?;
+    rejected("Zg==Zg==")?; // data after padding
+    rejected("Zm 9v")?;
+    rejected("Zm9v-_")?; // URL alphabet in standard base64
+    return Ok();
+}
+
+@test
+fn base64RoundTripsEveryLength() -> Result<void, TestFailure> {
+    var data = Vector<u8>.create();
+    for (n in 0..300) {
+        var coded = Vector<u8>.create();
+        Base64.encode(data.view(), mut coded)!;
+        var back = Vector<u8>.create();
+        Base64.decode(coded.view(), mut back)!;
+        Check.equalBytes(data.view(), back.view())?;
+        var urlCoded = Vector<u8>.create();
+        Base64.encodeUrl(data.view(), mut urlCoded)!;
+        var urlBack = Vector<u8>.create();
+        Base64.decodeUrl(urlCoded.view(), mut urlBack)!;
+        Check.equalBytes(data.view(), urlBack.view())?;
+        data.push(truncate<u8>(n * 37 + 11))!;
+    }
+    return Ok();
+}
+
+@test
+fn hexRoundTrip() -> Result<void, TestFailure> {
+    let raw = [0x00u8, 0x01, 0x7F, 0x80, 0xAB, 0xFF];
+    var lower = Vector<u8>.create();
+    Hex.encode(raw[..], mut lower)!;
+    Check.isTrue(text(lower) == "00017f80abff", "encoding")?;
+    var upper = Vector<u8>.create();
+    Hex.encodeUpper(raw[..], mut upper)!;
+    Check.isTrue(text(upper) == "00017F80ABFF", "encoding")?;
+    var back = Vector<u8>.create();
+    Hex.decode("00017f80ABff".bytes(), mut back)!;
+    Check.equalBytes(raw[..], back.view())?;
+    var bad = Vector<u8>.create();
+    match (Hex.decode("abc".bytes(), mut bad)) {
+        Ok() => { return Check.fail("odd length accepted"); }
+        Err(_) => {}
+    }
+    match (Hex.decode("zz".bytes(), mut bad)) {
+        Ok() => { return Check.fail("bad digit accepted"); }
+        Err(_) => {}
+    }
+    return Check.equalU64(0, bad.length as u64);
+}

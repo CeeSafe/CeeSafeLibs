@@ -1,0 +1,190 @@
+/// An allocation's outcome as a `TlsError`.
+fn grown(outcome: Result<void, AllocError>) -> Result<void, TlsError> {
+    match (outcome) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(TlsError.OutOfMemory); }
+    }
+}
+
+/// The lowest protocol version a configuration accepts.
+public enum TlsVersion {
+    Tls12,
+    Tls13,
+}
+
+/// TLS settings for one side of a connection: a certificate, trusted roots, verification, ALPN and SNI.
+///
+/// Configure it with `borrow mut` methods, then share it: it may be borrowed by any number of connections at once,
+/// on any thread (it is `Send` and `Share`; OpenSSL's context is thread-safe once configured). `clone` is cheap: it
+/// takes another reference to the same OpenSSL context.
+@noncopy
+public struct TlsConfig {
+    private raw: usize;
+    private serverSide: bool;
+
+    /// Safety: `raw` is a live SSL_CTX reference this value owns.
+    drop {
+        unsafe { cstls_ctx_free(this.raw as *mut void); }
+    }
+
+    /// A client configuration that verifies the server's certificate against the system's trusted roots and checks
+    /// the host name it was asked to connect to. TLS 1.2 or later.
+    public fn client() -> Result<TlsConfig, TlsError> {
+        var config = TlsConfig.empty(false)?;
+        config.trustSystem()?;
+        return Ok(config);
+    }
+
+    /// A client configuration that trusts nothing yet: add roots with `trustPem` or `trustSystem`.
+    public fn clientWithoutRoots() -> Result<TlsConfig, TlsError> => TlsConfig.empty(false);
+
+    /// A server configuration presenting the PEM certificate chain `chainPem` (the leaf first, then any
+    /// intermediates) with the PEM private key `keyPem`. Client certificates are not requested.
+    public fn server(chainPem: Slice<u8>, keyPem: Slice<u8>) -> Result<TlsConfig, TlsError> {
+        var config = TlsConfig.empty(true)?;
+        config.useCertificate(chainPem, keyPem)?;
+        return Ok(config);
+    }
+
+    /// Safety: a null result is checked before the pointer is kept.
+    fn empty(server: bool) -> Result<TlsConfig, TlsError> {
+        let raw = unsafe { cstls_ctx_new(if (server) 1 else 0) } as usize;
+        if (raw == 0) {
+            return Err(TlsError.OutOfMemory);
+        }
+        return Ok(TlsConfig { raw: raw, serverSide: server });
+    }
+
+    /// Another reference to the same configuration.
+    /// Safety: `raw` is live while `this` is; the new value owns the reference it takes.
+    public fn clone(borrow this) -> TlsConfig {
+        unsafe { cstls_ctx_up_ref(this.raw as *mut void); }
+        return TlsConfig { raw: this.raw, serverSide: this.serverSide };
+    }
+
+    /// Whether this is a server configuration.
+    public fn isServer(borrow this) -> bool => this.serverSide;
+
+    /// Replaces the certificate chain and private key (PEM). For a running server, prefer a new `TlsConfig` swapped
+    /// in through `SharedTlsConfig.replace`, which never changes a configuration that connections are using.
+    /// Safety: the slices are live for the call, which reads them and keeps nothing.
+    public fn useCertificate(borrow mut this, chainPem: Slice<u8>, keyPem: Slice<u8>) -> Result<void, TlsError> {
+        let code = unsafe { cstls_ctx_use_pem(
+            this.raw as *mut void,
+            chainPem.ptr,
+            chainPem.length,
+            keyPem.ptr,
+            keyPem.length,
+        ) };
+        return TlsErrors.check(code);
+    }
+
+    /// Trusts the system's default roots (OpenSSL's configured CA file and directory).
+    /// Safety: `raw` is live.
+    public fn trustSystem(borrow mut this) -> Result<void, TlsError> =>
+        TlsErrors.check(unsafe { cstls_ctx_trust_system(this.raw as *mut void) });
+
+    /// Trusts every certificate in `pem` (one or more PEM blocks).
+    /// Safety: the slice is live for the call, which copies what it keeps.
+    public fn trustPem(borrow mut this, pem: Slice<u8>) -> Result<void, TlsError> =>
+        TlsErrors.check(unsafe { cstls_ctx_trust_pem(this.raw as *mut void, pem.ptr, pem.length) });
+
+    /// Whether the peer's certificate is verified. For a client (on by default), the server's chain and host name;
+    /// for a server (off by default), a client certificate is then required and verified against the trusted roots.
+    /// Safety: `raw` is live.
+    public fn verifyPeer(borrow mut this, on: bool) {
+        unsafe { cstls_ctx_verify_peer(this.raw as *mut void, if (on) 1 else 0); }
+    }
+
+    /// Lets this client configuration's connections authenticate servers with DANE (`TlsStream.connectDaneWithin`).
+    /// Call it once, before the configuration is shared: it changes the OpenSSL context.
+    /// Safety: `raw` is live.
+    public fn enableDane(borrow mut this) -> Result<void, TlsError> =>
+        TlsErrors.check(unsafe { cstls_ctx_dane_enable(this.raw as *mut void) });
+
+    /// The lowest protocol version accepted (TLS 1.2 by default).
+    /// Safety: `raw` is live.
+    public fn minVersion(borrow mut this, version: TlsVersion) -> Result<void, TlsError> {
+        let v: i32 = match (version) {
+            TlsVersion.Tls12 => 12,
+            TlsVersion.Tls13 => 13,
+        };
+        return TlsErrors.check(unsafe { cstls_ctx_min_version(this.raw as *mut void, v) });
+    }
+
+    /// The application protocols offered (a client) or accepted in order of preference (a server), such as
+    /// `["h2", "http/1.1"]`. A server that sets them refuses a client offering none of them (RFC 7301).
+    /// Safety: the wire buffer is live for the call, which copies it.
+    public fn alpn(borrow mut this, protocols: Slice<StringView>) -> Result<void, TlsError> {
+        var wire = Vector<u8>.create();
+        for (p in protocols) {
+            if (p.length == 0 || p.length > 255) {
+                return Err(TlsError.Config);
+            }
+            grown(wire.pushBE(truncate<u8>(p.length)))?;
+            grown(wire.extend(p.bytes()))?;
+        }
+        let w = wire.view();
+        return TlsErrors.check(unsafe { cstls_ctx_set_alpn(this.raw as *mut void, w.ptr, w.length) });
+    }
+
+    /// For a server: presents `certificate`'s chain to clients that ask for `name` with SNI. `name` is a host name or
+    /// a wildcard `*.example.com` (one label); exact names win over wildcards, and clients asking for any other
+    /// name, or none, get this configuration's own certificate. ALPN and verification stay this configuration's.
+    /// Safety: both contexts are live; the shim takes its own reference to `certificate`'s.
+    public fn addServerName(
+        borrow mut this,
+        name: StringView,
+        certificate: borrow TlsConfig,
+    ) -> Result<void, TlsError> {
+        if (!this.serverSide || !certificate.serverSide) {
+            return Err(TlsError.Config);
+        }
+        return TlsErrors.check(
+            unsafe { cstls_ctx_add_sni(this.raw as *mut void, name.ptr, name.length, certificate.raw as *mut void) },
+        );
+    }
+
+    fn handle(borrow this) -> usize => this.raw;
+}
+
+/// A server configuration that can be replaced while connections use it, for certificate renewal. Share it across
+/// tasks and threads with an `Arc`. `replace` affects connections accepted afterwards; established ones keep the
+/// configuration they started with.
+@noncopy
+public struct SharedTlsConfig {
+    private raw: usize;
+    private serverSide: bool;
+
+    /// Safety: `raw` is a live holder this value owns.
+    drop {
+        unsafe { cstls_holder_free(this.raw as *mut void); }
+    }
+
+    /// A holder starting with `config`.
+    /// Safety: the holder takes its own reference to `config`'s context; a null result is checked.
+    public fn create(config: TlsConfig) -> Result<SharedTlsConfig, TlsError> {
+        let raw = unsafe { cstls_holder_new(config.handle() as *mut void) } as usize;
+        if (raw == 0) {
+            return Err(TlsError.OutOfMemory);
+        }
+        return Ok(SharedTlsConfig { raw: raw, serverSide: config.isServer() });
+    }
+
+    /// Makes `config` the current configuration. It must be the same kind (server or client) as the first.
+    /// Safety: the holder takes its own reference, under its lock.
+    public fn replace(borrow this, config: TlsConfig) -> Result<void, TlsError> {
+        if (config.isServer() != this.serverSide) {
+            return Err(TlsError.Config);
+        }
+        unsafe { cstls_holder_set(this.raw as *mut void, config.handle() as *mut void); }
+        return Ok();
+    }
+
+    /// The current configuration.
+    /// Safety: `cstls_holder_get` returns a new reference, which the result owns.
+    public fn current(borrow this) -> TlsConfig {
+        let raw = unsafe { cstls_holder_get(this.raw as *mut void) } as usize;
+        return TlsConfig { raw: raw, serverSide: this.serverSide };
+    }
+}

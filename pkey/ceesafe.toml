@@ -1,0 +1,14 @@
+[package]
+name = "pkey"
+version = "0.1.0"
+kind = "library"
+c = ["c/pkey_shim.c"]
+tests = ["tests"]
+links = ["crypto"]
+
+# Homebrew's OpenSSL 3 (Apple Silicon). On Linux the distribution's libssl-dev is on the default paths.
+[target.macos]
+lib-dirs = ["/opt/homebrew/opt/openssl@3/lib"]
+include-dirs = ["/opt/homebrew/opt/openssl@3/include"]
+
+[dependencies]

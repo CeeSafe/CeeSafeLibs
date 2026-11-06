@@ -1,0 +1,87 @@
+// The C shim's functions (c/tls_shim.h). None of them sleeps: they work on memory BIOs only, so they may be called
+// from async code. They allocate through OpenSSL and ceesafe/foreign.h.
+
+extern "C" {
+    @effects(alloc)
+    fn cstls_ctx_new(server: i32) -> *mut void;
+    @effects()
+    fn cstls_ctx_up_ref(ctx: *mut void);
+    @effects()
+    fn cstls_ctx_free(ctx: *mut void);
+    @effects(alloc)
+    fn cstls_ctx_use_pem(ctx: *mut void, chain: *u8, chainLength: usize, key: *u8, keyLength: usize) -> i32;
+    @effects(alloc)
+    fn cstls_ctx_trust_system(ctx: *mut void) -> i32;
+    @effects(alloc)
+    fn cstls_ctx_trust_pem(ctx: *mut void, pem: *u8, length: usize) -> i32;
+    @effects()
+    fn cstls_ctx_verify_peer(ctx: *mut void, on: i32);
+    @effects()
+    fn cstls_ctx_min_version(ctx: *mut void, version: i32) -> i32;
+    @effects(alloc)
+    fn cstls_ctx_set_alpn(ctx: *mut void, wire: *u8, length: usize) -> i32;
+    @effects(alloc)
+    fn cstls_ctx_add_sni(ctx: *mut void, name: *u8, length: usize, child: *mut void) -> i32;
+
+    @effects(alloc)
+    fn cstls_holder_new(ctx: *mut void) -> *mut void;
+    @effects()
+    fn cstls_holder_get(holder: *mut void) -> *mut void;
+    @effects()
+    fn cstls_holder_set(holder: *mut void, ctx: *mut void);
+    @effects()
+    fn cstls_holder_free(holder: *mut void);
+
+    @effects(alloc)
+    fn cstls_conn_new(ctx: *mut void, server: i32, host: *u8, hostLength: usize, verifyHost: i32) -> *mut void;
+    @effects()
+    fn cstls_conn_free(conn: *mut void);
+    @effects(alloc)
+    fn cstls_conn_handshake(conn: *mut void) -> i32;
+    @effects(alloc)
+    fn cstls_conn_feed(conn: *mut void, bytes: *u8, length: usize) -> i64;
+    @effects()
+    fn cstls_conn_pending_out(conn: *mut void) -> usize;
+    @effects()
+    fn cstls_conn_drain(conn: *mut void, out: *mut u8, capacity: usize) -> i64;
+    @effects(alloc)
+    fn cstls_conn_read(conn: *mut void, out: *mut u8, capacity: usize) -> i64;
+    @effects(alloc)
+    fn cstls_conn_write(conn: *mut void, bytes: *u8, length: usize) -> i64;
+    @effects(alloc)
+    fn cstls_conn_shutdown(conn: *mut void) -> i32;
+    @effects()
+    fn cstls_conn_version(conn: *mut void) -> i32;
+    @effects()
+    fn cstls_conn_alpn(conn: *mut void, out: *mut u8, capacity: usize) -> usize;
+    @effects()
+    fn cstls_conn_server_name(conn: *mut void, out: *mut u8, capacity: usize) -> usize;
+    @effects()
+    fn cstls_conn_verify_result(conn: *mut void) -> i64;
+    @effects()
+    fn cstls_conn_has_peer_certificate(conn: *mut void) -> i32;
+
+    @effects()
+    fn cstls_ctx_dane_enable(ctx: *mut void) -> i32;
+    @effects(alloc)
+    fn cstls_conn_dane_enable(conn: *mut void, base: *u8, length: usize) -> i32;
+    @effects(alloc)
+    fn cstls_conn_dane_add(conn: *mut void, usage: i32, selector: i32, matching: i32, data: *u8, length: usize) -> i32;
+    @effects()
+    fn cstls_conn_dane_depth(conn: *mut void) -> i32;
+
+    @effects()
+    fn cstls_take_error() -> u64;
+    @effects()
+    fn cstls_error_text(code: u64, out: *mut u8, capacity: usize) -> usize;
+    @effects()
+    fn cstls_verify_text(code: i64, out: *mut u8, capacity: usize) -> usize;
+}
+
+// Result codes of the configuration functions (tls_shim.h).
+const CSTLS_OK: i32 = 0;
+const CSTLS_ERR_CERT: i32 = -1;
+const CSTLS_ERR_KEY: i32 = -2;
+const CSTLS_ERR_KEY_MISMATCH: i32 = -3;
+const CSTLS_ERR_NOMEM: i32 = -4;
+const CSTLS_ERR_TRUST: i32 = -5;

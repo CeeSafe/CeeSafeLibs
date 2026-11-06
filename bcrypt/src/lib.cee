@@ -1,0 +1,309 @@
+// bcrypt (Provos and Mazières, 1999), as OpenBSD defines it: `$2b$` hashes, and `$2a$`/`$2y$`, which verify the same
+// way for passwords of up to 72 bytes. Pure CeeSafe; the Blowfish tables are pi's digits (src/tables.cee).
+
+import sha256.constantTimeEqual;
+
+const ALPHABET: StringView = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const MAGIC: StringView = "OrpheanBeholderScryDoubt";
+
+/// Why a hash could not be made or read.
+public enum BcryptError {
+    /// The cost is outside 4 to 31.
+    Cost,
+    /// The system's random source failed.
+    Random,
+    OutOfMemory,
+}
+
+/// Blowfish's key schedule state.
+struct Blowfish {
+    p: [u32; 18];
+    s: [u32; 1024];
+
+    fn initial() -> Blowfish => Blowfish { p: P_INIT, s: S_INIT };
+
+    fn f(borrow this, x: u32) -> u32 {
+        let a = this.s[(x >> 24) as usize];
+        let b = this.s[256 + ((x >> 16) & 0xff) as usize];
+        let c = this.s[512 + ((x >> 8) & 0xff) as usize];
+        let d = this.s[768 + (x & 0xff) as usize];
+        return ((a.wrappingAdd(b)) ^ c).wrappingAdd(d);
+    }
+
+    fn encipher(borrow this, block: borrow mut [u32; 2]) {
+        var l = block[0];
+        var r = block[1];
+        l = l ^ this.p[0];
+        var i: usize = 1;
+        while (i <= 16) {
+            r = r ^ this.f(l) ^ this.p[i];
+            l = l ^ this.f(r) ^ this.p[i + 1];
+            i += 2;
+        }
+        block[0] = r ^ this.p[17];
+        block[1] = l;
+    }
+
+    /// The key schedule step: P is XORed with the key, then P and S are replaced by encryptions, mixing in `salt`
+    /// when one is given.
+    fn expand(borrow mut this, salt: Slice<u8>, key: Slice<u8>) {
+        var j: usize = 0;
+        for (i in 0..18) {
+            this.p[i] = this.p[i] ^ streamWord(key, mut j);
+        }
+        var block = [0u32; 2];
+        var k: usize = 0;
+        var i: usize = 0;
+        while (i < 18) {
+            if (salt.length > 0) {
+                block[0] = block[0] ^ streamWord(salt, mut k);
+                block[1] = block[1] ^ streamWord(salt, mut k);
+            }
+            this.encipher(mut block);
+            this.p[i] = block[0];
+            this.p[i + 1] = block[1];
+            i += 2;
+        }
+        i = 0;
+        while (i < 1024) {
+            if (salt.length > 0) {
+                block[0] = block[0] ^ streamWord(salt, mut k);
+                block[1] = block[1] ^ streamWord(salt, mut k);
+            }
+            this.encipher(mut block);
+            this.s[i] = block[0];
+            this.s[i + 1] = block[1];
+            i += 2;
+        }
+    }
+}
+
+/// The next four bytes of `data`, read cyclically, big-endian.
+fn streamWord(data: Slice<u8>, at: borrow mut usize) -> u32 {
+    var word: u32 = 0;
+    for (n in 0..4) {
+        if (at >= data.length) {
+            at = 0;
+        }
+        word = (word << 8) | (data[at] as u32);
+        at += 1;
+    }
+    return word;
+}
+
+/// The 23-byte bcrypt digest of `key` (the password and its NUL, at most 72 bytes) with `salt` at `cost`.
+fn digest(cost: u32, salt: Slice<u8>, key: Slice<u8>) -> [u8; 23] {
+    var state = Blowfish.initial();
+    state.expand(salt, key);
+    let zero = [0u8; 1];
+    let none = zero[0..0];
+    let rounds: u64 = 1u64 << (cost as u64);
+    for (r in 0..rounds) {
+        state.expand(none, key);
+        state.expand(none, salt);
+    }
+    var words = [0u32; 6];
+    var j: usize = 0;
+    for (i in 0..6) {
+        words[i] = streamWord(MAGIC.bytes(), mut j);
+    }
+    for (n in 0..64) {
+        var b: usize = 0;
+        while (b < 6) {
+            var block = [words[b], words[b + 1]];
+            state.encipher(mut block);
+            words[b] = block[0];
+            words[b + 1] = block[1];
+            b += 2;
+        }
+    }
+    var out = [0u8; 23];
+    var bytes = [0u8; 24];
+    for (i in 0..6) {
+        bytes[..].writeBE(i * 4, words[i]);
+    }
+    out[..].copyFrom(bytes[0..23]);
+    return out;
+}
+
+/// bcrypt's base64 (its own alphabet, no padding).
+fn encode64(data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let alphabet = ALPHABET.bytes();
+    var i: usize = 0;
+    while (i < data.length) {
+        let c1 = data[i];
+        i += 1;
+        out.push(alphabet[(c1 >> 2) as usize])?;
+        var c = (c1 & 0x03) << 4;
+        if (i >= data.length) {
+            return out.push(alphabet[c as usize]);
+        }
+        let c2 = data[i];
+        i += 1;
+        c = c | (c2 >> 4);
+        out.push(alphabet[c as usize])?;
+        c = (c2 & 0x0f) << 2;
+        if (i >= data.length) {
+            return out.push(alphabet[c as usize]);
+        }
+        let c3 = data[i];
+        i += 1;
+        c = c | (c3 >> 6);
+        out.push(alphabet[c as usize])?;
+        out.push(alphabet[(c3 & 0x3f) as usize])?;
+    }
+    return Ok();
+}
+
+fn value64(c: u8) -> u8 {
+    let alphabet = ALPHABET.bytes();
+    for (i in 0..64) {
+        if (alphabet[i] == c) {
+            return truncate<u8>(i);
+        }
+    }
+    return 255;
+}
+
+/// Decodes `text` (bcrypt's base64) into `out`; false on a character outside the alphabet.
+fn decode64(text: Slice<u8>, out: SliceMut<u8>) -> bool {
+    var o: usize = 0;
+    var i: usize = 0;
+    while (o < out.length) {
+        if (i + 1 >= text.length) {
+            return false;
+        }
+        let c1 = value64(text[i]);
+        let c2 = value64(text[i + 1]);
+        if (c1 == 255 || c2 == 255) {
+            return false;
+        }
+        out[o] = (c1 << 2) | ((c2 & 0x30) >> 4);
+        o += 1;
+        if (o >= out.length) {
+            return true;
+        }
+        if (i + 2 >= text.length) {
+            return false;
+        }
+        let c3 = value64(text[i + 2]);
+        if (c3 == 255) {
+            return false;
+        }
+        out[o] = ((c2 & 0x0f) << 4) | ((c3 & 0x3c) >> 2);
+        o += 1;
+        if (o >= out.length) {
+            return true;
+        }
+        if (i + 3 >= text.length) {
+            return false;
+        }
+        let c4 = value64(text[i + 3]);
+        if (c4 == 255) {
+            return false;
+        }
+        out[o] = ((c3 & 0x03) << 6) | c4;
+        o += 1;
+        i += 4;
+    }
+    return true;
+}
+
+/// The key bcrypt uses: the password, its terminating NUL, at most 72 bytes.
+fn keyOf(password: Slice<u8>, out: borrow mut [u8; 73]) -> usize {
+    let n = if (password.length > 72) 72 else password.length;
+    out[0..n].copyFrom(password[0..n]);
+    out[n] = 0;
+    return if (n + 1 > 72) 72 else n + 1;
+}
+
+/// The cost, salt and digest of a `$2a$`, `$2b$` or `$2y$` hash; `null` if it is not one.
+struct Parsed {
+    cost: u32;
+    salt: [u8; 16];
+    digest: [u8; 23];
+}
+
+fn parse(hash: Slice<u8>) -> Parsed? {
+    if (hash.length != 60 || hash[0] != 0x24 || hash[1] != 0x32 || hash[3] != 0x24 || hash[6] != 0x24) {
+        return null;
+    }
+    let variant = hash[2];
+    if (variant != 0x61 && variant != 0x62 && variant != 0x79) {
+        return null;
+    }
+    if (hash[4] < 0x30 || hash[4] > 0x39 || hash[5] < 0x30 || hash[5] > 0x39) {
+        return null;
+    }
+    let cost = ((hash[4] - 0x30) as u32) * 10 + ((hash[5] - 0x30) as u32);
+    if (cost < 4 || cost > 31) {
+        return null;
+    }
+    var parsed = Parsed { cost: cost, salt: [0u8; 16], digest: [0u8; 23] };
+    if (!decode64(hash[7..29], mut parsed.salt[..]) || !decode64(hash[29..60], mut parsed.digest[..])) {
+        return null;
+    }
+    return parsed;
+}
+
+/// Hashing and checking passwords.
+public struct Bcrypt {
+    /// Whether `password` matches `hash` (`$2a$`, `$2b$` or `$2y$`). A malformed hash matches nothing. The compare
+    /// takes the same time wherever the digests differ. CPU-bound for 2^cost rounds (about 0.25 s at cost 12): async
+    /// code calls it through `Async.blocking`.
+    public fn verify(password: Slice<u8>, hash: StringView) -> bool {
+        let parsed = match (parse(hash.bytes())) {
+            Some(p) => p,
+            null => { return false; }
+        };
+        var key = [0u8; 73];
+        let length = keyOf(password, mut key);
+        let got = digest(parsed.cost, parsed.salt[..], key[0..length]);
+        return constantTimeEqual(got[..], parsed.digest[..]);
+    }
+
+    /// A new `$2b$` hash of `password` at `cost` (10 to 12 is usual), with a random salt.
+    public fn hash(password: Slice<u8>, cost: u32) -> Result<String, BcryptError> {
+        var salt = [0u8; 16];
+        match (Random.fill(mut salt[..])) {
+            Ok() => {}
+            Err(_) => { return Err(BcryptError.Random); }
+        }
+        return Bcrypt.hashWithSalt(password, cost, salt[..]);
+    }
+
+    /// As `hash`, with a given 16-byte salt (for tests and imports).
+    public fn hashWithSalt(password: Slice<u8>, cost: u32, salt: Slice<u8>) -> Result<String, BcryptError> {
+        if (cost < 4 || cost > 31 || salt.length != 16) {
+            return Err(BcryptError.Cost);
+        }
+        var key = [0u8; 73];
+        let length = keyOf(password, mut key);
+        let d = digest(cost, salt, key[0..length]);
+        var out = Vector<u8>.create();
+        match (fill(mut out, cost, salt, d[..])) {
+            Ok() => {}
+            Err(_) => { return Err(BcryptError.OutOfMemory); }
+        }
+        var text = String.create();
+        match (text.append(StringView.fromUtf8(out.view())!)) {
+            Ok() => { return Ok(text); }
+            Err(_) => { return Err(BcryptError.OutOfMemory); }
+        }
+    }
+
+    /// The cost of a bcrypt hash, or `null` if it is not one (to rehash old, cheap hashes at the next login).
+    public fn costOf(hash: StringView) -> u32? {
+        let parsed = parse(hash.bytes())?;
+        return parsed.cost;
+    }
+}
+
+fn fill(out: borrow mut Vector<u8>, cost: u32, salt: Slice<u8>, d: Slice<u8>) -> Result<void, AllocError> {
+    out.extend("$2b$".bytes())?;
+    out.push(0x30 + truncate<u8>(cost / 10))?;
+    out.push(0x30 + truncate<u8>(cost % 10))?;
+    out.push(0x24)?;
+    encode64(salt, out)?;
+    return encode64(d, out);
+}

@@ -1,0 +1,46 @@
+// Async.blocking leaves a stale wake when the task sees `done` before the blocking thread's wake lands; the task's next
+// suspension, on an Async.timeout's join, is then readied while still the scope's waiter, and a returning child
+// readies it a second time: the ready queue loops (a stall), or a later park aborts.
+enum E { T }
+
+async fn quick() -> Result<u32, E> {
+    return Ok(1);
+}
+
+async fn worker() -> Result<void, E> {
+    for (i in 0..20000) {
+        let n: u32 = await Async.blocking(() => 1u32);
+        let r = await Async.timeout(1000, E.T, async () => await quick());
+        match (r) {
+            Ok(v) => {
+                if (v + n != 2) {
+                    return Err(E.T);
+                }
+            }
+            Err(e) => { return Err(e); }
+        }
+    }
+    return Ok();
+}
+
+async fn all() -> Result<void, AllocError> {
+    await Async.scope(AllocError.OutOfMemory, (s) => {
+        for (k in 0..4) {
+            s.spawn(async () => {
+                match (await worker()) {
+                    Ok() => {}
+                    Err(_) => { return Err(AllocError.OutOfMemory); }
+                }
+                return Ok();
+            });
+        }
+    })?;
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(all())) {
+        Ok() => { Console.writeLine("ok"); }
+        Err(_) => { Console.writeLine("oom"); }
+    }
+}

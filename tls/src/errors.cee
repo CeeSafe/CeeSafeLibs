@@ -1,0 +1,95 @@
+/// What went wrong in a TLS operation.
+public enum TlsError {
+    /// The socket failed, or the operation was cancelled or timed out.
+    Io(AsyncError),
+    /// Memory ran out (in CeeSafe or in OpenSSL).
+    OutOfMemory,
+    /// The certificate chain could not be read or used.
+    Certificate,
+    /// The private key could not be read or used.
+    PrivateKey,
+    /// The private key does not belong to the certificate.
+    KeyMismatch,
+    /// Trusted certificates could not be loaded.
+    TrustStore,
+    /// A setting was refused, such as an empty or oversized ALPN list or server name.
+    Config,
+    /// The handshake failed; the payload is OpenSSL's packed error code (0 when none was recorded).
+    Handshake(u64),
+    /// The peer's certificate did not verify; the payload is OpenSSL's X509 verification result.
+    Verify(i64),
+    /// The connection failed after the handshake; the payload is OpenSSL's packed error code.
+    Protocol(u64),
+    /// The peer closed the TCP connection without a TLS close_notify, so the data may be cut short.
+    Truncated,
+    /// The connection was already shut down or broken.
+    Closed,
+}
+
+/// Words for `TlsError`s.
+public struct TlsErrors {
+    /// Writes a description of `error` into `out` and returns its length. OpenSSL's own text is used where there is
+    /// one.
+    /// Safety: each shim call writes at most `out.length` bytes into `out`.
+    public fn describe(error: TlsError, out: SliceMut<u8>) -> usize {
+        match (error) {
+            TlsError.Handshake(code) => {
+                if (code != 0) {
+                    return unsafe { cstls_error_text(code, out.ptr, out.length) };
+                }
+                return TlsErrors.fixed("TLS handshake failed", out);
+            }
+            TlsError.Protocol(code) => {
+                if (code != 0) {
+                    return unsafe { cstls_error_text(code, out.ptr, out.length) };
+                }
+                return TlsErrors.fixed("TLS protocol error", out);
+            }
+            TlsError.Verify(code) => { return unsafe { cstls_verify_text(code, out.ptr, out.length) }; }
+            TlsError.Io(_) => { return TlsErrors.fixed("socket error", out); }
+            TlsError.OutOfMemory => { return TlsErrors.fixed("out of memory", out); }
+            TlsError.Certificate => { return TlsErrors.fixed("bad certificate chain", out); }
+            TlsError.PrivateKey => { return TlsErrors.fixed("bad private key", out); }
+            TlsError.KeyMismatch => { return TlsErrors.fixed("private key does not match the certificate", out); }
+            TlsError.TrustStore => { return TlsErrors.fixed("could not load trusted certificates", out); }
+            TlsError.Config => { return TlsErrors.fixed("invalid TLS setting", out); }
+            TlsError.Truncated => { return TlsErrors.fixed("connection closed without close_notify", out); }
+            TlsError.Closed => { return TlsErrors.fixed("TLS connection is closed", out); }
+        }
+    }
+
+    fn fixed(text: StringView, out: SliceMut<u8>) -> usize {
+        let n = if (text.length < out.length) text.length else out.length;
+        let bytes = text.bytes();
+        out[0..n].copyFrom(bytes[0..n]);
+        return n;
+    }
+
+    /// The error a configuration result code stands for.
+    fn fromConfig(code: i32) -> TlsError {
+        if (code == CSTLS_ERR_CERT) {
+            return TlsError.Certificate;
+        }
+        if (code == CSTLS_ERR_KEY) {
+            return TlsError.PrivateKey;
+        }
+        if (code == CSTLS_ERR_KEY_MISMATCH) {
+            return TlsError.KeyMismatch;
+        }
+        if (code == CSTLS_ERR_NOMEM) {
+            return TlsError.OutOfMemory;
+        }
+        if (code == CSTLS_ERR_TRUST) {
+            return TlsError.TrustStore;
+        }
+        return TlsError.Config;
+    }
+
+    /// Turns a configuration result code into a result.
+    fn check(code: i32) -> Result<void, TlsError> {
+        if (code == CSTLS_OK) {
+            return Ok();
+        }
+        return Err(TlsErrors.fromConfig(code));
+    }
+}

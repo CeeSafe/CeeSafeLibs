@@ -1,0 +1,184 @@
+// Files beyond lib/std's `File`: positioned reads, fsync, rename, mkdir -p and exclusive creation, for stores that
+// must survive a crash (write to a temporary name, sync, rename, sync the directory).
+//
+// Every call may block on the disk. Async code makes them through `Async.blocking`, so other tasks keep running.
+
+/// Why a file operation failed.
+public enum FileError {
+    NotFound,
+    Exists,
+    Denied,
+    NoSpace,
+    /// Another error: the negative errno.
+    Os(i32),
+}
+
+/// Safety: the shim's errno constants are pure functions.
+fn errorOf(code: i64) -> FileError {
+    let c = truncate<i32>(code);
+    if (c == unsafe { csf_errno_not_found() }) {
+        return FileError.NotFound;
+    }
+    if (c == unsafe { csf_errno_exists() }) {
+        return FileError.Exists;
+    }
+    if (c == unsafe { csf_errno_denied() }) {
+        return FileError.Denied;
+    }
+    if (c == unsafe { csf_errno_no_space() }) {
+        return FileError.NoSpace;
+    }
+    return FileError.Os(c);
+}
+
+fn check(code: i32) -> Result<void, FileError> {
+    if (code < 0) {
+        return Err(errorOf(code as i64));
+    }
+    return Ok();
+}
+
+/// Words for a `FileError`.
+public fn describe(error: FileError) -> StringView {
+    match (error) {
+        FileError.NotFound => { return "no such file or directory"; }
+        FileError.Exists => { return "the file exists"; }
+        FileError.Denied => { return "permission denied"; }
+        FileError.NoSpace => { return "no space left on the device"; }
+        FileError.Os(_) => { return "file system error"; }
+    }
+}
+
+/// An open file descriptor. Its drop closes it, without waiting for the device, so async code may drop one.
+@noncopy
+public struct RawFile {
+    private fd: i64;
+
+    /// Safety: `fd` is a descriptor this value owns, or -1.
+    drop {
+        unsafe { csf_close(this.fd); }
+    }
+
+    /// Safety: the shim reads `path.length` bytes of the view during the call only.
+    fn opened(path: StringView, mode: i32) -> Result<RawFile, FileError> {
+        let bytes = path.bytes();
+        let fd = unsafe { csf_open(bytes.ptr, bytes.length, mode) };
+        if (fd < 0) {
+            return Err(errorOf(fd));
+        }
+        return Ok(RawFile { fd: fd });
+    }
+
+    /// Opens an existing file for reading.
+    public fn open(path: StringView) -> Result<RawFile, FileError> => RawFile.opened(path, 0);
+
+    /// Creates a new file for writing; `FileError.Exists` if there is one already.
+    public fn createNew(path: StringView) -> Result<RawFile, FileError> => RawFile.opened(path, 1);
+
+    /// Creates or truncates a file for writing.
+    public fn create(path: StringView) -> Result<RawFile, FileError> => RawFile.opened(path, 2);
+
+    /// Opens or creates a file for appending.
+    public fn append(path: StringView) -> Result<RawFile, FileError> => RawFile.opened(path, 3);
+
+    /// Reads up to `out.length` bytes at `offset`, without moving any file position; 0 at the end.
+    /// Safety: the shim writes at most `out.length` bytes into `out`.
+    public fn readAt(borrow this, out: SliceMut<u8>, offset: u64) -> Result<usize, FileError> {
+        let n = unsafe { csf_pread(this.fd, out.ptr, out.length, offset) };
+        if (n < 0) {
+            return Err(errorOf(n));
+        }
+        return Ok(truncate<usize>(n));
+    }
+
+    /// Reads exactly `out.length` bytes at `offset`; `NotFound` if the file ends first.
+    public fn readExactAt(borrow this, out: SliceMut<u8>, offset: u64) -> Result<void, FileError> {
+        var done: usize = 0;
+        while (done < out.length) {
+            let n = this.readAt(mut out[done..], offset + (done as u64))?;
+            if (n == 0) {
+                return Err(FileError.NotFound);
+            }
+            done += n;
+        }
+        return Ok();
+    }
+
+    /// Writes all of `bytes` at the file's position.
+    /// Safety: the shim reads `bytes.length` bytes during the call only.
+    public fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, FileError> {
+        let r = unsafe { csf_write_all(this.fd, bytes.ptr, bytes.length) };
+        if (r < 0) {
+            return Err(errorOf(r));
+        }
+        return Ok();
+    }
+
+    /// Flushes the file's data and metadata to the device (fsync).
+    /// Safety: `fd` is this value's open descriptor.
+    public fn sync(borrow this) -> Result<void, FileError> => check(unsafe { csf_sync(this.fd) });
+
+    /// The file's size in bytes.
+    /// Safety: as `sync`.
+    public fn size(borrow this) -> Result<u64, FileError> {
+        let n = unsafe { csf_size(this.fd) };
+        if (n < 0) {
+            return Err(errorOf(n));
+        }
+        return Ok(truncate<u64>(n));
+    }
+}
+
+/// Operations on paths.
+public struct Files {
+    /// Renames `from` to `to`, replacing `to` atomically if it exists.
+    /// Safety: the shim reads both views during the call only.
+    public fn rename(from: StringView, to: StringView) -> Result<void, FileError> {
+        let a = from.bytes();
+        let b = to.bytes();
+        return check(unsafe { csf_rename(a.ptr, a.length, b.ptr, b.length) });
+    }
+
+    /// Removes a file.
+    /// Safety: as `rename`.
+    public fn remove(path: StringView) -> Result<void, FileError> {
+        let p = path.bytes();
+        return check(unsafe { csf_remove(p.ptr, p.length) });
+    }
+
+    /// Whether anything exists at `path`.
+    /// Safety: as `rename`.
+    public fn exists(path: StringView) -> Result<bool, FileError> {
+        let p = path.bytes();
+        let r = unsafe { csf_exists(p.ptr, p.length) };
+        if (r < 0) {
+            return Err(errorOf(r as i64));
+        }
+        return Ok(r == 1);
+    }
+
+    /// Creates `path` and every missing parent directory (mkdir -p).
+    /// Safety: as `rename`.
+    public fn makeDirectories(path: StringView) -> Result<void, FileError> {
+        let p = path.bytes();
+        return check(unsafe { csf_make_dirs(p.ptr, p.length) });
+    }
+
+    /// When `path` was last modified, in Unix seconds.
+    /// Safety: as `rename`.
+    public fn modifiedSeconds(path: StringView) -> Result<i64, FileError> {
+        let p = path.bytes();
+        let r = unsafe { csf_modified(p.ptr, p.length) };
+        if (r < 0) {
+            return Err(errorOf(r));
+        }
+        return Ok(r);
+    }
+
+    /// Flushes a directory's entries to the device, so a rename or creation in it survives a crash.
+    /// Safety: as `rename`.
+    public fn syncDirectory(path: StringView) -> Result<void, FileError> {
+        let p = path.bytes();
+        return check(unsafe { csf_sync_dir(p.ptr, p.length) });
+    }
+}

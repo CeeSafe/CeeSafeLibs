@@ -1,0 +1,6 @@
+[package]
+name = "stalewake"
+version = "0.1.0"
+kind = "executable"
+
+[dependencies]

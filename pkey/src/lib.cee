@@ -1,0 +1,201 @@
+// Public-key signatures through OpenSSL 3, for DKIM: RSA with SHA-256 (PKCS #1 v1.5) and Ed25519. Verifying
+// (`Signatures`), and signing with keys made or imported here (`Keys`, `PrivateKey`).
+
+extern "C" {
+    @effects()
+    fn pks_verify_rsa_sha256(
+        key: *u8,
+        keyLength: usize,
+        data: *u8,
+        dataLength: usize,
+        sig: *u8,
+        sigLength: usize,
+    ) -> i32;
+    @effects()
+    fn pks_verify_ed25519(key: *u8, keyLength: usize, data: *u8, dataLength: usize, sig: *u8, sigLength: usize) -> i32;
+    @effects()
+    fn pks_key_kind(key: *u8, keyLength: usize) -> i32;
+    @effects()
+    fn pks_sign(key: *u8, keyLength: usize, data: *u8, dataLength: usize, out: *mut u8, cap: usize) -> i64;
+    @effects()
+    fn pks_generate(kind: i32, bits: i32, out: *mut u8, cap: usize) -> i64;
+    @effects()
+    fn pks_public(key: *u8, keyLength: usize, out: *mut u8, cap: usize) -> i64;
+    @effects()
+    fn pks_from_pem(pem: *u8, pemLength: usize, out: *mut u8, cap: usize) -> i64;
+}
+
+/// Why a key operation failed.
+public enum KeyError {
+    /// Not a private key this package can use (RSA or Ed25519, in PKCS #8 DER or, for `fromPem`, PEM).
+    BadKey,
+    OutOfMemory,
+    /// OpenSSL could not do it.
+    Failed,
+}
+
+fn keyErrorOf(code: i64) -> KeyError {
+    if (code == -1) {
+        return KeyError.BadKey;
+    }
+    if (code == -3) {
+        return KeyError.OutOfMemory;
+    }
+    return KeyError.Failed;
+}
+
+/// The kinds of key.
+public enum KeyKind {
+    Rsa,
+    Ed25519,
+}
+
+/// The largest key, public key or signature the shim writes: an 8192-bit RSA key's PKCS #8 DER is under 5 KB.
+const KEY_BUFFER: usize = 8192;
+
+/// Runs a shim call that writes up to `KEY_BUFFER` bytes into `out` (replacing its contents).
+fn written(out: borrow mut Vector<u8>, code: i64) -> Result<void, KeyError> {
+    if (code < 0) {
+        out.clear();
+        return Err(keyErrorOf(code));
+    }
+    return grown(out.resize(truncate<usize>(code), 0));
+}
+
+fn grown(r: Result<void, AllocError>) -> Result<void, KeyError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(KeyError.OutOfMemory),
+};
+
+/// A private key: PKCS #8 DER, RSA or Ed25519. Store `der()`; keep it secret.
+@noncopy
+public struct PrivateKey {
+    bytes: Vector<u8>;
+    kind: KeyKind;
+
+    /// The key in `der` (PKCS #8), checked.
+    /// Safety: the shim reads `der` during the call only.
+    public fn fromDer(der: Slice<u8>) -> Result<PrivateKey, KeyError> {
+        let code = unsafe { pks_key_kind(der.ptr, der.length) };
+        if (code < 0) {
+            return Err(KeyError.BadKey);
+        }
+        var bytes = Vector<u8>.create();
+        grown(bytes.extend(der))?;
+        return Ok(PrivateKey { bytes: bytes, kind: if (code == 1) KeyKind.Rsa else KeyKind.Ed25519 });
+    }
+
+    /// A PEM private key (PKCS #8 `PRIVATE KEY`, or `RSA PRIVATE KEY`), as from another server or openssl.
+    /// Safety: the shim reads `pem` and writes at most `KEY_BUFFER` bytes into the buffer during the call.
+    public fn fromPem(pem: Slice<u8>) -> Result<PrivateKey, KeyError> {
+        var der = Vector<u8>.create();
+        grown(der.resize(KEY_BUFFER, 0))?;
+        let room = der.viewMut();
+        let code = unsafe { pks_from_pem(pem.ptr, pem.length, room.ptr, room.length) };
+        written(mut der, code)?;
+        return PrivateKey.fromDer(der.view());
+    }
+
+    /// A new key: RSA of `bits` (2048 is DKIM's usual size; 1024 is the least RFC 8301 allows), or Ed25519 (`bits`
+    /// is ignored).
+    /// Safety: the shim writes at most `KEY_BUFFER` bytes into the buffer.
+    public fn generate(kind: KeyKind, bits: u32) -> Result<PrivateKey, KeyError> {
+        let k = match (kind) {
+            KeyKind.Rsa => 1,
+            KeyKind.Ed25519 => 2,
+        };
+        var der = Vector<u8>.create();
+        grown(der.resize(KEY_BUFFER, 0))?;
+        let room = der.viewMut();
+        let code = unsafe { pks_generate(k, truncate<i32>(bits), room.ptr, room.length) };
+        written(mut der, code)?;
+        return PrivateKey.fromDer(der.view());
+    }
+
+    /// The PKCS #8 DER, to store.
+    public fn der(borrow this) -> Slice<u8> => this.bytes.view();
+
+    public fn isRsa(borrow this) -> bool => match (this.kind) {
+        KeyKind.Rsa => true,
+        KeyKind.Ed25519 => false,
+    };
+
+    /// The public key as DKIM's `p=` holds it (before base64): SubjectPublicKeyInfo DER for RSA, the raw 32 bytes
+    /// for Ed25519.
+    /// Safety: as `fromPem`.
+    public fn publicKey(borrow this, out: borrow mut Vector<u8>) -> Result<void, KeyError> {
+        let key = this.bytes.view();
+        grown(out.resize(KEY_BUFFER, 0))?;
+        let room = out.viewMut();
+        let code = unsafe { pks_public(key.ptr, key.length, room.ptr, room.length) };
+        return written(out, code);
+    }
+
+    /// Signs `data`: RSA PKCS #1 v1.5 over its SHA-256, or Ed25519 over `data` itself (DKIM's ed25519-sha256 passes
+    /// the SHA-256 hash as `data`, RFC 8463).
+    /// Safety: as `fromPem`.
+    public fn sign(borrow this, data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, KeyError> {
+        let key = this.bytes.view();
+        grown(out.resize(KEY_BUFFER, 0))?;
+        let room = out.viewMut();
+        let code = unsafe { pks_sign(key.ptr, key.length, data.ptr, data.length, room.ptr, room.length) };
+        return written(out, code);
+    }
+}
+
+/// What a verification found.
+public enum Verdict {
+    Good,
+    Bad,
+    /// The key could not be read, or is not the right kind.
+    BadKey,
+    /// An RSA key under 1024 bits, which RFC 8301 forbids.
+    WeakKey,
+    OutOfMemory,
+}
+
+fn verdictOf(code: i32) -> Verdict {
+    if (code == 1) {
+        return Verdict.Good;
+    }
+    if (code == 0) {
+        return Verdict.Bad;
+    }
+    if (code == -2) {
+        return Verdict.WeakKey;
+    }
+    if (code == -3) {
+        return Verdict.OutOfMemory;
+    }
+    return Verdict.BadKey;
+}
+
+public struct Signatures {
+    /// Whether `signature` is `key`'s RSA PKCS #1 v1.5 signature of SHA-256(`data`). `key` is DER:
+    /// SubjectPublicKeyInfo or RSAPublicKey.
+    /// Safety: the shim reads each slice during the call only.
+    public fn verifyRsaSha256(key: Slice<u8>, data: Slice<u8>, signature: Slice<u8>) -> Verdict =>
+        verdictOf(
+            unsafe { pks_verify_rsa_sha256(
+                key.ptr,
+                key.length,
+                data.ptr,
+                data.length,
+                signature.ptr,
+                signature.length,
+            ) },
+        );
+
+    /// Whether `signature` is `key`'s Ed25519 signature of `data`. `key` is the raw 32-byte public key.
+    /// Safety: as `verifyRsaSha256`.
+    public fn verifyEd25519(key: Slice<u8>, data: Slice<u8>, signature: Slice<u8>) -> Verdict =>
+        verdictOf(
+            unsafe { pks_verify_ed25519(key.ptr, key.length, data.ptr, data.length, signature.ptr, signature.length) },
+        );
+}
+
+/// Whether a verdict is `Good`.
+public fn isGood(v: Verdict) -> bool => match (v) {
+    Verdict.Good => true,
+    _ => false,
+};

@@ -1,0 +1,120 @@
+// Keys and signatures made by the openssl command line (tests/fixtures): an independent signer.
+
+fn fixture(name: StringView) -> Vector<u8> {
+    var path = String.create();
+    path.append("tests/fixtures/")!;
+    path.append(name)!;
+    var file = File.open(path.view())!;
+    var out = Vector<u8>.create();
+    var buffer = [0u8; 4096];
+    loop {
+        let n = file.read(mut buffer[..])!;
+        if (n == 0) {
+            return out;
+        }
+        out.extend(buffer[0..n])!;
+    }
+}
+
+fn good(v: Verdict) -> bool => isGood(v);
+
+fn bad(v: Verdict) -> bool => match (v) {
+    Verdict.Bad => true,
+    _ => false,
+};
+
+@test
+fn verifiesRsa() -> Result<void, TestFailure> {
+    let data = fixture("data.bin");
+    let sig = fixture("rsa.sig");
+    let spki = fixture("rsa.spki.der");
+    let pkcs1 = fixture("rsa.pkcs1.der");
+    let weakKey = fixture("weak.spki.der");
+    let weakSig = fixture("weak.sig");
+    Check.isTrue(good(Signatures.verifyRsaSha256(spki.view(), data.view(), sig.view())), "SPKI key")?;
+    Check.isTrue(good(Signatures.verifyRsaSha256(pkcs1.view(), data.view(), sig.view())), "RSAPublicKey")?;
+    var changed = Vector<u8>.create();
+    changed.extend(data.view())!;
+    changed[0] = changed[0] ^ 1;
+    Check.isTrue(bad(Signatures.verifyRsaSha256(spki.view(), changed.view(), sig.view())), "changed data")?;
+    let weak = Signatures.verifyRsaSha256(weakKey.view(), data.view(), weakSig.view());
+    Check.isTrue(match (weak) {
+        Verdict.WeakKey => true,
+        _ => false,
+    }, "a 512-bit key is refused")?;
+    let junk = [1u8, 2, 3];
+    return Check.isTrue(match (Signatures.verifyRsaSha256(junk[..], data.view(), sig.view())) {
+        Verdict.BadKey => true,
+        _ => false,
+    }, "an unreadable key");
+}
+
+@test
+fn verifiesEd25519() -> Result<void, TestFailure> {
+    let data = fixture("data.bin");
+    let key = fixture("ed.raw");
+    let sig = fixture("ed.sig");
+    let rsa = fixture("rsa.spki.der");
+    Check.isTrue(good(Signatures.verifyEd25519(key.view(), data.view(), sig.view())), "Ed25519")?;
+    var changed = Vector<u8>.create();
+    changed.extend(sig.view())!;
+    changed[10] = changed[10] ^ 0x80;
+    Check.isTrue(bad(Signatures.verifyEd25519(key.view(), data.view(), changed.view())), "a changed signature")?;
+    return Check.isTrue(!good(Signatures.verifyEd25519(rsa.view(), data.view(), sig.view())), "an RSA key");
+}
+
+// Signing. RSA PKCS #1 v1.5 and Ed25519 signatures are deterministic, so ours must equal openssl's byte for byte:
+// tests/fixtures/sign-rsa.pem (traditional PEM) and sign-ed.pem (PKCS #8), with sign-rsa.sig and sign-ed.sig made by
+//     openssl dgst -sha256 -sign sign-rsa.pem -out sign-rsa.sig data.bin
+//     openssl pkeyutl -sign -rawin -inkey sign-ed.pem -in data.bin -out sign-ed.sig
+
+fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool => a.length == b.length && a.startsWith(b);
+
+@test
+fn signsAsOpensslDoes() -> Result<void, TestFailure> {
+    let data = fixture("data.bin");
+    var sig = Vector<u8>.create();
+    let rsaPem = fixture("sign-rsa.pem");
+    let rsa = PrivateKey.fromPem(rsaPem.view())!;
+    Check.isTrue(rsa.isRsa(), "an RSA key")?;
+    rsa.sign(data.view(), mut sig)!;
+    let rsaSig = fixture("sign-rsa.sig");
+    Check.isTrue(sameBytes(sig.view(), rsaSig.view()), "RSA: openssl's signature")?;
+    let edPem = fixture("sign-ed.pem");
+    let ed = PrivateKey.fromPem(edPem.view())!;
+    Check.isFalse(ed.isRsa(), "an Ed25519 key")?;
+    ed.sign(data.view(), mut sig)!;
+    let edSig = fixture("sign-ed.sig");
+    return Check.isTrue(sameBytes(sig.view(), edSig.view()), "Ed25519: openssl's signature");
+}
+
+@test
+fn generatesKeysThatVerify() -> Result<void, TestFailure> {
+    let data = fixture("data.bin");
+    var sig = Vector<u8>.create();
+    var publicKey = Vector<u8>.create();
+    let rsa = PrivateKey.generate(KeyKind.Rsa, 2048)!;
+    rsa.sign(data.view(), mut sig)!;
+    rsa.publicKey(mut publicKey)!;
+    Check.isTrue(sig.length == 256 && good(Signatures.verifyRsaSha256(publicKey.view(), data.view(), sig.view())), "RSA")?;
+    // Stored and read back.
+    let again = PrivateKey.fromDer(rsa.der())!;
+    var sig2 = Vector<u8>.create();
+    again.sign(data.view(), mut sig2)!;
+    Check.isTrue(sameBytes(sig.view(), sig2.view()), "the DER round trip")?;
+    let ed = PrivateKey.generate(KeyKind.Ed25519, 0)!;
+    ed.sign(data.view(), mut sig)!;
+    ed.publicKey(mut publicKey)!;
+    Check.isTrue(publicKey.length == 32 && good(Signatures.verifyEd25519(publicKey.view(), data.view(), sig.view())), "Ed25519")?;
+    // Not keys.
+    Check.isTrue(isBadKey(PrivateKey.fromDer("not a key".bytes())), "garbage DER")?;
+    let spki = fixture("rsa.spki.der");
+    Check.isTrue(isBadKey(PrivateKey.fromPem(spki.view())), "a public key is not a private key")?;
+    return Check.isTrue(isBadKey(PrivateKey.generate(KeyKind.Rsa, 512)), "too small");
+}
+
+fn isBadKey(r: Result<PrivateKey, KeyError>) -> bool => match (r) {
+    Ok(_) => false,
+    Err(KeyError.BadKey) => true,
+    Err(_) => false,
+};

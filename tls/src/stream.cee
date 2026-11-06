@@ -1,0 +1,363 @@
+/// The size of the buffer each connection moves ciphertext through: one maximal TLS record plus its overhead.
+const NET_BUFFER: usize = 16 * 1024 + 512;
+
+/// The most plaintext given to OpenSSL in one call, so that a large write never piles up in memory before it is sent.
+const WRITE_CHUNK: usize = 64 * 1024;
+
+/// A TLS connection over an `AsyncTcpStream`.
+///
+/// `connect` and `accept` take a stream that is already connected, so they serve both implicit TLS (SMTPS on 465,
+/// IMAPS on 993) and STARTTLS. For STARTTLS, throw away any bytes read from the plain stream after the STARTTLS
+/// command before upgrading: they were not protected and must not be treated as part of the TLS session (RFC 3207
+/// §6, RFC 8314 §4).
+///
+/// Reads and writes take `borrow mut`, so one task drives a connection at a time.
+@noncopy
+public struct TlsStream {
+    private stream: AsyncTcpStream;
+    private conn: usize;
+    private net: Vector<u8>;
+    private peerClosed: bool;
+    private shutDown: bool;
+    private broken: bool;
+
+    /// Safety: `conn` is a live connection this value owns.
+    drop {
+        unsafe { cstls_conn_free(this.conn as *mut void); }
+    }
+
+    /// Starts TLS as a client over `stream` and completes the handshake. `serverName` is sent with SNI (unless it is
+    /// an IP address) and, when `config` verifies peers, checked against the server's certificate. An empty
+    /// `serverName` sends no SNI and checks no name.
+    public async fn connect(
+        stream: AsyncTcpStream,
+        config: borrow TlsConfig,
+        serverName: StringView,
+    ) -> Result<TlsStream, TlsError> {
+        if (config.isServer()) {
+            return Err(TlsError.Config);
+        }
+        var tls = TlsStream.wrap(stream, config, false, serverName)?;
+        await tls.handshake()?;
+        return Ok(tls);
+    }
+
+    /// Starts TLS as a server over `stream` and completes the handshake.
+    public async fn accept(stream: AsyncTcpStream, config: borrow TlsConfig) -> Result<TlsStream, TlsError> {
+        if (!config.isServer()) {
+            return Err(TlsError.Config);
+        }
+        var tls = TlsStream.wrap(stream, config, true, "")?;
+        await tls.handshake()?;
+        return Ok(tls);
+    }
+
+    /// As `accept`, giving up after `timeoutMs` with `Io(TimedOut)`: a server's handshake timeout, so a client that
+    /// connects and stays silent cannot hold a connection.
+    public async fn acceptWithin(
+        stream: AsyncTcpStream,
+        config: borrow TlsConfig,
+        timeoutMs: u64,
+    ) -> Result<TlsStream, TlsError> {
+        if (!config.isServer()) {
+            return Err(TlsError.Config);
+        }
+        var tls = TlsStream.wrap(stream, config, true, "")?;
+        let done: Result<void, TlsError> = await Async.timeout(
+            timeoutMs,
+            TlsError.Io(AsyncError.TimedOut),
+            async () => await tls.handshake(),
+        );
+        match (done) {
+            Ok() => { return Ok(tls); }
+            Err(e) => { return Err(e); }
+        }
+    }
+
+    /// As `connect`, giving up after `timeoutMs` with `Io(TimedOut)`: a client's handshake timeout, so a server that
+    /// stalls mid-handshake cannot hold a connection (an SMTP relay's STARTTLS, for one).
+    public async fn connectWithin(
+        stream: AsyncTcpStream,
+        config: borrow TlsConfig,
+        serverName: StringView,
+        timeoutMs: u64,
+    ) -> Result<TlsStream, TlsError> {
+        if (config.isServer()) {
+            return Err(TlsError.Config);
+        }
+        var tls = TlsStream.wrap(stream, config, false, serverName)?;
+        let done: Result<void, TlsError> = await Async.timeout(
+            timeoutMs,
+            TlsError.Io(AsyncError.TimedOut),
+            async () => await tls.handshake(),
+        );
+        match (done) {
+            Ok() => { return Ok(tls); }
+            Err(e) => { return Err(e); }
+        }
+    }
+
+    /// As `connectWithin`, authenticating the server by DANE (RFC 6698; RFC 7672 for SMTP) instead of by trusted
+    /// roots: the handshake succeeds only if a certificate in the server's chain matches one of `records`, with
+    /// `serverName` (an MX host's name) as the TLSA base domain. A chain no record matches is `Verify(65)`
+    /// (X509_V_ERR_DANE_NO_MATCH). `records` must hold at least one record OpenSSL can use (`Config` otherwise), and
+    /// the configuration must have had `enableDane`.
+    /// Safety: the shim copies each record's data and the name.
+    public async fn connectDaneWithin(
+        stream: AsyncTcpStream,
+        config: borrow TlsConfig,
+        serverName: StringView,
+        records: borrow Vector<Tlsa>,
+        timeoutMs: u64,
+    ) -> Result<TlsStream, TlsError> {
+        if (config.isServer()) {
+            return Err(TlsError.Config);
+        }
+        var tls = TlsStream.wrap(stream, config, false, serverName)?;
+        TlsErrors.check(unsafe { cstls_conn_dane_enable(tls.conn as *mut void, serverName.ptr, serverName.length) })?;
+        var usable = 0;
+        for (r in records.view()) {
+            let data = r.data.view();
+            let added = unsafe { cstls_conn_dane_add(
+                tls.conn as *mut void,
+                r.usage as i32,
+                r.selector as i32,
+                r.matching as i32,
+                data.ptr,
+                data.length,
+            ) };
+            if (added < 0) {
+                return Err(TlsError.OutOfMemory);
+            }
+            usable += added;
+        }
+        if (usable == 0) {
+            return Err(TlsError.Config);
+        }
+        let done: Result<void, TlsError> = await Async.timeout(
+            timeoutMs,
+            TlsError.Io(AsyncError.TimedOut),
+            async () => await tls.handshake(),
+        );
+        match (done) {
+            Ok() => {}
+            Err(e) => { return Err(e); }
+        }
+        if (tls.daneDepth() < 0) {
+            return Err(TlsError.Verify(65));
+        }
+        return Ok(tls);
+    }
+
+    /// After a DANE handshake: the depth in the server's chain of the certificate a TLSA record matched (0 for the
+    /// server's own; for a bare trust-anchor key, the certificate it signed), or -1 when DANE did not authenticate it.
+    /// Safety: `conn` is live while `this` is.
+    public fn daneDepth(borrow this) -> i32 => unsafe { cstls_conn_dane_depth(this.conn as *mut void) };
+
+    /// Safety: the context is live for the call; the connection takes its own reference to it. Null is checked.
+    fn wrap(
+        stream: AsyncTcpStream,
+        config: borrow TlsConfig,
+        server: bool,
+        name: StringView,
+    ) -> Result<TlsStream, TlsError> {
+        if (name.length > 253) {
+            return Err(TlsError.Config);
+        }
+        let verify = if (server) 0 else 1;
+        let raw = unsafe { cstls_conn_new(
+            config.handle() as *mut void,
+            if (server) 1 else 0,
+            name.ptr,
+            name.length,
+            verify,
+        ) } as usize;
+        if (raw == 0) {
+            return Err(TlsError.OutOfMemory);
+        }
+        var net = Vector<u8>.create();
+        match (net.resize(NET_BUFFER, 0)) {
+            Ok() => {}
+            Err(_) => {
+                unsafe { cstls_conn_free(raw as *mut void); }
+                return Err(TlsError.OutOfMemory);
+            }
+        }
+        return Ok(TlsStream {
+            stream: stream,
+            conn: raw,
+            net: net,
+            peerClosed: false,
+            shutDown: false,
+            broken: false,
+        });
+    }
+
+    /// Safety: `conn` is live while `this` is.
+    async fn handshake(borrow mut this) -> Result<void, TlsError> {
+        loop {
+            let r = unsafe { cstls_conn_handshake(this.conn as *mut void) };
+            await this.flush()?; // the hello, a reply, or an alert telling the peer why
+            if (r == 1) {
+                return Ok();
+            }
+            if (r < 0) {
+                this.broken = true;
+                let verified = unsafe { cstls_conn_verify_result(this.conn as *mut void) };
+                let code = unsafe { cstls_take_error() };
+                if (verified != 0) {
+                    return Err(TlsError.Verify(verified));
+                }
+                return Err(TlsError.Handshake(code));
+            }
+            await this.fill()?;
+        }
+    }
+
+    /// Sends every byte OpenSSL has queued.
+    /// Safety: `drain` writes at most the buffer's length into it.
+    async fn flush(borrow mut this) -> Result<void, TlsError> {
+        loop {
+            let pending = unsafe { cstls_conn_pending_out(this.conn as *mut void) };
+            if (pending == 0) {
+                return Ok();
+            }
+            let room = this.net.viewMut();
+            let n = truncate<usize>(unsafe { cstls_conn_drain(this.conn as *mut void, room.ptr, room.length) });
+            if (n == 0) {
+                return Ok();
+            }
+            let out = this.net.view();
+            match (await this.stream.write(out[0..n])) {
+                Ok() => {}
+                Err(e) => {
+                    this.broken = true;
+                    return Err(TlsError.Io(e));
+                }
+            }
+        }
+    }
+
+    /// Reads ciphertext from the socket and gives it to OpenSSL. The end of the stream is `Truncated`.
+    /// A read cancelled or timed out while it waited consumed nothing and fed OpenSSL nothing, so the session stays
+    /// usable: a caller may wait for input with a deadline (an IMAP server polling during IDLE) and read again.
+    /// Safety: `feed` reads exactly the `n` bytes just received.
+    async fn fill(borrow mut this) -> Result<void, TlsError> {
+        let room = this.net.viewMut();
+        let n = match (await this.stream.read(room)) {
+            Ok(n) => n,
+            Err(AsyncError.Cancelled) => { return Err(TlsError.Io(AsyncError.Cancelled)); }
+            Err(AsyncError.TimedOut) => { return Err(TlsError.Io(AsyncError.TimedOut)); }
+            Err(e) => {
+                this.broken = true;
+                return Err(TlsError.Io(e));
+            }
+        };
+        if (n == 0) {
+            this.broken = true;
+            return Err(TlsError.Truncated);
+        }
+        let got = this.net.view();
+        let fed = unsafe { cstls_conn_feed(this.conn as *mut void, got.ptr, n) };
+        if (fed < 0 || truncate<usize>(fed) != n) {
+            this.broken = true;
+            return Err(TlsError.OutOfMemory);
+        }
+        return Ok();
+    }
+
+    /// Reads decrypted bytes into `buffer`: how many, at least 1, or 0 once the peer has closed the TLS session
+    /// cleanly (close_notify). An empty `buffer` reads nothing and returns 0. A TCP close without close_notify is
+    /// `Truncated`.
+    /// Safety: `read` writes at most `buffer.length` bytes into it.
+    public async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, TlsError> {
+        if (buffer.length == 0 || this.peerClosed) {
+            return Ok(0);
+        }
+        if (this.broken) {
+            return Err(TlsError.Closed);
+        }
+        loop {
+            let r = unsafe { cstls_conn_read(this.conn as *mut void, buffer.ptr, buffer.length) };
+            if (r > 0) {
+                await this.flush()?; // a TLS 1.3 key update may want an answer
+                return Ok(truncate<usize>(r));
+            }
+            if (r == 0) {
+                this.peerClosed = true;
+                return Ok(0);
+            }
+            if (r < -1) {
+                this.broken = true;
+                return Err(TlsError.Protocol(unsafe { cstls_take_error() }));
+            }
+            await this.flush()?;
+            await this.fill()?;
+        }
+    }
+
+    /// Encrypts and sends all of `bytes`.
+    /// Safety: each `write` call reads only the chunk it is given.
+    public async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, TlsError> {
+        if (this.broken || this.shutDown) {
+            return Err(TlsError.Closed);
+        }
+        var at: usize = 0;
+        while (at < bytes.length) {
+            let end = if (bytes.length - at > WRITE_CHUNK) at + WRITE_CHUNK else bytes.length;
+            let chunk = bytes[at..end];
+            let r = unsafe { cstls_conn_write(this.conn as *mut void, chunk.ptr, chunk.length) };
+            if (r > 0) {
+                at += truncate<usize>(r);
+                await this.flush()?;
+            } else if (r == -1) {
+                await this.flush()?;
+                await this.fill()?;
+            } else {
+                this.broken = true;
+                return Err(TlsError.Protocol(unsafe { cstls_take_error() }));
+            }
+        }
+        return Ok();
+    }
+
+    /// Sends close_notify, ending this side of the session; reads still work until the peer's close_notify. Waiting
+    /// for the peer's answer is not required (RFC 8446 §6.1): close the socket by dropping the stream.
+    /// Safety: `conn` is live while `this` is.
+    public async fn shutdown(borrow mut this) -> Result<void, TlsError> {
+        if (this.shutDown || this.broken) {
+            return Ok();
+        }
+        this.shutDown = true;
+        let r = unsafe { cstls_conn_shutdown(this.conn as *mut void) };
+        if (r < 0) {
+            return Err(TlsError.Protocol(unsafe { cstls_take_error() }));
+        }
+        await this.flush()?;
+        return Ok();
+    }
+
+    /// The negotiated protocol version: `0x0303` for TLS 1.2, `0x0304` for TLS 1.3.
+    /// Safety: `conn` is live while `this` is.
+    public fn version(borrow this) -> u16 => truncate<u16>(unsafe { cstls_conn_version(this.conn as *mut void) });
+
+    /// The ALPN protocol agreed on, copied into `out`: its length, or 0 when none was. A protocol longer than `out` is
+    /// cut short, and the full length still returned.
+    /// Safety: the shim copies at most `out.length` bytes.
+    public fn alpn(borrow this, out: SliceMut<u8>) -> usize =>
+        unsafe { cstls_conn_alpn(this.conn as *mut void, out.ptr, out.length) };
+
+    /// For a server: the host name the client asked for with SNI, copied into `out` as for `alpn`; 0 if none.
+    /// Safety: the shim copies at most `out.length` bytes.
+    public fn serverName(borrow this, out: SliceMut<u8>) -> usize =>
+        unsafe { cstls_conn_server_name(this.conn as *mut void, out.ptr, out.length) };
+
+    /// Whether the peer presented a certificate (a server's always does; a client's only when asked for).
+    /// Safety: `conn` is live while `this` is.
+    public fn hasPeerCertificate(borrow this) -> bool =>
+        unsafe { cstls_conn_has_peer_certificate(this.conn as *mut void) } != 0;
+
+    /// The underlying TCP stream, for its addresses and socket options. Reading or writing it directly would corrupt
+    /// the TLS session.
+    public fn tcp(borrow this) -> borrow AsyncTcpStream => borrow this.stream;
+}

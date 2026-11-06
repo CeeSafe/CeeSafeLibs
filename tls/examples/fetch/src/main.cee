@@ -1,0 +1,92 @@
+// Connects to a TLS server with the system's trusted roots and prints the first line it sends.
+// Usage: fetch <host> <port>    e.g. fetch smtp.gmail.com 465   or   fetch imap.gmail.com 993
+import tls.TlsConfig;
+import tls.TlsError;
+import tls.TlsErrors;
+import tls.TlsStream;
+
+fn parsePort(text: StringView) -> u16? {
+    var v: u32 = 0;
+    if (text.length == 0 || text.length > 5) {
+        return null;
+    }
+    for (c in text.bytes()) {
+        if (c < '0' || c > '9') {
+            return null;
+        }
+        v = v * 10 + (c - '0') as u32;
+    }
+    if (v == 0 || v > 65535) {
+        return null;
+    }
+    return truncate<u16>(v);
+}
+
+async fn say(text: StringView) {
+    match (await AsyncConsole.write(text)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+async fn fetch(host: StringView, port: u16, config: borrow TlsConfig) -> Result<void, TlsError> {
+    let addresses = match (await AsyncDns.resolve(host, port)) {
+        Ok(a) => a,
+        Err(e) => { return Err(TlsError.Io(e)); }
+    };
+    if (addresses.length == 0) {
+        return Err(TlsError.Config);
+    }
+    let tcp = match (await AsyncTcpStream.connectTo(addresses[0])) {
+        Ok(s) => s,
+        Err(e) => { return Err(TlsError.Io(e)); }
+    };
+    var session = await TlsStream.connect(tcp, config, host)?;
+    await say(if (session.version() == 0x0304) "TLS 1.3, verified\n" else "TLS 1.2, verified\n");
+    var buffer = [0u8; 512];
+    let n = await session.read(mut buffer[..])?;
+    match (StringView.fromUtf8(buffer[0..n])) {
+        Some(text) => { await say(text); }
+        null => { await say("(binary greeting)\n"); }
+    }
+    await session.shutdown()?;
+    return Ok();
+}
+
+fn main() -> i32 {
+    let host = match (Process.argument(1)) {
+        Some(h) => h,
+        null => {
+            Console.writeErrorLine("usage: fetch <host> <port>");
+            return 2;
+        }
+    };
+    let port = match (Process.argument(2)) {
+        Some(p) => parsePort(p),
+        null => null,
+    };
+    if (port == null) {
+        Console.writeErrorLine("usage: fetch <host> <port>");
+        return 2;
+    }
+    let config = match (TlsConfig.client()) {
+        Ok(c) => c,
+        Err(_) => {
+            Console.writeErrorLine("could not load the system's trusted roots");
+            return 1;
+        }
+    };
+    match (Async.run(fetch(host, port!, config))) {
+        Ok() => { return 0; }
+        Err(e) => {
+            var words = [0u8; 256];
+            let n = TlsErrors.describe(e, mut words[..]);
+            Console.writeError("failed: ");
+            match (StringView.fromUtf8(words[0..n])) {
+                Some(t) => { Console.writeErrorLine(t); }
+                null => { Console.writeErrorLine("?"); }
+            }
+            return 1;
+        }
+    }
+}

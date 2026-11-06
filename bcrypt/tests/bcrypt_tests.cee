@@ -1,0 +1,75 @@
+// Hashes made by Apache's htpasswd (`htpasswd -bnBC <cost> u <password>`), an independent implementation.
+
+fn vector(password: StringView, hash: StringView) -> Result<void, TestFailure> {
+    Check.isTrue(Bcrypt.verify(password.bytes(), hash), hash)?;
+    // A one-byte change of the password must not match (the first byte: bcrypt ignores bytes after the 72nd).
+    var wrong = Vector<u8>.create();
+    wrong.extend(password.bytes())!;
+    wrong[0] = wrong[0] ^ 0x01;
+    return Check.isTrue(!Bcrypt.verify(wrong.view(), hash), "a wrong password");
+}
+
+@test
+fn verifiesHtpasswdHashes() -> Result<void, TestFailure> {
+    vector("password", "$2y$04$69Yz4O19J6nqW8nevFEdXe8DIQKFgwxMi7TyxNAmkY2ZkIcxuj9FS")?;
+    vector("password", "$2y$05$dgNtA1pKYEE96GKLiHB0X.MCY8fb5gdyjJxIwMLEWEjqlJwJJPzpG")?;
+    vector("correct horse battery staple", "$2y$04$JzIE37EdP9V8YrGalDFwQ.sySyjnkCMrvsyFZn2TDcyNWSJ6fHUjm")?;
+    vector("correct horse battery staple", "$2y$05$7EehTfdOt4IW7WwSDJbIX.LuWvXBSqdF02Rc9VwtF78oTvBxvXo0u")?;
+    vector("Ünïcödé-密码", "$2y$04$QeMZ/Rv8iWmVwEUQhfuFzuaF32ugyL5TlN751oPjOOf/Bxl.ICTw.")?;
+    vector("Ünïcödé-密码", "$2y$05$Q3hP3TNmFq4zEbwkDFIiCuI/ABgL.UUsAF7uSd6yIIgWJDcGxhPk.")?;
+    vector("a", "$2y$04$6IveVkF696DHQKH0q1AaOuATC0tN7BKUFIh1SiLfmO8lRJxWR0hI6")?;
+    vector("a", "$2y$05$wGrE1hmJuG6nZtxX9B4uze8qpCOw7X1fdNbZ25LKmcJXCQuCcN9dy")?;
+    vector(
+        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+        "$2y$04$FP0L1/XEO2hv.C3eIgzjquWxMs.DG2d8Fg3fULPzgpEzT3z/sO2dC",
+    )?;
+    vector(
+        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+        "$2y$05$4FICMbNWtpiaORKiIv0azOJI3C.kKHT1cc1zDyV.Iq9VICS.R9fTO",
+    )?;
+    return Ok();
+}
+
+@test
+fn truncatesAt72Bytes() -> Result<void, TestFailure> {
+    // The 100-byte password's hash also matches its first 72 bytes followed by anything.
+    let long = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789";
+    let hash = "$2y$04$FP0L1/XEO2hv.C3eIgzjquWxMs.DG2d8Fg3fULPzgpEzT3z/sO2dC";
+    let bytes = long.bytes();
+    Check.isTrue(Bcrypt.verify(bytes[0..72], hash), "the first 72 bytes")?;
+    return Check.isTrue(!Bcrypt.verify(bytes[0..71], hash), "71 bytes do not");
+}
+
+@test
+fn hashesAndVerifies() -> Result<void, TestFailure> {
+    let made = Bcrypt.hash("s3cret".bytes(), 5)!;
+    Check.isTrue(made.length == 60 && made.view().startsWith("$2b$05$"), "format")?;
+    Check.isTrue(Bcrypt.verify("s3cret".bytes(), made.view()), "verifies")?;
+    Check.isTrue(!Bcrypt.verify("s3creT".bytes(), made.view()), "case matters")?;
+    Check.isTrue(Bcrypt.costOf(made.view())! == 5, "cost")?;
+    // The same salt gives the same hash; $2b$ and $2y$ verify the same way.
+    let salt = [7u8; 16];
+    let a = Bcrypt.hashWithSalt("x".bytes(), 4, salt[..])!;
+    let b = Bcrypt.hashWithSalt("x".bytes(), 4, salt[..])!;
+    Check.isTrue(a.view() == b.view(), "deterministic")?;
+    var y = String.create();
+    y.append("$2y$")!;
+    let rest = a.view();
+    y.append(rest[4..])!;
+    return Check.isTrue(Bcrypt.verify("x".bytes(), y.view()), "$2y$ form");
+}
+
+@test
+fn rejectsMalformedHashes() -> Result<void, TestFailure> {
+    Check.isTrue(!Bcrypt.verify("password".bytes(), ""), "empty")?;
+    Check.isTrue(!Bcrypt.verify("password".bytes(), "$1$abc$def"), "MD5-crypt")?;
+    Check.isTrue(
+        !Bcrypt.verify("password".bytes(), "$2y$03$69Yz4O19J6nqW8nevFEdXe8DIQKFgwxMi7TyxNAmkY2ZkIcxuj9FS"),
+        "cost 3",
+    )?;
+    Check.isTrue(
+        !Bcrypt.verify("password".bytes(), "$2y$04$69Yz4O19J6nqW8nevFEdXe8DIQKFgwxMi7TyxNAmkY2ZkIcxuj9F!"),
+        "bad character",
+    )?;
+    return Check.isTrue(Bcrypt.costOf("nope") == null, "costOf");
+}
