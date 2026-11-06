@@ -1,8 +1,8 @@
 # tls
 
-TLS for CeeSafe async code: a thin, socket-free C shim over OpenSSL 3 (`c/tls_shim.c`), with a safe CeeSafe API on top
-of it. OpenSSL works on two memory BIOs, and every byte moves through CeeSafe's own `AsyncTcpStream`. The package
-therefore works on whichever reactor CeeSafe uses (kqueue, epoll or io_uring), and cancellation works as it does for any
+TLS for CeeSafe async code, over OpenSSL 3, all in CeeSafe: `src/ffi.cee` calls OpenSSL directly (no C shim, no
+OpenSSL headers), and a safe CeeSafe API sits on top of it. OpenSSL works on two memory BIOs, and every byte moves
+through CeeSafe's own `AsyncTcpStream`. The package therefore works on whichever reactor CeeSafe uses (kqueue, epoll or io_uring), and cancellation works as it does for any
 other socket operation.
 
 ## Usage
@@ -85,5 +85,6 @@ recreates. They cover:
 
 ## Licence
 
-`c/tls_shim.c` is written for this package against OpenSSL's public API; it is not derived from CeeSafe.Web's GPL
-`web_tls`. OpenSSL 3 is under the Apache License 2.0.
+`src/ffi.cee` is written for this package against OpenSSL's public API; it is not derived from CeeSafe.Web's GPL
+`web_tls`. OpenSSL 3 is under the Apache License 2.0; linking with it is permitted by the repository's OpenSSL
+exception (COPYING.OPENSSL).
