@@ -18,3 +18,7 @@ CeeSafe package (`ceesafe.toml`), with its own README and tests (`ceesafec test`
 
 `repros/` holds reduced reproductions of CeeSafe compiler and runtime issues found while writing these, and
 `NOTES-ceesafe-0.14.md` records the issues met with that release.
+
+## License
+
+CeeSafeLibs is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)).
