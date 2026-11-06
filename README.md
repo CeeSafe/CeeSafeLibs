@@ -1,7 +1,7 @@
 # CeeSafeLibs
 
 Libraries for [CeeSafe](https://ceesafe.github.io/CeeSafe/) programs, written for the
-[CeeSafe mail server](https://github.com/pooviputh/mailserver) and usable on their own. Each directory is a
+[CeeSafe mail server](https://github.com/CeeSafe/mailserver) and usable on their own. Each directory is a
 CeeSafe package (`ceesafe.toml`), with its own README and tests (`ceesafec test` in the package's directory).
 
 | Package | What it is |
