@@ -21,4 +21,5 @@ CeeSafe package (`ceesafe.toml`), with its own README and tests (`ceesafec test`
 
 ## License
 
-CeeSafeLibs is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)).
+CeeSafeLibs is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)),
+with an exception that permits linking with OpenSSL ([COPYING.OPENSSL](COPYING.OPENSSL)).
