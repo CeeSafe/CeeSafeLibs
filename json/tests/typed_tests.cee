@@ -1,0 +1,207 @@
+// Typed encoding and decoding: ToJson and FromJson written by hand for structs, as README.md shows.
+
+struct Server {
+    host: String;
+    port: u16;
+    weight: u32?;
+    tags: Vector<String>;
+}
+
+impl ToJson for Server {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> {
+        w.beginObject()?;
+        w.field("host", this.host)?;
+        w.field("port", this.port)?;
+        w.optionalField("weight", this.weight)?;
+        w.sliceField("tags", this.tags.view())?;
+        return w.endObject();
+    }
+}
+
+impl FromJson for Server {
+    public fn fromJson(value: borrow JsonValue) -> Result<Server, DecodeError> {
+        Decode.expectObject(value, "a server")?;
+        return Ok(Server {
+            host: Decode.field<String>(value, "host")?,
+            port: Decode.field<u16>(value, "port")?,
+            weight: Decode.optionalField<u32>(value, "weight")?,
+            tags: Decode.vectorField<String>(value, "tags")?,
+        });
+    }
+}
+
+struct Config {
+    name: String;
+    servers: Vector<Server>;
+    limits: HashMap<String, u64>;
+}
+
+impl ToJson for Config {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> {
+        w.beginObject()?;
+        w.field("name", this.name)?;
+        w.sliceField("servers", this.servers.view())?;
+        w.key("limits")?;
+        w.map(this.limits)?;
+        return w.endObject();
+    }
+}
+
+impl FromJson for Config {
+    public fn fromJson(value: borrow JsonValue) -> Result<Config, DecodeError> {
+        Decode.expectObject(value, "a config")?;
+        Decode.denyUnknownFields(value, ["name", "servers", "limits"][..])?;
+        return Ok(Config {
+            name: Decode.field<String>(value, "name")?,
+            servers: Decode.vectorField<Server>(value, "servers")?,
+            limits: Decode.mapField<u64>(value, "limits")?,
+        });
+    }
+}
+
+const CONFIG: StringView = """
+    {
+      "name": "edge",
+      "servers": [
+        {
+          "host": "a.example",
+          "port": 80,
+          "tags": []
+        },
+        {
+          "host": "b.example",
+          "port": 8443,
+          "weight": 3,
+          "tags": [
+            "tls",
+            "h2"
+          ]
+        }
+      ],
+      "limits": {
+        "body": 1048576,
+        "headers": 64
+      }
+    }
+    """;
+
+fn messageOf(e: borrow DecodeError) -> String => e.message()!;
+
+fn decodeFails(text: StringView, message: StringView) -> Result<void, TestFailure> {
+    match (Json.decode<Config>(text.bytes())) {
+        Ok(_) => { return Check.fail("decoded"); }
+        Err(e) => { return Check.equalText(message, messageOf(e).view()); }
+    }
+}
+
+@test
+fn decodesAndEncodesAStruct() -> Result<void, TestFailure> {
+    let config = Json.decode<Config>(CONFIG.bytes())!;
+    Check.equalText("edge", config.name.view())?;
+    Check.equalU64(2, config.servers.length as u64)?;
+    Check.equalU64(8443, config.servers[1].port as u64)?;
+    Check.equalU64(3, config.servers[1].weight! as u64)?;
+    Check.isTrue(config.servers[0].weight.isNull(), "no weight")?;
+    Check.equalText("h2", config.servers[1].tags[1].view())?;
+    Check.equalU64(64, *config.limits.get(String.from("headers")!)!)?;
+    let pretty = Json.encodePretty(config)!;
+    Check.equalText(CONFIG, bytesText(pretty))?;
+    let compact = Json.encode(config)!;
+    Check.isTrue(Json.decode<Config>(compact.view()).isOk(), "compact decodes")?;
+    return Ok();
+}
+
+@test
+fn errorsNameThePath() -> Result<void, TestFailure> {
+    decodeFails(
+        "{\"name\":\"x\",\"servers\":[{\"host\":\"a\",\"port\":1,\"tags\":[]},{\"host\":\"b\",\"port\":\"80\",\"tags\":[]}],\"limits\":{}}",
+        "$.servers[1].port: expected u16, found string",
+    )?;
+    decodeFails(
+        "{\"name\":\"x\",\"servers\":[{\"host\":\"a\",\"port\":70000,\"tags\":[]}],\"limits\":{}}",
+        "$.servers[0].port: expected u16, found 70000",
+    )?;
+    decodeFails(
+        "{\"name\":\"x\",\"servers\":[{\"host\":\"a\",\"port\":1.5,\"tags\":[]}],\"limits\":{}}",
+        "$.servers[0].port: expected u16, found number",
+    )?;
+    decodeFails(
+        "{\"name\":\"x\",\"servers\":[{\"host\":\"a\",\"tags\":[]}],\"limits\":{}}",
+        "$.servers[0]: missing field `port`",
+    )?;
+    decodeFails(
+        "{\"name\":\"x\",\"servers\":[{\"host\":\"a\",\"port\":1,\"tags\":[\"ok\",7]}],\"limits\":{}}",
+        "$.servers[0].tags[1]: expected a string, found number",
+    )?;
+    decodeFails(
+        "{\"name\":\"x\",\"servers\":[],\"limits\":{\"a b\":-1}}",
+        "$.limits[\"a b\"]: expected u64, found -1",
+    )?;
+    decodeFails("{\"name\":\"x\",\"servers\":7,\"limits\":{}}", "$.servers: expected an array, found number")?;
+    decodeFails("{\"name\":\"x\",\"servers\":[3],\"limits\":{}}", "$.servers[0]: expected a server, found number")?;
+    decodeFails("[]", "$: expected a config, found array")?;
+    decodeFails("{\"name\":\"x\",\"servers\":[],\"limits\":{},\"extra\":1}", "$: unknown field `extra`")?;
+    match (Json.decode<Config>("{\"name\":}".bytes())) {
+        Ok(_) => { return Check.fail("decoded"); }
+        Err(e) => {
+            Check.isTrue(e.reason == DecodeReason.Syntax, "a syntax error")?;
+            Check.isTrue(e.syntax!.kind == JsonErrorKind.ExpectedValue, "its kind")?;
+            Check.equalText("$: expected a value at line 1 column 9", messageOf(e).view())?;
+        }
+    }
+    return Ok();
+}
+
+@test
+fn integerRanges() -> Result<void, TestFailure> {
+    Check.equalU64(255, Json.decode<u8>("255".bytes())! as u64)?;
+    Check.isTrue(Json.decode<u8>("256".bytes()).err()!.reason == DecodeReason.OutOfRange, "u8 256")?;
+    Check.isTrue(Json.decode<u8>("-1".bytes()).err()!.reason == DecodeReason.OutOfRange, "u8 -1")?;
+    Check.isTrue(Json.decode<u16>("65536".bytes()).isErr(), "u16")?;
+    Check.isTrue(Json.decode<u32>("4294967295".bytes()).isOk(), "u32 max")?;
+    Check.isTrue(Json.decode<u32>("4294967296".bytes()).isErr(), "u32 max + 1")?;
+    Check.equalU64(0xFFFF_FFFF_FFFF_FFFF, Json.decode<u64>("18446744073709551615".bytes())!)?;
+    Check.isTrue(Json.decode<u64>("18446744073709551616".bytes()).err()!.reason == DecodeReason.WrongType, "float")?;
+    Check.equalI64(-128, Json.decode<i8>("-128".bytes())! as i64)?;
+    Check.isTrue(Json.decode<i8>("-129".bytes()).isErr(), "i8 min - 1")?;
+    Check.isTrue(Json.decode<i8>("128".bytes()).isErr(), "i8 max + 1")?;
+    Check.isTrue(Json.decode<i16>("-32768".bytes()).isOk(), "i16 min")?;
+    Check.isTrue(Json.decode<i32>("2147483648".bytes()).isErr(), "i32 max + 1")?;
+    Check.equalI64(-0x7FFF_FFFF_FFFF_FFFF - 1, Json.decode<i64>("-9223372036854775808".bytes())!)?;
+    Check.isTrue(Json.decode<i64>("9223372036854775808".bytes()).isErr(), "i64 max + 1")?;
+    Check.isTrue(Json.decode<usize>("7".bytes())! == 7, "usize")?;
+    Check.isTrue(Json.decode<isize>("-7".bytes())! == -7, "isize")?;
+    Check.isTrue(Json.decode<f64>("7".bytes())! == 7.0, "f64 from an integer")?;
+    Check.isTrue(Json.decode<f32>("1e300".bytes()).isErr(), "f32 out of range")?;
+    Check.isTrue(Json.decode<f32>("0.5".bytes())! == 0.5f32, "f32")?;
+    Check.isTrue(Json.decode<bool>("true".bytes())!, "bool")?;
+    Check.isTrue(Json.decode<bool>("1".bytes()).isErr(), "1 is not a bool")?;
+    Check.equalText("é", Json.decode<String>("\"é\"".bytes())!.view())?;
+    Check.isTrue(Json.decode<JsonValue>("[1]".bytes())!.isArray(), "JsonValue")?;
+    return Ok();
+}
+
+@test
+fn encodesScalarsAndHelpers() -> Result<void, TestFailure> {
+    Check.equalText("-5", bytesText(Json.encode(-5i8)!))?;
+    Check.equalText("65535", bytesText(Json.encode(65535u16)!))?;
+    Check.equalText("2.5", bytesText(Json.encode(2.5)!))?;
+    Check.equalText("\"a\\\"\"", bytesText(Json.encode(String.from("a\"")!)!))?;
+    Check.isTrue(Json.encode(0.0 / 0.0).err()! == JsonWriteError.NonFiniteNumber, "NaN")?;
+    var w = JsonWriter.compact();
+    w.beginArray()!;
+    let some: u32? = 4;
+    let none: u32? = null;
+    w.optional(some)!;
+    w.optional(none)!;
+    let items = [1u64, 2, 3];
+    w.slice(items[..])!;
+    w.value(true)!;
+    w.endArray()!;
+    Check.equalText("[4,null,[1,2,3],true]", bytesText(w.finish()!))?;
+    let parsedBack = Decode.optional<u32>(parsed("null"))!;
+    Check.isTrue(parsedBack.isNull(), "optional null")?;
+    Check.isTrue(Decode.vector<u8>(parsed("[1,2]"))!.length == 2, "vector")?;
+    Check.isTrue(Decode.fieldOr<u32>(parsed("{}"), "n", 9)! == 9, "fieldOr")?;
+    return Ok();
+}

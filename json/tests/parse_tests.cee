@@ -1,0 +1,289 @@
+// The parser: values, numbers, strings, errors and limits.
+
+@test
+fn parsesEveryKind() -> Result<void, TestFailure> {
+    let v = parsed(" {\"a\": [1, -2, 3.5, true, false, null, \"x\"], \"b\": {}, \"c\": []} \r\n\t");
+    Check.isTrue(v.isObject(), "object")?;
+    Check.equalU64(3, v.length() as u64)?;
+    let a = v.get("a")!;
+    Check.equalU64(7, a.length() as u64)?;
+    Check.equalU64(1, a.at(0)!.asU64()!)?;
+    Check.equalI64(-2, a.at(1)!.asI64()!)?;
+    Check.isTrue(a.at(2)!.asF64()! == 3.5, "float")?;
+    Check.isTrue(a.at(3)!.asBool()!, "true")?;
+    Check.isFalse(a.at(4)!.asBool()!, "false")?;
+    Check.isTrue(a.at(5)!.isNull(), "null")?;
+    Check.equalText("x", a.at(6)!.asStr()!)?;
+    Check.isTrue(a.at(7).isNull(), "past the end")?;
+    Check.isTrue(v.get("b")!.isObject(), "empty object")?;
+    Check.isTrue(v.get("c")!.isArray(), "empty array")?;
+    Check.isTrue(v.get("d").isNull(), "missing key")?;
+    Check.isTrue(parsed("7").asU64()! == 7, "a scalar at the top")?;
+    Check.isTrue(parsed("\"s\"").asStr()! == "s", "a string at the top")?;
+    return Ok();
+}
+
+@test
+fn integersStayExact() -> Result<void, TestFailure> {
+    match (parsed("18446744073709551615")) {
+        JsonValue.Number(JsonNumber.PosInt(n)) => { Check.isTrue(n == 0xFFFF_FFFF_FFFF_FFFF, "u64 max")?; }
+        _ => { return Check.fail("u64 max is not a PosInt"); }
+    }
+    match (parsed("-9223372036854775808")) {
+        JsonValue.Number(JsonNumber.NegInt(n)) => { Check.isTrue(n == -0x7FFF_FFFF_FFFF_FFFF - 1, "i64 min")?; }
+        _ => { return Check.fail("i64 min is not a NegInt"); }
+    }
+    match (parsed("9007199254740993")) {
+        JsonValue.Number(JsonNumber.PosInt(n)) => { Check.equalU64(9007199254740993, n)?; } // 2^53 + 1
+        _ => { return Check.fail("not exact"); }
+    }
+    // Beyond u64 and i64, integers become floats, as serde_json makes them.
+    match (parsed("18446744073709551616")) {
+        JsonValue.Number(JsonNumber.Float(f)) => { Check.isTrue(f == 18446744073709551616.0, "2^64")?; }
+        _ => { return Check.fail("2^64 is not a float"); }
+    }
+    match (parsed("-9223372036854775809")) {
+        JsonValue.Number(JsonNumber.Float(f)) => { Check.isTrue(f == -9223372036854775808.0, "below i64 min")?; }
+        _ => { return Check.fail("below i64 min is not a float"); }
+    }
+    Check.isTrue(parsed("-9223372036854775808").asU64().isNull(), "negative as u64")?;
+    Check.isTrue(parsed("9223372036854775808").asI64().isNull(), "2^63 as i64")?;
+    Check.isTrue(parsed("1.0").asU64().isNull(), "a float is not an integer")?;
+    return Ok();
+}
+
+@test
+fn negativeZero() -> Result<void, TestFailure> {
+    // serde_json reads `-0` as the float -0.0, and writes it back as `-0.0`.
+    match (parsed("-0")) {
+        JsonValue.Number(JsonNumber.Float(f)) => { Check.isTrue(f.bits() == (-0.0).bits(), "-0.0")?; }
+        _ => { return Check.fail("-0 is not a float"); }
+    }
+    compactIs("-0", "-0.0")?;
+    compactIs("0", "0")?;
+    compactIs("-0.0", "-0.0")?;
+    compactIs("0e5", "0.0")?;
+    return Ok();
+}
+
+@test
+fn floatForms() -> Result<void, TestFailure> {
+    compactIs("1E2", "100.0")?;
+    compactIs("1e+2", "100.0")?;
+    compactIs("1.5e-7", "1.5e-7")?;
+    compactIs("123.456e3", "123456.0")?;
+    compactIs("0.1", "0.1")?;
+    compactIs("2.50", "2.5")?;
+    return Ok();
+}
+
+@test
+fn hugeNumbersAreErrors() -> Result<void, TestFailure> {
+    // serde_json refuses what overflows an f64; what underflows becomes 0.
+    rejects("1e400", JsonErrorKind.NumberOutOfRange)?;
+    rejects("-1e400", JsonErrorKind.NumberOutOfRange)?;
+    rejectsAt("[1, 1.5e999]", JsonErrorKind.NumberOutOfRange, 1, 5)?;
+    compactIs("1e-400", "0.0")?;
+    compactIs("-1e-400", "-0.0")?;
+    let big = "100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    rejects(big, JsonErrorKind.NumberOutOfRange)?;
+    return Ok();
+}
+
+@test
+fn malformedNumbers() -> Result<void, TestFailure> {
+    rejects("01", JsonErrorKind.InvalidNumber)?;
+    rejects("-01", JsonErrorKind.InvalidNumber)?;
+    rejects("1.", JsonErrorKind.UnexpectedEnd)?;
+    rejects("1.e3", JsonErrorKind.InvalidNumber)?;
+    rejects(".5", JsonErrorKind.ExpectedValue)?;
+    rejects("1e", JsonErrorKind.UnexpectedEnd)?;
+    rejects("1e+", JsonErrorKind.UnexpectedEnd)?;
+    rejects("1ex", JsonErrorKind.InvalidNumber)?;
+    rejects("-", JsonErrorKind.UnexpectedEnd)?;
+    rejects("-a", JsonErrorKind.InvalidNumber)?;
+    rejects("+1", JsonErrorKind.ExpectedValue)?;
+    rejects("NaN", JsonErrorKind.ExpectedValue)?;
+    rejects("Infinity", JsonErrorKind.ExpectedValue)?;
+    rejects("-Infinity", JsonErrorKind.InvalidNumber)?;
+    rejects("0x10", JsonErrorKind.TrailingCharacters)?;
+    rejects("1 2", JsonErrorKind.TrailingCharacters)?;
+    return Ok();
+}
+
+@test
+fn stringEscapes() -> Result<void, TestFailure> {
+    let v = parsed("\"a\\\"b\\\\c\\/d\\b\\f\\n\\r\\t\\u0041\\u00e9\\u20AC\"");
+    Check.equalText("a\"b\\c/d\u{8}\u{C}\n\r\tAé€", v.asStr()!)?;
+    let pair = parsed("\"\\uD834\\uDD1E\""); // U+1D11E, a surrogate pair
+    Check.equalText("𝄞", pair.asStr()!)?;
+    Check.equalText("é𝄞", parsed("\"é𝄞\"").asStr()!)?; // UTF-8 as it is
+    Check.equalText("", parsed("\"\"").asStr()!)?;
+    Check.equalText("\u{0}", parsed("\"\\u0000\"").asStr()!)?;
+    return Ok();
+}
+
+@test
+fn badStrings() -> Result<void, TestFailure> {
+    rejects("\"\\uD800\"", JsonErrorKind.LoneSurrogate)?;
+    rejects("\"\\uDC00\"", JsonErrorKind.LoneSurrogate)?;
+    rejects("\"\\uD800\\u0041\"", JsonErrorKind.LoneSurrogate)?;
+    rejects("\"\\uD800x\"", JsonErrorKind.LoneSurrogate)?;
+    rejects("\"\\uDD1E\\uD834\"", JsonErrorKind.LoneSurrogate)?;
+    rejects("\"\\u12\"", JsonErrorKind.InvalidUnicodeEscape)?;
+    rejects("\"\\u12", JsonErrorKind.UnexpectedEnd)?;
+    rejects("\"\\x\"", JsonErrorKind.InvalidEscape)?;
+    rejects("\"\\'\"", JsonErrorKind.InvalidEscape)?;
+    rejects("\"a\tb\"", JsonErrorKind.ControlCharacter)?;
+    rejects("\"a\nb\"", JsonErrorKind.ControlCharacter)?;
+    rejects("\"abc", JsonErrorKind.UnexpectedEnd)?;
+    rejects("'a'", JsonErrorKind.ExpectedValue)?;
+    let latin1 = [0x22u8, 0xE9, 0x22];
+    rejectsBytes(latin1[..], JsonErrorKind.InvalidUtf8)?;
+    let overlong = [0x22u8, 0xC0, 0xAF, 0x22];
+    rejectsBytes(overlong[..], JsonErrorKind.InvalidUtf8)?;
+    let surrogate = [0x22u8, 0xED, 0xA0, 0x80, 0x22]; // U+D800 encoded in UTF-8
+    rejectsBytes(surrogate[..], JsonErrorKind.InvalidUtf8)?;
+    let bom = [0xEFu8, 0xBB, 0xBF, '{', '}'];
+    rejectsBytes(bom[..], JsonErrorKind.ExpectedValue)?;
+    return Ok();
+}
+
+@test
+fn invalidUtf8Position() -> Result<void, TestFailure> {
+    let text = [0x5Bu8, 0x31, 0x2C, 0x0A, 0x22, 0x61, 0xFF, 0x22, 0x5D]; // [1,\n"a\xFF"]
+    match (Json.parse(text[..])) {
+        Ok(_) => { return Check.fail("accepted"); }
+        Err(e) => {
+            Check.isTrue(e.kind == JsonErrorKind.InvalidUtf8, "kind")?;
+            Check.equalU64(6, e.offset as u64)?;
+            Check.equalU64(2, e.line as u64)?;
+            Check.equalU64(3, e.column as u64)?;
+        }
+    }
+    return Ok();
+}
+
+@test
+fn structureErrors() -> Result<void, TestFailure> {
+    rejects("", JsonErrorKind.UnexpectedEnd)?;
+    rejects("   ", JsonErrorKind.UnexpectedEnd)?;
+    rejects("[1,]", JsonErrorKind.TrailingComma)?;
+    rejects("{\"a\":1,}", JsonErrorKind.TrailingComma)?;
+    rejects("[1 2]", JsonErrorKind.ExpectedCommaOrEnd)?;
+    rejects("{\"a\" 1}", JsonErrorKind.ExpectedColon)?;
+    rejects("{\"a\":1 \"b\":2}", JsonErrorKind.ExpectedCommaOrEnd)?;
+    rejects("{1:2}", JsonErrorKind.ExpectedKey)?;
+    rejects("{a:2}", JsonErrorKind.ExpectedKey)?;
+    rejects("[", JsonErrorKind.UnexpectedEnd)?;
+    rejects("[1", JsonErrorKind.UnexpectedEnd)?;
+    rejects("{\"a\"", JsonErrorKind.UnexpectedEnd)?;
+    rejects("{\"a\":", JsonErrorKind.UnexpectedEnd)?;
+    rejects("[1]]", JsonErrorKind.TrailingCharacters)?;
+    rejects("tru", JsonErrorKind.UnexpectedEnd)?;
+    rejects("trUe", JsonErrorKind.InvalidLiteral)?;
+    rejects("nul", JsonErrorKind.UnexpectedEnd)?;
+    rejects("[1]/**/", JsonErrorKind.TrailingCharacters)?;
+    rejects("[1]\u{C}", JsonErrorKind.TrailingCharacters)?; // form feed is not JSON whitespace
+    rejects("\u{A0}1", JsonErrorKind.ExpectedValue)?;
+    return Ok();
+}
+
+@test
+fn errorPositions() -> Result<void, TestFailure> {
+    rejectsAt("[1,]", JsonErrorKind.TrailingComma, 1, 4)?;
+    rejectsAt("{\n  \"a\": 1,\n  \"b\" 2\n}", JsonErrorKind.ExpectedColon, 3, 7)?;
+    rejectsAt("[\n1,\n2", JsonErrorKind.UnexpectedEnd, 3, 2)?;
+    match (Json.parse("[1,]".bytes())) {
+        Ok(_) => { return Check.fail("accepted"); }
+        Err(e) => {
+            var s = String.create();
+            e.describe(mut s)!;
+            Check.equalText("trailing comma at line 1 column 4", s.view())?;
+        }
+    }
+    return Ok();
+}
+
+fn nested(depth: usize) -> Vector<u8> {
+    var text = Vector<u8>.create();
+    for (i in 0..depth) {
+        text.push('[')!;
+    }
+    for (i in 0..depth) {
+        text.push(']')!;
+    }
+    return text;
+}
+
+@test
+fn depthLimit() -> Result<void, TestFailure> {
+    let ok = nested(128);
+    Check.isTrue(Json.parse(ok.view()).isOk(), "128 levels")?;
+    let deep = nested(129);
+    rejectsBytes(deep.view(), JsonErrorKind.DepthLimitExceeded)?;
+    // No recursion: a very deep text fails cleanly, as does one deep and unclosed.
+    let deeper = nested(100000);
+    rejectsBytes(deeper.view(), JsonErrorKind.DepthLimitExceeded)?;
+    var options = ParseOptions.defaults();
+    options.maxDepth = 100000;
+    let tree = Json.parseWith(deeper.view(), options)!;
+    Check.isTrue(tree.isArray(), "100000 levels when allowed")?;
+    tree.dispose(); // dropping it would recurse 100000 levels deep (the interpreter's stack does not hold that)
+    var objects = Vector<u8>.create();
+    for (i in 0..200) {
+        objects.extend("{\"a\":".bytes())!;
+    }
+    rejectsBytes(objects.view(), JsonErrorKind.DepthLimitExceeded)?;
+    options.maxDepth = 2;
+    Check.isTrue(Json.parseWith("[[1]]".bytes(), options).isOk(), "2 levels")?;
+    Check.isTrue(Json.parseWith("[[[1]]]".bytes(), options).isErr(), "3 levels")?;
+    Check.isTrue(Json.parseWith("[{}]".bytes(), options).isOk(), "2 levels, an object")?;
+    return Ok();
+}
+
+@test
+fn inputSizeLimit() -> Result<void, TestFailure> {
+    var options = ParseOptions.defaults();
+    options.maxInputBytes = 4;
+    Check.isTrue(Json.parseWith("[12]".bytes(), options).isOk(), "4 bytes")?;
+    match (Json.parseWith("[123]".bytes(), options)) {
+        Ok(_) => { return Check.fail("5 bytes accepted"); }
+        Err(e) => { Check.isTrue(e.kind == JsonErrorKind.InputTooLarge, "kind")?; }
+    }
+    return Ok();
+}
+
+@test
+fn duplicateKeys() -> Result<void, TestFailure> {
+    // The last value wins, in the first one's place (serde_json with preserve_order).
+    compactIs("{\"a\":1,\"b\":2,\"a\":3}", "{\"a\":3,\"b\":2}")?;
+    var options = ParseOptions.defaults();
+    options.rejectDuplicateKeys = true;
+    Check.isTrue(Json.parseWith("{\"a\":1,\"b\":2}".bytes(), options).isOk(), "distinct keys")?;
+    match (Json.parseWith("{\"a\":1,\n \"a\":2}".bytes(), options)) {
+        Ok(_) => { return Check.fail("duplicate accepted"); }
+        Err(e) => {
+            Check.isTrue(e.kind == JsonErrorKind.DuplicateKey, "kind")?;
+            Check.equalU64(2, e.line as u64)?;
+            Check.equalU64(2, e.column as u64)?;
+        }
+    }
+    // A large object finds duplicates through its index too.
+    var big = Vector<u8>.create();
+    big.push('{')!;
+    for (i in 0..100) {
+        big.extend("\"k".bytes())!;
+        var n = String.create();
+        n.appendNumber(i)!;
+        big.extend(n.bytes())!;
+        big.extend("\":1,".bytes())!;
+    }
+    big.extend("\"k42\":2}".bytes())!;
+    Check.isTrue(Json.parseWith(big.view(), options).isErr(), "duplicate in a large object")?;
+    let last = Json.parse(big.view())!;
+    Check.equalU64(100, last.length() as u64)?;
+    Check.equalU64(2, last.get("k42")!.asU64()!)?;
+    Check.equalText("k42", last.asObject()!.keyAt(42))?;
+    return Ok();
+}

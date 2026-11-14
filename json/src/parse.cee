@@ -1,0 +1,563 @@
+// Parsing: strict RFC 8259, without recursion.
+//
+// The text must be UTF-8, and is checked once, up front, by the runtime's validator. Whitespace is SP, TAB, LF and CR
+// only. There are no comments, trailing commas, NaN, infinities, leading zeros, `+` signs or single quotes. A `\u`
+// escape of a surrogate must be the first half of a pair followed by the second; a lone one is an error. Containers
+// are parsed with a stack of open ones on the heap, so the depth is limited by `ParseOptions.maxDepth`, not by the
+// machine's stack.
+
+/// Why a text is not JSON (or not JSON the options accept).
+public enum JsonErrorKind {
+    /// The text ended inside a value: an open string, array or object, or nothing at all.
+    UnexpectedEnd,
+    /// A byte that cannot start a value.
+    ExpectedValue,
+    /// A word that starts like `true`, `false` or `null` and is not it.
+    InvalidLiteral,
+    /// An object key that is not a string.
+    ExpectedKey,
+    ExpectedColon,
+    /// After an element or member, something other than `,` or the container's end.
+    ExpectedCommaOrEnd,
+    /// A `,` just before `]` or `}`.
+    TrailingComma,
+    /// More than whitespace after the value.
+    TrailingCharacters,
+    /// A number that breaks the grammar: a leading zero, a bare `-`, `.` or `e` without digits.
+    InvalidNumber,
+    /// A number too large for an `f64` (`1e400`), which serde_json refuses too.
+    NumberOutOfRange,
+    /// A byte below U+0020 inside a string: it must be escaped.
+    ControlCharacter,
+    /// A `\` followed by something other than `"` `\` `/` `b` `f` `n` `r` `t` `u`.
+    InvalidEscape,
+    /// A `\u` without four hex digits.
+    InvalidUnicodeEscape,
+    /// A `\u` escape of half a surrogate pair without the other half.
+    LoneSurrogate,
+    /// Bytes that are not UTF-8.
+    InvalidUtf8,
+    /// More arrays and objects open at once than `ParseOptions.maxDepth`.
+    DepthLimitExceeded,
+    /// A text longer than `ParseOptions.maxInputBytes`.
+    InputTooLarge,
+    /// A key that its object already has, under `ParseOptions.rejectDuplicateKeys`.
+    DuplicateKey,
+    OutOfMemory,
+}
+
+impl JsonErrorKind {
+    /// What went wrong, in words.
+    public fn message(this) -> StringView => match (this) {
+        JsonErrorKind.UnexpectedEnd => "unexpected end of input",
+        JsonErrorKind.ExpectedValue => "expected a value",
+        JsonErrorKind.InvalidLiteral => "expected true, false or null",
+        JsonErrorKind.ExpectedKey => "expected a string key",
+        JsonErrorKind.ExpectedColon => "expected ':'",
+        JsonErrorKind.ExpectedCommaOrEnd => "expected ',' or the end of the array or object",
+        JsonErrorKind.TrailingComma => "trailing comma",
+        JsonErrorKind.TrailingCharacters => "trailing characters",
+        JsonErrorKind.InvalidNumber => "invalid number",
+        JsonErrorKind.NumberOutOfRange => "number out of range",
+        JsonErrorKind.ControlCharacter => "control character in a string",
+        JsonErrorKind.InvalidEscape => "invalid escape",
+        JsonErrorKind.InvalidUnicodeEscape => "invalid \\u escape",
+        JsonErrorKind.LoneSurrogate => "lone surrogate in a \\u escape",
+        JsonErrorKind.InvalidUtf8 => "invalid UTF-8",
+        JsonErrorKind.DepthLimitExceeded => "nested too deeply",
+        JsonErrorKind.InputTooLarge => "input too large",
+        JsonErrorKind.DuplicateKey => "duplicate key",
+        JsonErrorKind.OutOfMemory => "out of memory",
+    };
+}
+
+/// Where and why parsing stopped.
+public struct JsonError {
+    public kind: JsonErrorKind;
+    /// The line, from 1.
+    public line: usize;
+    /// The column, from 1, in bytes.
+    public column: usize;
+    /// The offset in the text, from 0, in bytes.
+    public offset: usize;
+
+    /// What went wrong, in words.
+    public fn message(borrow this) -> StringView => this.kind.message();
+
+    /// Appends serde_json's form of the error, `trailing comma at line 1 column 5`, to `out`.
+    public fn describe(borrow this, out: borrow mut String) -> Result<void, AllocError> {
+        out.append(this.kind.message())?;
+        out.append(" at line ")?;
+        out.appendNumber(this.line)?;
+        out.append(" column ")?;
+        out.appendNumber(this.column)?;
+        return Ok();
+    }
+}
+
+/// What `Json.parseWith` accepts.
+public struct ParseOptions {
+    /// The most arrays and objects open at once (serde_json's recursion limit is 128 too).
+    public maxDepth: usize;
+    /// The longest text, in bytes.
+    public maxInputBytes: usize;
+    /// Refuse an object that has a key twice; by default the last value wins, in the first one's place (serde_json).
+    public rejectDuplicateKeys: bool;
+
+    /// A depth of 128, 64 MiB of text, duplicate keys allowed.
+    public fn defaults() -> ParseOptions => ParseOptions {
+        maxDepth: 128,
+        maxInputBytes: 64 * 1024 * 1024,
+        rejectDuplicateKeys: false,
+    };
+}
+
+/// Parsing, encoding and decoding: static functions.
+public struct Json {
+    /// Parses `text`, which must be one JSON value with optional whitespace around it, with the default options.
+    public fn parse(text: Slice<u8>) -> Result<JsonValue, JsonError> => Json.parseWith(text, ParseOptions.defaults());
+
+    /// Parses `text` with `options`.
+    public fn parseWith(text: Slice<u8>, options: ParseOptions) -> Result<JsonValue, JsonError> {
+        if (text.length > options.maxInputBytes) {
+            return Err(JsonError { kind: JsonErrorKind.InputTooLarge, line: 1, column: 1, offset: 0 });
+        }
+        let view = match (StringView.fromUtf8(text)) {
+            Some(v) => v,
+            null => StringView.fromUtf8(text[..Utf8.firstInvalid(text) ?? 0]) ?? "",
+        };
+        var p = Parser { view: view, end: view.length, total: text.length, pos: 0, options: options };
+        return p.document();
+    }
+}
+
+/// An open container while parsing.
+enum Frame {
+    InArray(Vector<JsonValue>),
+    /// The object, the key whose value comes next, and where that key starts.
+    InObject(JsonObject, String, usize),
+}
+
+struct Parser<region r> {
+    /// The text up to its first byte that is not UTF-8 (all of it, if it is all UTF-8).
+    view: StringView<r>;
+    end: usize;
+    total: usize;
+    pos: usize;
+    options: ParseOptions;
+
+    fn document(borrow mut this) -> Result<JsonValue, JsonError> {
+        var stack = Vector<Frame>.create();
+        while (true) {
+            var value = JsonValue.Null;
+            this.skipSpace();
+            if (this.pos >= this.end) {
+                return Err(this.error(JsonErrorKind.UnexpectedEnd));
+            }
+            let c = this.view[this.pos];
+            if (c == '[' || c == '{') {
+                if (stack.length >= this.options.maxDepth) {
+                    return Err(this.error(JsonErrorKind.DepthLimitExceeded));
+                }
+                this.pos += 1;
+                this.skipSpace();
+                if (c == '[') {
+                    if (this.peekIs(']')) {
+                        this.pos += 1;
+                        value = JsonValue.array();
+                    } else {
+                        this.oom(stack.push(Frame.InArray(Vector<JsonValue>.create())))?;
+                        continue;
+                    }
+                } else if (this.peekIs('}')) {
+                    this.pos += 1;
+                    value = JsonValue.object();
+                } else {
+                    let at = this.pos;
+                    let key = this.key()?;
+                    this.oom(stack.push(Frame.InObject(JsonObject.create(), key, at)))?;
+                    continue;
+                }
+            } else {
+                value = this.scalar(c)?;
+            }
+            // Hand the value to the containers it completes, until one needs another value.
+            while (true) {
+                let frame = match (stack.pop()) {
+                    Some(f) => f,
+                    null => {
+                        this.skipSpace();
+                        if (this.pos < this.total) {
+                            return Err(this.error(JsonErrorKind.TrailingCharacters));
+                        }
+                        return Ok(value);
+                    }
+                };
+                match (frame) {
+                    Frame.InArray(var items) => {
+                        this.oom(items.push(value))?;
+                        this.skipSpace();
+                        if (this.pos >= this.end) {
+                            return Err(this.error(JsonErrorKind.UnexpectedEnd));
+                        }
+                        let d = this.view[this.pos];
+                        if (d == ']') {
+                            this.pos += 1;
+                            value = JsonValue.Array(items);
+                            continue;
+                        }
+                        if (d != ',') {
+                            return Err(this.error(JsonErrorKind.ExpectedCommaOrEnd));
+                        }
+                        this.pos += 1;
+                        this.skipSpace();
+                        if (this.peekIs(']')) {
+                            return Err(this.error(JsonErrorKind.TrailingComma));
+                        }
+                        this.oom(stack.push(Frame.InArray(items)))?;
+                        break;
+                    }
+                    Frame.InObject(var object, key, at) => {
+                        if (this.options.rejectDuplicateKeys && object.contains(key.view())) {
+                            this.pos = at;
+                            return Err(this.error(JsonErrorKind.DuplicateKey));
+                        }
+                        let _ = this.oom(object.put(key, value))?;
+                        this.skipSpace();
+                        if (this.pos >= this.end) {
+                            return Err(this.error(JsonErrorKind.UnexpectedEnd));
+                        }
+                        let d = this.view[this.pos];
+                        if (d == '}') {
+                            this.pos += 1;
+                            value = JsonValue.Object(object);
+                            continue;
+                        }
+                        if (d != ',') {
+                            return Err(this.error(JsonErrorKind.ExpectedCommaOrEnd));
+                        }
+                        this.pos += 1;
+                        this.skipSpace();
+                        if (this.peekIs('}')) {
+                            return Err(this.error(JsonErrorKind.TrailingComma));
+                        }
+                        let next = this.pos;
+                        let nextKey = this.key()?;
+                        this.oom(stack.push(Frame.InObject(object, nextKey, next)))?;
+                        break;
+                    }
+                }
+            }
+        }
+        return Err(this.error(JsonErrorKind.UnexpectedEnd));
+    }
+
+    /// A key and its colon, at a `"`.
+    fn key(borrow mut this) -> Result<String, JsonError> {
+        if (this.pos >= this.end) {
+            return Err(this.error(JsonErrorKind.UnexpectedEnd));
+        }
+        if (this.view[this.pos] != '"') {
+            return Err(this.error(JsonErrorKind.ExpectedKey));
+        }
+        let key = this.string()?;
+        this.skipSpace();
+        if (this.pos >= this.end) {
+            return Err(this.error(JsonErrorKind.UnexpectedEnd));
+        }
+        if (this.view[this.pos] != ':') {
+            return Err(this.error(JsonErrorKind.ExpectedColon));
+        }
+        this.pos += 1;
+        return Ok(key);
+    }
+
+    /// A value that is not a container, starting with `c`.
+    fn scalar(borrow mut this, c: u8) -> Result<JsonValue, JsonError> {
+        if (c == '"') {
+            return Ok(JsonValue.String(this.string()?));
+        }
+        if (c == '-' || (c >= '0' && c <= '9')) {
+            return Ok(JsonValue.Number(this.number()?));
+        }
+        if (c == 't') {
+            this.literal("true")?;
+            return Ok(JsonValue.Bool(true));
+        }
+        if (c == 'f') {
+            this.literal("false")?;
+            return Ok(JsonValue.Bool(false));
+        }
+        if (c == 'n') {
+            this.literal("null")?;
+            return Ok(JsonValue.Null);
+        }
+        return Err(this.error(JsonErrorKind.ExpectedValue));
+    }
+
+    fn literal(borrow mut this, word: StringView) -> Result<void, JsonError> {
+        for (b in word.bytes()) {
+            if (this.pos >= this.end) {
+                return Err(this.error(JsonErrorKind.UnexpectedEnd));
+            }
+            if (this.view[this.pos] != b) {
+                return Err(this.error(JsonErrorKind.InvalidLiteral));
+            }
+            this.pos += 1;
+        }
+        return Ok();
+    }
+
+    fn number(borrow mut this) -> Result<JsonNumber, JsonError> {
+        let start = this.pos;
+        let negative = this.view[this.pos] == '-';
+        if (negative) {
+            this.pos += 1;
+        }
+        if (this.pos >= this.end) {
+            return Err(this.error(JsonErrorKind.UnexpectedEnd));
+        }
+        let first = this.view[this.pos];
+        if (first == '0') {
+            this.pos += 1;
+            if (this.digitHere()) {
+                return Err(this.error(JsonErrorKind.InvalidNumber));
+            }
+        } else if (first >= '1' && first <= '9') {
+            this.skipDigits();
+        } else {
+            return Err(this.error(JsonErrorKind.InvalidNumber));
+        }
+        let integerEnd = this.pos;
+        var integral = true;
+        if (this.peekIs('.')) {
+            this.pos += 1;
+            this.requireDigit()?;
+            this.skipDigits();
+            integral = false;
+        }
+        if (this.peekIs('e') || this.peekIs('E')) {
+            this.pos += 1;
+            if (this.peekIs('+') || this.peekIs('-')) {
+                this.pos += 1;
+            }
+            this.requireDigit()?;
+            this.skipDigits();
+            integral = false;
+        }
+        let bytes = this.view.bytes();
+        if (integral) {
+            let digitsStart = if (negative) start + 1 else start;
+            match (NumberParsing.parseU64(bytes[digitsStart..integerEnd])) {
+                Some(m) => {
+                    if (!negative) {
+                        return Ok(JsonNumber.PosInt(m));
+                    }
+                    if (m == 0) {
+                        return Ok(JsonNumber.Float(-0.0)); // serde_json's `-0`
+                    }
+                    if (m <= 0x8000_0000_0000_0000) {
+                        return Ok(JsonNumber.NegInt(0 - truncate<i64>(m - 1) - 1));
+                    }
+                }
+                null => {} // more than a u64 holds: an f64, as serde_json makes it
+            }
+        }
+        match (NumberParsing.parseF64(bytes[start..this.pos])) {
+            Some(f) => {
+                if (!Floats.isFinite(f)) {
+                    this.pos = start;
+                    return Err(this.error(JsonErrorKind.NumberOutOfRange));
+                }
+                return Ok(JsonNumber.Float(f));
+            }
+            null => {
+                this.pos = start;
+                return Err(this.error(JsonErrorKind.InvalidNumber));
+            }
+        }
+    }
+
+    fn digitHere(borrow this) -> bool =>
+        this.pos < this.end && this.view[this.pos] >= '0' && this.view[this.pos] <= '9';
+
+    fn skipDigits(borrow mut this) {
+        while (this.digitHere()) {
+            this.pos += 1;
+        }
+    }
+
+    fn requireDigit(borrow this) -> Result<void, JsonError> {
+        if (this.pos >= this.end) {
+            return Err(this.error(JsonErrorKind.UnexpectedEnd));
+        }
+        if (!this.digitHere()) {
+            return Err(this.error(JsonErrorKind.InvalidNumber));
+        }
+        return Ok();
+    }
+
+    /// A string, at its opening `"`.
+    fn string(borrow mut this) -> Result<String, JsonError> {
+        this.pos += 1;
+        let start = this.pos;
+        // Most strings have no escapes: find the end, and copy them once.
+        while (this.pos < this.end) {
+            let b = this.view[this.pos];
+            if (b == '"') {
+                let s = this.oom(String.from(this.view[start..this.pos]))?;
+                this.pos += 1;
+                return Ok(s);
+            }
+            if (b == '\\') {
+                break;
+            }
+            if (b < 0x20) {
+                return Err(this.error(JsonErrorKind.ControlCharacter));
+            }
+            this.pos += 1;
+        }
+        var s = String.create();
+        var run = start;
+        while (true) {
+            if (this.pos >= this.end) {
+                return Err(this.error(JsonErrorKind.UnexpectedEnd));
+            }
+            let b = this.view[this.pos];
+            if (b == '"') {
+                this.oom(s.append(this.view[run..this.pos]))?;
+                this.pos += 1;
+                return Ok(s);
+            }
+            if (b < 0x20) {
+                return Err(this.error(JsonErrorKind.ControlCharacter));
+            }
+            if (b != '\\') {
+                this.pos += 1;
+                continue;
+            }
+            this.oom(s.append(this.view[run..this.pos]))?;
+            this.pos += 1;
+            if (this.pos >= this.end) {
+                return Err(this.error(JsonErrorKind.UnexpectedEnd));
+            }
+            let e = this.view[this.pos];
+            this.pos += 1;
+            match (e) {
+                '"' => { this.oom(s.append("\""))?; }
+                '\\' => { this.oom(s.append("\\"))?; }
+                '/' => { this.oom(s.append("/"))?; }
+                'b' => { this.oom(s.append("\u{8}"))?; }
+                'f' => { this.oom(s.append("\u{C}"))?; }
+                'n' => { this.oom(s.append("\n"))?; }
+                'r' => { this.oom(s.append("\r"))?; }
+                't' => { this.oom(s.append("\t"))?; }
+                'u' => {
+                    let cp = this.unicodeEscape()?;
+                    var buffer = [0u8; 4];
+                    let n = Utf8.encode(cp, mut buffer[..]);
+                    match (StringView.fromUtf8(buffer[..n])) {
+                        Some(text) => { this.oom(s.append(text))?; }
+                        null => { return Err(this.error(JsonErrorKind.LoneSurrogate)); }
+                    }
+                }
+                _ => {
+                    this.pos -= 1;
+                    return Err(this.error(JsonErrorKind.InvalidEscape));
+                }
+            }
+            run = this.pos;
+        }
+        return Err(this.error(JsonErrorKind.UnexpectedEnd));
+    }
+
+    /// The scalar value of a `\u` escape, after its `u`: a pair of them for a character above U+FFFF.
+    fn unicodeEscape(borrow mut this) -> Result<u32, JsonError> {
+        let escape = this.pos - 2;
+        let unit = this.hex4()?;
+        if (unit >= 0xDC00 && unit <= 0xDFFF) {
+            this.pos = escape;
+            return Err(this.error(JsonErrorKind.LoneSurrogate));
+        }
+        if (unit < 0xD800 || unit > 0xDBFF) {
+            return Ok(unit);
+        }
+        if (this.pos < this.end && this.view[this.pos] == '\\' && this.pos + 1 >= this.end) {
+            this.pos = this.end;
+            return Err(this.error(JsonErrorKind.UnexpectedEnd));
+        }
+        if (this.pos >= this.end || this.view[this.pos] != '\\' || this.view[this.pos + 1] != 'u') {
+            this.pos = escape;
+            return Err(this.error(JsonErrorKind.LoneSurrogate));
+        }
+        this.pos += 2;
+        let low = this.hex4()?;
+        if (low < 0xDC00 || low > 0xDFFF) {
+            this.pos = escape;
+            return Err(this.error(JsonErrorKind.LoneSurrogate));
+        }
+        return Ok(0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00));
+    }
+
+    fn hex4(borrow mut this) -> Result<u32, JsonError> {
+        var value: u32 = 0;
+        for (k in 0..4) {
+            if (this.pos >= this.end) {
+                return Err(this.error(JsonErrorKind.UnexpectedEnd));
+            }
+            let c = this.view[this.pos];
+            var d: u32 = 0;
+            if (c >= '0' && c <= '9') {
+                d = (c - '0') as u32;
+            } else if (c >= 'a' && c <= 'f') {
+                d = (c - 'a' + 10) as u32;
+            } else if (c >= 'A' && c <= 'F') {
+                d = (c - 'A' + 10) as u32;
+            } else {
+                return Err(this.error(JsonErrorKind.InvalidUnicodeEscape));
+            }
+            value = value * 16 + d;
+            this.pos += 1;
+        }
+        return Ok(value);
+    }
+
+    fn skipSpace(borrow mut this) {
+        while (this.pos < this.end) {
+            let b = this.view[this.pos];
+            if (b != ' ' && b != '\t' && b != '\n' && b != '\r') {
+                return;
+            }
+            this.pos += 1;
+        }
+    }
+
+    fn peekIs(borrow this, b: u8) -> bool => this.pos < this.end && this.view[this.pos] == b;
+
+    fn oom<T>(borrow this, outcome: Result<T, AllocError>) -> Result<T, JsonError> {
+        match (outcome) {
+            Ok(v) => { return Ok(v); }
+            Err(_) => { return Err(this.error(JsonErrorKind.OutOfMemory)); }
+        }
+    }
+
+    /// The error `kind` here; at the end of the UTF-8 part of a text that goes on, the bytes there are the error.
+    fn error(borrow this, kind: JsonErrorKind) -> JsonError {
+        var at = this.pos;
+        var why = kind;
+        if (at >= this.end && this.end < this.total && kind != JsonErrorKind.OutOfMemory) {
+            at = this.end;
+            why = JsonErrorKind.InvalidUtf8;
+        }
+        var line: usize = 1;
+        var lineStart: usize = 0;
+        let bytes = this.view.bytes();
+        for (i in 0..at.min(bytes.length)) {
+            if (bytes[i] == '\n') {
+                line += 1;
+                lineStart = i + 1;
+            }
+        }
+        return JsonError { kind: why, line: line, column: at - lineStart + 1, offset: at };
+    }
+}

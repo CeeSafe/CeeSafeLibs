@@ -1,0 +1,163 @@
+// The tree: builders, accessors, objects large and small, JSON Pointer, equality and copies.
+
+@test
+fn buildsATree() -> Result<void, TestFailure> {
+    var root = JsonValue.object();
+    root.insert("name", JsonValue.string("edge")!)!;
+    root.insert("port", JsonValue.fromU64(8080))!;
+    root.insert("offset", JsonValue.fromI64(-3))!;
+    root.insert("ratio", JsonValue.fromF64(0.25))!;
+    root.insert("on", JsonValue.fromBool(true))!;
+    root.insert("none", JsonValue.Null)!;
+    var list = JsonValue.array();
+    list.push(JsonValue.fromU64(1))!;
+    list.push(JsonValue.string("two")!)!;
+    root.insert("list", list)!;
+    root.insert("port", JsonValue.fromU64(443))!; // replaces, in place
+    var out = Vector<u8>.create();
+    root.write(mut out)!;
+    let expected = "{\"name\":\"edge\",\"port\":443,\"offset\":-3,\"ratio\":0.25,\"on\":true,\"none\":null,\"list\":[1,\"two\"]}";
+    Check.equalText(expected, bytesText(out))?;
+    Check.isTrue(JsonValue.fromI64(5).asNumber()!.equals(JsonNumber.PosInt(5)), "fromI64 of a positive")?;
+    return Ok();
+}
+
+@test
+fn accessorsOfEachKind() -> Result<void, TestFailure> {
+    let v = parsed("{\"s\":\"text\",\"n\":-7,\"u\":7,\"f\":2.5,\"b\":false,\"z\":null,\"a\":[1],\"o\":{\"k\":1}}");
+    let s = v.get("s")!;
+    Check.isTrue(s.kind() == JsonKind.String && s.isString(), "string")?;
+    Check.isTrue(s.asU64().isNull() && s.asBool().isNull() && s.asF64().isNull(), "a string is no number")?;
+    Check.equalI64(-7, v.get("n")!.asI64()!)?;
+    Check.isTrue(v.get("n")!.asU64().isNull(), "negative as u64")?;
+    Check.isTrue(v.get("n")!.asF64()! == -7.0, "an integer as f64")?;
+    Check.equalI64(7, v.get("u")!.asI64()!)?;
+    Check.isTrue(v.get("f")!.asI64().isNull(), "float as i64")?;
+    Check.isTrue(v.get("b")!.isBool() && !v.get("b")!.asBool()!, "bool")?;
+    Check.isTrue(v.get("z")!.isNull(), "null")?;
+    Check.isTrue(v.get("a")!.asArray()!.length == 1, "array")?;
+    Check.isTrue(v.get("o")!.asObject()!.contains("k"), "object")?;
+    Check.isTrue(v.get("a")!.get("k").isNull(), "get on an array")?;
+    Check.isTrue(v.at(0).isNull(), "at on an object")?;
+    Check.equalText("number", v.get("n")!.kind().name())?;
+    return Ok();
+}
+
+@test
+fn changesInPlace() -> Result<void, TestFailure> {
+    var v = parsed("{\"a\":[1,2],\"b\":{\"c\":1}}");
+    v.getMut("a")!.push(JsonValue.fromU64(3))!;
+    let c = v.getMut("b")!.getMut("c")!;
+    c = JsonValue.Bool(true);
+    let first = v.getMut("a")!.atMut(0)!;
+    first = JsonValue.Null;
+    Check.isTrue(v.pointerMut("/b/d").isNull(), "missing")?;
+    v.asObjectMut()!.insert("e", JsonValue.array())!;
+    var out = Vector<u8>.create();
+    v.write(mut out)!;
+    Check.equalText("{\"a\":[null,2,3],\"b\":{\"c\":true},\"e\":[]}", bytesText(out))?;
+    let removed = v.asObjectMut()!.remove("a")!;
+    Check.equalU64(3, removed.length() as u64)?;
+    Check.isTrue(v.asObjectMut()!.remove("a").isNull(), "removed twice")?;
+    var again = Vector<u8>.create();
+    v.write(mut again)!;
+    Check.equalText("{\"b\":{\"c\":true},\"e\":[]}", bytesText(again))?;
+    return Ok();
+}
+
+fn keyOf(i: usize) -> String {
+    var k = String.create();
+    k.append("key")!;
+    k.appendNumber(i)!;
+    return k;
+}
+
+@test
+fn largeObjects() -> Result<void, TestFailure> {
+    // Past a dozen members an object looks keys up through a hash index; the order stays the insertion order.
+    var o = JsonObject.create();
+    for (i in 0..1000) {
+        let k = keyOf(i);
+        Check.isTrue(o.insert(k.view(), JsonValue.fromU64(i as u64))!.isNull(), "new key")?;
+    }
+    Check.equalU64(1000, o.length() as u64)?;
+    for (i in 0..1000) {
+        let k = keyOf(i);
+        Check.equalU64(i as u64, o.get(k.view())!.asU64()!)?;
+        Check.equalText(k.view(), o.keyAt(i))?;
+    }
+    Check.isTrue(o.get("key1000").isNull(), "absent")?;
+    let old = o.insert("key500", JsonValue.Null)!;
+    Check.equalU64(500, old!.asU64()!)?;
+    Check.isTrue(o.valueAt(500).isNull(), "replaced in place")?;
+    // Removing keeps the order of the rest.
+    for (i in 0..990) {
+        let k = keyOf(i);
+        Check.isTrue(o.remove(k.view()).isSome(), "removed")?;
+    }
+    Check.equalU64(10, o.length() as u64)?;
+    for (i in 0..10) {
+        let k = keyOf(990 + i);
+        Check.equalText(k.view(), o.keyAt(i))?;
+        Check.equalU64((990 + i) as u64, o.get(k.view())!.asU64()!)?;
+    }
+    Check.isTrue(o.get("key5").isNull(), "removed key gone")?;
+    let copy = o.clone()!;
+    Check.isTrue(copy.equals(o), "copy")?;
+    return Ok();
+}
+
+@test
+fn jsonPointer() -> Result<void, TestFailure> {
+    // RFC 6901 §5's examples.
+    let doc = parsed("""
+        {"foo": ["bar", "baz"], "": 0, "a/b": 1, "c%d": 2, "e^f": 3, "g|h": 4, "i\\j": 5, "k\"l": 6, " ": 7, "m~n": 8}
+        """);
+    Check.isTrue(doc.pointer("")!.isObject(), "whole document")?;
+    Check.equalText("bar", doc.pointer("/foo/0")!.asStr()!)?;
+    Check.equalText("baz", doc.pointer("/foo/1")!.asStr()!)?;
+    Check.equalU64(2, doc.pointer("/foo")!.length() as u64)?;
+    Check.equalU64(0, doc.pointer("/")!.asU64()!)?;
+    Check.equalU64(1, doc.pointer("/a~1b")!.asU64()!)?;
+    Check.equalU64(2, doc.pointer("/c%d")!.asU64()!)?;
+    Check.equalU64(3, doc.pointer("/e^f")!.asU64()!)?;
+    Check.equalU64(4, doc.pointer("/g|h")!.asU64()!)?;
+    Check.equalU64(5, doc.pointer("/i\\j")!.asU64()!)?;
+    Check.equalU64(6, doc.pointer("/k\"l")!.asU64()!)?;
+    Check.equalU64(7, doc.pointer("/ ")!.asU64()!)?;
+    Check.equalU64(8, doc.pointer("/m~0n")!.asU64()!)?;
+    Check.isTrue(doc.pointer("foo").isNull(), "no leading slash")?;
+    Check.isTrue(doc.pointer("/foo/2").isNull(), "past the end")?;
+    Check.isTrue(doc.pointer("/foo/-").isNull(), "dash")?;
+    Check.isTrue(doc.pointer("/foo/01").isNull(), "leading zero")?;
+    Check.isTrue(doc.pointer("/foo/+1").isNull(), "sign")?;
+    Check.isTrue(doc.pointer("/foo/0/x").isNull(), "into a string")?;
+    Check.isTrue(doc.pointer("/m~2n").isNull(), "bad escape")?;
+    Check.isTrue(doc.pointer("/m~").isNull(), "cut escape")?;
+    Check.isTrue(doc.pointer("/nope").isNull(), "missing key")?;
+    let deep = parsed("{\"a\":[{\"b\":[0,{\"c\":\"deep\"}]}]}");
+    Check.equalText("deep", deep.pointer("/a/0/b/1/c")!.asStr()!)?;
+    var m = parsed("{\"a\":[{\"b~/\":1}]}");
+    let slot = m.pointerMut("/a/0/b~0~1")!;
+    slot = JsonValue.fromU64(2);
+    Check.equalU64(2, m.pointer("/a/0/b~0~1")!.asU64()!)?;
+    Check.isTrue(m.pointerMut("/a/1").isNull(), "mut past the end")?;
+    return Ok();
+}
+
+@test
+fn equalityAndCopies() -> Result<void, TestFailure> {
+    let a = parsed("{\"x\":[1,2.5,\"s\",null,true,{\"y\":-1}],\"z\":{}}");
+    let b = parsed("{\"z\":{},\"x\":[1,2.5,\"s\",null,true,{\"y\":-1}]}");
+    Check.isTrue(a.equals(b), "objects compare as maps")?;
+    Check.isTrue(a.clone()!.equals(a), "clone")?;
+    Check.isFalse(parsed("[1]").equals(parsed("[1.0]")), "1 is not 1.0")?;
+    Check.isTrue(parsed("0.0").equals(parsed("-0.0")), "0.0 is -0.0")?;
+    Check.isFalse(parsed("[1,2]").equals(parsed("[2,1]")), "arrays keep order")?;
+    Check.isFalse(parsed("{\"a\":1}").equals(parsed("{\"a\":1,\"b\":2}")), "more members")?;
+    Check.isFalse(parsed("{\"a\":1}").equals(parsed("{\"b\":1}")), "other key")?;
+    Check.isFalse(parsed("\"a\"").equals(parsed("\"b\"")), "strings")?;
+    Check.isFalse(parsed("null").equals(parsed("false")), "kinds")?;
+    Check.isTrue(JsonNumber.NegInt(-5).equals(JsonNumber.fromI64(-5)), "negatives")?;
+    return Ok();
+}

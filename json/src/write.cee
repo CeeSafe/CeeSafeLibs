@@ -1,0 +1,680 @@
+// Writing JSON: the streaming JsonWriter, and JsonValue's write methods over it.
+//
+// The output is RFC 8259 JSON. Compact output has no whitespace; pretty output is serde_json's PrettyFormatter: two
+// spaces an indent level, `": "` after a key, an empty array or object as `[]` or `{}`, and no newline at the end.
+
+/// Why a write failed. After an error the writer's output is not JSON; discard it.
+public enum JsonWriteError {
+    OutOfMemory,
+    /// An `f64` or `f32` that is NaN or infinite: JSON has no such number.
+    NonFiniteNumber,
+    /// `stringBytes` or `keyBytes` given bytes that are not UTF-8.
+    InvalidUtf8,
+    /// A value in an object without a key before it.
+    ExpectedKey,
+    /// A key outside an object, or a second key before the first one's value.
+    UnexpectedKey,
+    /// An `end` that does not close the innermost open container.
+    UnbalancedEnd,
+    /// `finish` before the value was whole: a container still open, a key without its value, or nothing written.
+    Incomplete,
+    /// A second value after the whole one at the top.
+    AlreadyComplete,
+    /// More containers open at once than `WriteOptions.maxDepth`.
+    DepthLimitExceeded,
+}
+
+impl JsonWriteError {
+    /// What went wrong, in words.
+    public fn message(this) -> StringView => match (this) {
+        JsonWriteError.OutOfMemory => "out of memory",
+        JsonWriteError.NonFiniteNumber => "NaN and infinities cannot be written as JSON",
+        JsonWriteError.InvalidUtf8 => "a string is not UTF-8",
+        JsonWriteError.ExpectedKey => "a value in an object needs a key first",
+        JsonWriteError.UnexpectedKey => "a key is not expected here",
+        JsonWriteError.UnbalancedEnd => "the end does not match the open container",
+        JsonWriteError.Incomplete => "the JSON value is not complete",
+        JsonWriteError.AlreadyComplete => "the JSON value is already complete",
+        JsonWriteError.DepthLimitExceeded => "nested too deeply",
+    };
+}
+
+/// How a JsonWriter writes.
+public struct WriteOptions {
+    /// Newlines and two-space indentation, as serde_json's `to_string_pretty`; else no whitespace at all.
+    public pretty: bool;
+    /// Writes `</` in strings as `<\/`, so the JSON can sit inside an HTML `<script>` element.
+    public escapeEndTag: bool;
+    /// Writes every character outside ASCII as `\uXXXX` (a surrogate pair above U+FFFF), so the output is ASCII.
+    public asciiOnly: bool;
+    /// The most arrays and objects open at once; deeper is `DepthLimitExceeded` (the parser's default too).
+    public maxDepth: usize;
+
+    /// Compact output, UTF-8 left as it is, at most 128 levels.
+    public fn compact() -> WriteOptions => WriteOptions {
+        pretty: false,
+        escapeEndTag: false,
+        asciiOnly: false,
+        maxDepth: 128,
+    };
+
+    /// Pretty output, otherwise as `compact`.
+    public fn indented() -> WriteOptions => WriteOptions {
+        pretty: true,
+        escapeEndTag: false,
+        asciiOnly: false,
+        maxDepth: 128,
+    };
+}
+
+// A container on the writer's stack: bit 0 set for an object, bit 1 once it has a member or element.
+const IN_OBJECT: u8 = 1;
+const HAS_ITEMS: u8 = 2;
+
+const HEX: StringView = "0123456789abcdef";
+
+/// Writes one JSON value, piece by piece, without building a tree: commas, colons and indentation are its business.
+///
+/// ```ceesafe
+/// var w = JsonWriter.pretty();
+/// w.beginObject()?;
+/// w.key("name")?;
+/// w.string("edge")?;
+/// w.key("port")?;
+/// w.u64(8080)?;
+/// w.endObject()?;
+/// let bytes = w.finish()?; // {\n  "name": "edge",\n  "port": 8080\n}
+/// ```
+///
+/// Each call checks that it fits where it is written (a key in an object, a value after a key, ends that match), so
+/// a writer that `finish`es without an error wrote one whole JSON value.
+public struct JsonWriter {
+    out: Vector<u8>;
+    options: WriteOptions;
+    stack: Vector<u8>;
+    afterKey: bool;
+    complete: bool;
+    scratch: String;
+
+    /// A writer of compact JSON into a new vector.
+    public fn compact() -> JsonWriter => JsonWriter.appendingTo(Vector<u8>.create(), WriteOptions.compact());
+
+    /// A writer of pretty JSON into a new vector.
+    public fn pretty() -> JsonWriter => JsonWriter.appendingTo(Vector<u8>.create(), WriteOptions.indented());
+
+    /// A writer with `options` into a new vector.
+    public fn withOptions(options: WriteOptions) -> JsonWriter => JsonWriter.appendingTo(Vector<u8>.create(), options);
+
+    /// A writer that appends to `out`, which `finish` or `intoBytes` gives back.
+    public fn appendingTo(out: Vector<u8>, options: WriteOptions) -> JsonWriter => JsonWriter {
+        out: out,
+        options: options,
+        stack: Vector<u8>.create(),
+        afterKey: false,
+        complete: false,
+        scratch: String.create(),
+    };
+
+    /// The output so far.
+    public fn written(borrow this) -> Slice<u8> => this.out.view();
+
+    /// Whether one whole value has been written.
+    public fn isComplete(borrow this) -> bool => this.complete;
+
+    /// How many arrays and objects are open.
+    public fn depth(borrow this) -> usize => this.stack.length;
+
+    /// The output, once it is one whole value; `Incomplete` otherwise (and the output is lost).
+    public fn finish(this) -> Result<Vector<u8>, JsonWriteError> {
+        if (!this.complete) {
+            return Err(JsonWriteError.Incomplete);
+        }
+        return Ok(this.out);
+    }
+
+    /// The output, whole or not.
+    public fn intoBytes(this) -> Vector<u8> => this.out;
+
+    /// Opens an object, as a value.
+    public fn beginObject(borrow mut this) -> Result<void, JsonWriteError> => this.open('{', IN_OBJECT);
+
+    /// Closes the innermost open container, which must be an object with no key waiting for its value.
+    public fn endObject(borrow mut this) -> Result<void, JsonWriteError> => this.close('}', IN_OBJECT);
+
+    /// Opens an array, as a value.
+    public fn beginArray(borrow mut this) -> Result<void, JsonWriteError> => this.open('[', 0);
+
+    /// Closes the innermost open container, which must be an array.
+    public fn endArray(borrow mut this) -> Result<void, JsonWriteError> => this.close(']', 0);
+
+    /// Writes the key of the next member of the innermost object.
+    public fn key(borrow mut this, name: StringView) -> Result<void, JsonWriteError> {
+        this.keyStart()?;
+        this.quoted(name.bytes())?;
+        return this.keyEnd();
+    }
+
+    /// `key` for bytes that should be UTF-8: `InvalidUtf8` (and nothing written) if they are not.
+    public fn keyBytes(borrow mut this, name: Slice<u8>) -> Result<void, JsonWriteError> {
+        if (StringView.fromUtf8(name).isNull()) {
+            return Err(JsonWriteError.InvalidUtf8);
+        }
+        return this.key(StringView.fromUtf8(name) ?? "");
+    }
+
+    /// A string value.
+    public fn string(borrow mut this, text: StringView) -> Result<void, JsonWriteError> {
+        this.valueStart()?;
+        this.quoted(text.bytes())?;
+        this.valueEnd();
+        return Ok();
+    }
+
+    /// A string value from bytes that should be UTF-8: `InvalidUtf8` (and nothing written) if they are not.
+    public fn stringBytes(borrow mut this, bytes: Slice<u8>) -> Result<void, JsonWriteError> {
+        if (StringView.fromUtf8(bytes).isNull()) {
+            return Err(JsonWriteError.InvalidUtf8);
+        }
+        return this.string(StringView.fromUtf8(bytes) ?? "");
+    }
+
+    /// A string value from any bytes: each ill-formed UTF-8 sequence becomes U+FFFD, as `String::from_utf8_lossy`
+    /// does (one for each maximal subpart, the Unicode Standard's §3.9 practice).
+    public fn stringLossy(borrow mut this, bytes: Slice<u8>) -> Result<void, JsonWriteError> {
+        this.valueStart()?;
+        this.byte('"')?;
+        var i: usize = 0;
+        while (i < bytes.length) {
+            let n = Utf8.sequenceLength(bytes, i);
+            if (n == 0) {
+                this.text("\u{FFFD}")?;
+                i += Utf8.invalidLength(bytes, i);
+            } else {
+                var end = i + n;
+                while (end < bytes.length) {
+                    let m = Utf8.sequenceLength(bytes, end);
+                    if (m == 0) {
+                        break;
+                    }
+                    end += m;
+                }
+                this.escaped(bytes[i..end])?;
+                i = end;
+            }
+        }
+        this.byte('"')?;
+        this.valueEnd();
+        return Ok();
+    }
+
+    /// An unsigned integer.
+    public fn u64(borrow mut this, n: u64) -> Result<void, JsonWriteError> {
+        this.valueStart()?;
+        this.decimal(n, false)?;
+        this.valueEnd();
+        return Ok();
+    }
+
+    /// A signed integer.
+    public fn i64(borrow mut this, n: i64) -> Result<void, JsonWriteError> {
+        this.valueStart()?;
+        this.decimal(n.unsignedAbs(), n < 0)?;
+        this.valueEnd();
+        return Ok();
+    }
+
+    /// A float, in serde_json's form (ryu's shortest digits that read back the same: `1.0`, `0.1`, `1e20`, `1.5e-7`,
+    /// `-0.0`). NaN and the infinities are `NonFiniteNumber`, and nothing is written.
+    public fn f64(borrow mut this, f: f64) -> Result<void, JsonWriteError> {
+        if (!Floats.isFinite(f)) {
+            return Err(JsonWriteError.NonFiniteNumber);
+        }
+        this.valueStart()?;
+        this.scratch.clear();
+        if (f == 0.0) {
+            this.text(if (f.bits() >> 63 != 0) "-0.0" else "0.0")?;
+        } else {
+            Writes.oom(this.scratch.appendNumber(f))?;
+            this.shortest()?;
+        }
+        this.valueEnd();
+        return Ok();
+    }
+
+    /// A float of `f32` precision, with `f32`'s shortest digits (`0.1f32` is `0.1`), else as `f64`.
+    public fn f32(borrow mut this, f: f32) -> Result<void, JsonWriteError> {
+        if (!Floats.isFinite32(f)) {
+            return Err(JsonWriteError.NonFiniteNumber);
+        }
+        this.valueStart()?;
+        this.scratch.clear();
+        if (f == 0.0) {
+            this.text(if (f.bits() >> 31 != 0) "-0.0" else "0.0")?;
+        } else {
+            Writes.oom(this.scratch.appendNumber(f))?;
+            this.shortest()?;
+        }
+        this.valueEnd();
+        return Ok();
+    }
+
+    /// A JSON number.
+    public fn number(borrow mut this, n: JsonNumber) -> Result<void, JsonWriteError> {
+        match (n) {
+            JsonNumber.PosInt(u) => { return this.u64(u); }
+            JsonNumber.NegInt(i) => { return this.i64(i); }
+            JsonNumber.Float(f) => { return this.f64(f); }
+        }
+    }
+
+    /// `true` or `false`.
+    public fn bool(borrow mut this, b: bool) -> Result<void, JsonWriteError> {
+        this.valueStart()?;
+        this.text(if (b) "true" else "false")?;
+        this.valueEnd();
+        return Ok();
+    }
+
+    /// `null`.
+    public fn nullValue(borrow mut this) -> Result<void, JsonWriteError> {
+        this.valueStart()?;
+        this.text("null")?;
+        this.valueEnd();
+        return Ok();
+    }
+
+    /// A tree, as one value.
+    public fn json(borrow mut this, value: borrow JsonValue) -> Result<void, JsonWriteError> {
+        match (value) {
+            JsonValue.Null => { return this.nullValue(); }
+            JsonValue.Bool(b) => { return this.bool(*b); }
+            JsonValue.Number(n) => { return this.number(*n); }
+            JsonValue.String(s) => { return this.string(s.view()); }
+            JsonValue.Array(items) => {
+                this.beginArray()?;
+                for (i in 0..items.length) {
+                    this.json(items[i])?;
+                }
+                return this.endArray();
+            }
+            JsonValue.Object(o) => {
+                this.beginObject()?;
+                for (i in 0..o.length()) {
+                    this.key(o.keyAt(i))?;
+                    this.json(o.valueAt(i))?;
+                }
+                return this.endObject();
+            }
+        }
+    }
+
+    /// A value of any type that writes itself.
+    public fn value<T: ToJson>(borrow mut this, value: borrow T) -> Result<void, JsonWriteError> => value.toJson(this);
+
+    /// A member: `key`, then `value`.
+    public fn field<T: ToJson>(borrow mut this, name: StringView, value: borrow T) -> Result<void, JsonWriteError> {
+        this.key(name)?;
+        return value.toJson(this);
+    }
+
+    /// A member whose value is optional: nothing at all when it is null (serde's
+    /// `skip_serializing_if = "Option::is_none"`).
+    public fn optionalField<T: ToJson>(
+        borrow mut this,
+        name: StringView,
+        value: borrow T?,
+    ) -> Result<void, JsonWriteError> {
+        match (value) {
+            Some(v) => {
+                this.key(name)?;
+                return v.toJson(this);
+            }
+            null => { return Ok(); }
+        }
+    }
+
+    /// An optional value: the value, or `null`.
+    public fn optional<T: ToJson>(borrow mut this, value: borrow T?) -> Result<void, JsonWriteError> {
+        match (value) {
+            Some(v) => { return v.toJson(this); }
+            null => { return this.nullValue(); }
+        }
+    }
+
+    /// An array of the items.
+    public fn slice<T: ToJson>(borrow mut this, items: Slice<T>) -> Result<void, JsonWriteError> {
+        this.beginArray()?;
+        for (i in 0..items.length) {
+            items[i].toJson(this)?;
+        }
+        return this.endArray();
+    }
+
+    /// A member whose value is an array of the items.
+    public fn sliceField<T: ToJson>(
+        borrow mut this,
+        name: StringView,
+        items: Slice<T>,
+    ) -> Result<void, JsonWriteError> {
+        this.key(name)?;
+        return this.slice(items);
+    }
+
+    /// An object of the map's entries, in the map's order.
+    public fn map<T: ToJson>(borrow mut this, map: borrow HashMap<String, T>) -> Result<void, JsonWriteError> {
+        this.beginObject()?;
+        for (i in 0..map.length()) {
+            this.key(map.keyAt(i).view())?;
+            map.valueAt(i).toJson(this)?;
+        }
+        return this.endObject();
+    }
+
+    // The pieces.
+
+    fn byte(borrow mut this, b: u8) -> Result<void, JsonWriteError> => Writes.oom(this.out.push(b));
+
+    fn text(borrow mut this, s: StringView) -> Result<void, JsonWriteError> => Writes.oom(this.out.extend(s.bytes()));
+
+    fn newline(borrow mut this, levels: usize) -> Result<void, JsonWriteError> {
+        let start = this.out.length;
+        Writes.oom(this.out.resize(start + 1 + 2 * levels, ' '))?;
+        this.out[start] = '\n';
+        return Ok();
+    }
+
+    /// What goes before a value or a key in a container: the comma, and in pretty output the line and indent.
+    fn separate(borrow mut this) -> Result<void, JsonWriteError> {
+        let top = this.stack.length - 1;
+        let hadItems = this.stack[top] & HAS_ITEMS != 0;
+        this.stack[top] = this.stack[top] | HAS_ITEMS;
+        if (hadItems) {
+            this.byte(',')?;
+        }
+        if (this.options.pretty) {
+            this.newline(this.stack.length)?;
+        }
+        return Ok();
+    }
+
+    fn valueStart(borrow mut this) -> Result<void, JsonWriteError> {
+        if (this.stack.length == 0) {
+            if (this.complete) {
+                return Err(JsonWriteError.AlreadyComplete);
+            }
+            return Ok();
+        }
+        if (this.stack[this.stack.length - 1] & IN_OBJECT != 0) {
+            if (!this.afterKey) {
+                return Err(JsonWriteError.ExpectedKey);
+            }
+            this.afterKey = false;
+            return Ok();
+        }
+        return this.separate();
+    }
+
+    fn valueEnd(borrow mut this) {
+        if (this.stack.length == 0) {
+            this.complete = true;
+        }
+    }
+
+    fn keyStart(borrow mut this) -> Result<void, JsonWriteError> {
+        if (this.stack.length == 0 || this.afterKey || this.stack[this.stack.length - 1] & IN_OBJECT == 0) {
+            return Err(JsonWriteError.UnexpectedKey);
+        }
+        return this.separate();
+    }
+
+    fn keyEnd(borrow mut this) -> Result<void, JsonWriteError> {
+        this.text(if (this.options.pretty) ": " else ":")?;
+        this.afterKey = true;
+        return Ok();
+    }
+
+    fn open(borrow mut this, bracket: u8, kind: u8) -> Result<void, JsonWriteError> {
+        if (this.stack.length >= this.options.maxDepth) {
+            return Err(JsonWriteError.DepthLimitExceeded);
+        }
+        this.valueStart()?;
+        Writes.oom(this.stack.push(kind))?;
+        return this.byte(bracket);
+    }
+
+    fn close(borrow mut this, bracket: u8, kind: u8) -> Result<void, JsonWriteError> {
+        if (this.stack.length == 0 || this.afterKey) {
+            return Err(JsonWriteError.UnbalancedEnd);
+        }
+        let top = this.stack[this.stack.length - 1];
+        if (top & IN_OBJECT != kind) {
+            return Err(JsonWriteError.UnbalancedEnd);
+        }
+        let _ = this.stack.pop();
+        if (this.options.pretty && top & HAS_ITEMS != 0) {
+            this.newline(this.stack.length)?;
+        }
+        this.byte(bracket)?;
+        this.valueEnd();
+        return Ok();
+    }
+
+    /// `n` in decimal, after a `-` when `negative`.
+    fn decimal(borrow mut this, n: u64, negative: bool) -> Result<void, JsonWriteError> {
+        var digits = [0u8; 21];
+        var at: usize = 21;
+        var rest = n;
+        loop {
+            at -= 1;
+            digits[at] = '0' + truncate<u8>(rest % 10);
+            rest = rest / 10;
+            if (rest == 0) {
+                break;
+            }
+        }
+        if (negative) {
+            at -= 1;
+            digits[at] = '-';
+        }
+        return Writes.oom(this.out.extend(digits[at..]));
+    }
+
+    /// Rewrites the shortest digits `appendNumber` put in `scratch` (ECMAScript's layout: `100`, `1e+21`, `1.5e-7`,
+    /// `0.000001`) in ryu's, which serde_json writes: `100.0`, `1e21`, `1.5e-7`, `1e-6`.
+    fn shortest(borrow mut this) -> Result<void, JsonWriteError> {
+        var digits = [0u8; 24];
+        var count: usize = 0;
+        var whole: isize = -1; // digits before the point
+        var exponent: isize = 0;
+        var negative = false;
+        let s = this.scratch.bytes();
+        var i: usize = 0;
+        if (s.length > 0 && s[0] == '-') {
+            negative = true;
+            i = 1;
+        }
+        while (i < s.length) {
+            let b = s[i];
+            if (b == '.') {
+                whole = truncate<isize>(count);
+            } else if (b == 'e') {
+                var sign: isize = 1;
+                i += 1;
+                if (i < s.length && (s[i] == '+' || s[i] == '-')) {
+                    if (s[i] == '-') {
+                        sign = -1;
+                    }
+                    i += 1;
+                }
+                var e: isize = 0;
+                while (i < s.length) {
+                    e = e * 10 + ((s[i] - '0') as isize);
+                    i += 1;
+                }
+                exponent = sign * e;
+                break;
+            } else if (count < digits.length) {
+                digits[count] = b;
+                count += 1;
+            }
+            i += 1;
+        }
+        if (whole < 0) {
+            whole = truncate<isize>(count);
+        }
+        var first: usize = 0;
+        while (first < count && digits[first] == '0') {
+            first += 1;
+            whole -= 1;
+        }
+        while (count > first && digits[count - 1] == '0') {
+            count -= 1;
+        }
+        let d = digits[first..count];
+        let length = truncate<isize>(d.length);
+        let kk = whole + exponent; // the value is 0.d × 10^kk
+        if (negative) {
+            this.byte('-')?;
+        }
+        if (kk >= length && kk <= 16) {
+            Writes.oom(this.out.extend(d))?;
+            let zeros = truncate<usize>(kk - length);
+            Writes.oom(this.out.resize(this.out.length + zeros, '0'))?;
+            return this.text(".0");
+        }
+        if (kk > 0 && kk <= 16) {
+            let point = truncate<usize>(kk);
+            Writes.oom(this.out.extend(d[..point]))?;
+            this.byte('.')?;
+            return Writes.oom(this.out.extend(d[point..]));
+        }
+        if (kk > -5 && kk <= 0) {
+            this.text("0.")?;
+            Writes.oom(this.out.resize(this.out.length + truncate<usize>(0 - kk), '0'))?;
+            return Writes.oom(this.out.extend(d));
+        }
+        this.byte(d[0])?;
+        if (d.length > 1) {
+            this.byte('.')?;
+            Writes.oom(this.out.extend(d[1..]))?;
+        }
+        this.byte('e')?;
+        let e = kk - 1;
+        return this.decimal(e.unsignedAbs() as u64, e < 0);
+    }
+
+    /// `bytes`, which are UTF-8, as a quoted JSON string.
+    fn quoted(borrow mut this, bytes: Slice<u8>) -> Result<void, JsonWriteError> {
+        Writes.oom(this.out.reserve(bytes.length + 2))?;
+        this.byte('"')?;
+        this.escaped(bytes)?;
+        return this.byte('"');
+    }
+
+    /// `bytes`, which are UTF-8, escaped as the inside of a JSON string: runs that need nothing are copied whole.
+    fn escaped(borrow mut this, bytes: Slice<u8>) -> Result<void, JsonWriteError> {
+        var run: usize = 0;
+        var i: usize = 0;
+        while (i < bytes.length) {
+            let b = bytes[i];
+            let plain = b >= 0x20 && b != '"' && b != '\\' && (b < 0x80 || !this.options.asciiOnly) &&
+                (b != '/' || !this.options.escapeEndTag || i == 0 || bytes[i - 1] != '<');
+            if (plain) {
+                i += 1;
+                continue;
+            }
+            Writes.oom(this.out.extend(bytes[run..i]))?;
+            if (b >= 0x80) {
+                let n = Utf8.sequenceLength(bytes, i);
+                let cp = Utf8.decode(bytes, i, n);
+                if (cp >= 0x10000) {
+                    let v = cp - 0x10000;
+                    this.unicodeEscape(0xD800 + (v >> 10))?;
+                    this.unicodeEscape(0xDC00 + (v & 0x3FF))?;
+                } else {
+                    this.unicodeEscape(cp)?;
+                }
+                i += if (n == 0) 1 else n;
+                run = i;
+                continue;
+            }
+            match (b) {
+                '"' => { this.text("\\\"")?; }
+                '\\' => { this.text("\\\\")?; }
+                '\n' => { this.text("\\n")?; }
+                '\r' => { this.text("\\r")?; }
+                '\t' => { this.text("\\t")?; }
+                0x08 => { this.text("\\b")?; }
+                0x0C => { this.text("\\f")?; }
+                '/' => { this.text("\\/")?; }
+                _ => { this.unicodeEscape(b as u32)?; }
+            }
+            i += 1;
+            run = i;
+        }
+        return Writes.oom(this.out.extend(bytes[run..]));
+    }
+
+    fn unicodeEscape(borrow mut this, unit: u32) -> Result<void, JsonWriteError> {
+        let hex = HEX;
+        var e = [0u8; 6];
+        e[0] = '\\';
+        e[1] = 'u';
+        e[2] = hex[((unit >> 12) & 15) as usize];
+        e[3] = hex[((unit >> 8) & 15) as usize];
+        e[4] = hex[((unit >> 4) & 15) as usize];
+        e[5] = hex[(unit & 15) as usize];
+        return Writes.oom(this.out.extend(e[..]));
+    }
+}
+
+struct Writes {
+    fn oom(outcome: Result<void, AllocError>) -> Result<void, JsonWriteError> {
+        match (outcome) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(JsonWriteError.OutOfMemory); }
+        }
+    }
+}
+
+impl JsonValue {
+    /// Appends the value to `out` as compact JSON. On an error `out` is as it was.
+    public fn write(borrow this, out: borrow mut Vector<u8>) -> Result<void, JsonWriteError> =>
+        this.writeWith(out, WriteOptions.compact());
+
+    /// Appends the value to `out` as pretty JSON (serde_json's `to_string_pretty`).
+    public fn writePretty(borrow this, out: borrow mut Vector<u8>) -> Result<void, JsonWriteError> =>
+        this.writeWith(out, WriteOptions.indented());
+
+    /// Appends the value to `out` as `options` say.
+    public fn writeWith(
+        borrow this,
+        out: borrow mut Vector<u8>,
+        options: WriteOptions,
+    ) -> Result<void, JsonWriteError> {
+        // `replace(mut out, …)` would hand the writer `out` itself, but ceesafec 0.47 refuses it for a `borrow mut`
+        // parameter (repros/replace-through-reference): so the writer starts afresh, and an empty `out` (the usual
+        // case) takes its bytes without a copy.
+        var w = JsonWriter.withOptions(options);
+        w.json(this)?;
+        if (out.length == 0) {
+            out = w.intoBytes();
+            return Ok();
+        }
+        return Writes.oom(out.extend(w.written()));
+    }
+
+    /// The value as compact JSON in a new vector.
+    public fn toBytes(borrow this) -> Result<Vector<u8>, JsonWriteError> {
+        var out = Vector<u8>.create();
+        this.write(mut out)?;
+        return Ok(out);
+    }
+
+    /// The value as pretty JSON in a new vector.
+    public fn toPrettyBytes(borrow this) -> Result<Vector<u8>, JsonWriteError> {
+        var out = Vector<u8>.create();
+        this.writePretty(mut out)?;
+        return Ok(out);
+    }
+}

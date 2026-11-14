@@ -1,0 +1,71 @@
+// Helpers the test files share. The file has a test of its own, so that under `--sweep alloc` an unwrap here counts
+// as the tests' own (tooling.md §10.2).
+
+@test
+fn helpersParse() -> Result<void, TestFailure> => compactIs(" [1, {\"a\": null}] ", "[1,{\"a\":null}]");
+
+fn parsed(text: StringView) -> JsonValue => Json.parse(text.bytes())!;
+
+fn bytesText(v: borrow Vector<u8>) -> StringView => StringView.fromUtf8(v.view())!;
+
+/// `text` parsed and written back compact must be `expected`.
+fn compactIs(text: StringView, expected: StringView) -> Result<void, TestFailure> {
+    let v = parsed(text);
+    var out = Vector<u8>.create();
+    v.write(mut out)!;
+    return Check.equalText(expected, bytesText(out));
+}
+
+/// `text` parsed and written back pretty must be `expected`.
+fn prettyIs(text: StringView, expected: StringView) -> Result<void, TestFailure> {
+    let v = parsed(text);
+    var out = Vector<u8>.create();
+    v.writePretty(mut out)!;
+    return Check.equalText(expected, bytesText(out));
+}
+
+/// Parsing `text` must fail with `kind`.
+fn rejects(text: StringView, kind: JsonErrorKind) -> Result<void, TestFailure> => rejectsBytes(text.bytes(), kind);
+
+fn rejectsBytes(text: Slice<u8>, kind: JsonErrorKind) -> Result<void, TestFailure> {
+    match (Json.parse(text)) {
+        Ok(_) => { return Check.fail("malformed JSON was accepted"); }
+        Err(e) => {
+            if (e.kind != kind) {
+                Console.write("got: ");
+                Console.writeLine(e.message());
+                Console.write("wanted: ");
+                Console.writeLine(kind.message());
+                return Check.fail("wrong error");
+            }
+            return Ok();
+        }
+    }
+}
+
+/// Parsing `text` must fail with `kind` at `line` and `column`.
+fn rejectsAt(text: StringView, kind: JsonErrorKind, line: usize, column: usize) -> Result<void, TestFailure> {
+    match (Json.parse(text.bytes())) {
+        Ok(_) => { return Check.fail("malformed JSON was accepted"); }
+        Err(e) => {
+            Check.isTrue(e.kind == kind, "error kind")?;
+            Check.equalU64(line as u64, e.line as u64)?;
+            Check.equalU64(column as u64, e.column as u64)?;
+            return Ok();
+        }
+    }
+}
+
+/// The f64 `f` written by a JsonWriter must be `expected`, and read back as `f`.
+fn floatIs(f: f64, expected: StringView) -> Result<void, TestFailure> {
+    var w = JsonWriter.compact();
+    w.f64(f)!;
+    let out = w.finish()!;
+    Check.equalText(expected, bytesText(out))?;
+    let back = Json.parse(out.view())!;
+    match (back) {
+        JsonValue.Number(JsonNumber.Float(g)) => { Check.isTrue(g.bits() == f.bits(), "read back the same")?; }
+        _ => { return Check.fail("not read back as a float"); }
+    }
+    return Ok();
+}

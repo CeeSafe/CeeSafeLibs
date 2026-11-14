@@ -1,0 +1,640 @@
+// Typed encoding and decoding, serde-style but by hand: a type implements ToJson (it writes itself through a
+// JsonWriter) and FromJson (it builds itself from a JsonValue). CeeSafe's `@derive` makes neither, so a struct's impls
+// are written out (README.md has one); DERIVE-PROPOSAL.md proposes the derive.
+//
+// A generic impl may only target a generic struct or enum of the program (ADR 0054), so `impl<T: ToJson> ToJson for
+// Vector<T>` and `for T?` cannot be written: vectors, optionals and maps go through `JsonWriter.slice`, `optional`,
+// `map` and their `…Field` forms, and through `Decode.vector`, `optional` and `map`.
+
+/// A type that writes itself as one JSON value.
+public interface ToJson {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError>;
+}
+
+/// A type that builds itself from a JSON value. An error names where it is, `$.servers[2].port: expected u16, found
+/// string`: the `Decode` functions add each step to the path of an error from below.
+public interface FromJson {
+    fn fromJson(value: borrow JsonValue) -> Result<Self, DecodeError>;
+}
+
+/// Why a value could not be decoded.
+public enum DecodeReason {
+    /// The value is of another kind than the type needs.
+    WrongType,
+    /// A number that the type cannot hold: `70000` for a `u16`, `-1` for a `u64`, `1.5` for an integer.
+    OutOfRange,
+    /// An object without a member the type needs.
+    MissingField,
+    /// A member the type does not know, under `Decode.denyUnknownFields`.
+    UnknownField,
+    /// A value the type's own rules refuse (`DecodeError.invalid`).
+    Invalid,
+    /// The text is not JSON: the `syntax` error says why.
+    Syntax,
+    OutOfMemory,
+}
+
+/// A step of a path to a value.
+enum PathStep {
+    Key(String),
+    Index(usize),
+}
+
+/// Why and where a value could not be decoded.
+public struct DecodeError {
+    public reason: DecodeReason;
+    /// The parse error, when the reason is `Syntax`.
+    public syntax: JsonError?;
+    /// What went wrong at the place: `expected u16, found string`.
+    text: String;
+    /// The steps from the place up to the root, innermost first.
+    steps: Vector<PathStep>;
+
+    /// An error of `reason` with `detail` (copied; a copy that cannot be made leaves it empty).
+    public fn create(reason: DecodeReason, detail: StringView) -> DecodeError => DecodeError {
+        reason: reason,
+        syntax: null,
+        text: String.from(detail).ok() ?? String.create(),
+        steps: Vector<PathStep>.create(),
+    };
+
+    /// `expected <what>, found <kind of value>`.
+    public fn wrongType(what: StringView, found: borrow JsonValue) -> DecodeError {
+        var e = DecodeError.create(DecodeReason.WrongType, "expected ");
+        let _ = e.text.append(what);
+        let _ = e.text.append(", found ");
+        let _ = e.text.append(found.kind().name());
+        return e;
+    }
+
+    /// `expected <what>, found <the number>`.
+    public fn outOfRange(what: StringView, found: borrow JsonValue) -> DecodeError {
+        var e = DecodeError.create(DecodeReason.OutOfRange, "expected ");
+        let _ = e.text.append(what);
+        let _ = e.text.append(", found ");
+        var text = Vector<u8>.create();
+        match (found.write(mut text)) {
+            Ok() => {
+                let _ = e.text.append(StringView.fromUtf8(text.view()) ?? "a number");
+            }
+            Err(_) => {
+                let _ = e.text.append("a number");
+            }
+        }
+        return e;
+    }
+
+    /// `missing field <name>`.
+    public fn missingField(name: StringView) -> DecodeError {
+        var e = DecodeError.create(DecodeReason.MissingField, "missing field `");
+        let _ = e.text.append(name);
+        let _ = e.text.append("`");
+        return e;
+    }
+
+    /// `unknown field <name>`.
+    public fn unknownField(name: StringView) -> DecodeError {
+        var e = DecodeError.create(DecodeReason.UnknownField, "unknown field `");
+        let _ = e.text.append(name);
+        let _ = e.text.append("`");
+        return e;
+    }
+
+    /// A value the type refuses, in the type's own words.
+    public fn invalid(message: StringView) -> DecodeError => DecodeError.create(DecodeReason.Invalid, message);
+
+    /// The text is not JSON.
+    public fn fromSyntax(e: JsonError) -> DecodeError {
+        var d = DecodeError.create(DecodeReason.Syntax, "");
+        let _ = e.describe(mut d.text);
+        d.syntax = e;
+        return d;
+    }
+
+    /// Out of memory.
+    public fn outOfMemory() -> DecodeError => DecodeError.create(DecodeReason.OutOfMemory, "out of memory");
+
+    /// The same error, one member `key` further down.
+    public fn atKey(this, key: StringView) -> DecodeError {
+        var e = this;
+        match (String.from(key)) {
+            Ok(k) => {
+                let _ = e.steps.push(PathStep.Key(k));
+            }
+            Err(_) => {}
+        }
+        return e;
+    }
+
+    /// The same error, one element `index` further down.
+    public fn atIndex(this, index: usize) -> DecodeError {
+        var e = this;
+        let _ = e.steps.push(PathStep.Index(index));
+        return e;
+    }
+
+    /// What went wrong at the place, without the path.
+    public fn detail(borrow this) -> StringView => this.text.view();
+
+    /// Appends the path to the value, `$.servers[2].port` (`$` for the root; a key that is not a plain name is written
+    /// `["a key"]`), to `out`.
+    public fn writePath(borrow this, out: borrow mut String) -> Result<void, AllocError> {
+        out.append("$")?;
+        var i = this.steps.length;
+        while (i > 0) {
+            i -= 1;
+            match (borrow this.steps[i]) {
+                PathStep.Key(k) => {
+                    if (DecodeError.plainName(k.view())) {
+                        out.append(".")?;
+                        out.append(k.view())?;
+                    } else {
+                        out.append("[")?;
+                        var quoted = Vector<u8>.create();
+                        var w = JsonWriter.compact();
+                        match (w.string(k.view())) {
+                            Ok() => {}
+                            Err(_) => { return Err(AllocError.OutOfMemory); }
+                        }
+                        quoted = w.intoBytes();
+                        out.append(StringView.fromUtf8(quoted.view()) ?? "?")?;
+                        out.append("]")?;
+                    }
+                }
+                PathStep.Index(n) => {
+                    out.append("[")?;
+                    out.appendNumber(*n)?;
+                    out.append("]")?;
+                }
+            }
+        }
+        return Ok();
+    }
+
+    /// Appends the whole message, `$.servers[2].port: expected u16, found string`, to `out`.
+    public fn describe(borrow this, out: borrow mut String) -> Result<void, AllocError> {
+        this.writePath(out)?;
+        out.append(": ")?;
+        out.append(this.text.view())?;
+        return Ok();
+    }
+
+    /// The whole message, as `describe` writes it.
+    public fn message(borrow this) -> Result<String, AllocError> {
+        var out = String.create();
+        this.describe(mut out)?;
+        return Ok(out);
+    }
+
+    fn plainName(key: StringView) -> bool {
+        if (key.length == 0) {
+            return false;
+        }
+        for (b in key.bytes()) {
+            let ok = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' ||
+                b == '-';
+            if (!ok) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+/// Decoding helpers for FromJson impls: members, vectors, optionals and maps, each adding its step to an error's
+/// path.
+public struct Decode {
+    /// The value `T` decodes from.
+    public fn value<T: FromJson>(value: borrow JsonValue) -> Result<T, DecodeError> => T.fromJson(value);
+
+    /// `WrongType` unless `value` is an object: a FromJson impl for a struct starts with it, so that a value of the
+    /// wrong kind says `expected <what>` rather than naming its first field as missing.
+    public fn expectObject(value: borrow JsonValue, what: StringView) -> Result<void, DecodeError> {
+        if (!value.isObject()) {
+            return Err(DecodeError.wrongType(what, value));
+        }
+        return Ok();
+    }
+
+    /// Member `name` of the object `value`, decoded: `MissingField` if it is not there.
+    public fn field<T: FromJson>(value: borrow JsonValue, name: StringView) -> Result<T, DecodeError> {
+        Decode.objectCheck(value)?;
+        match (value.get(name)) {
+            Some(v) => {
+                match (T.fromJson(v)) {
+                    Ok(t) => { return Ok(t); }
+                    Err(e) => { return Err(e.atKey(name)); }
+                }
+            }
+            null => { return Err(DecodeError.missingField(name)); }
+        }
+    }
+
+    /// Member `name`, decoded; null if it is missing or `null` (serde's `Option` fields).
+    public fn optionalField<T: FromJson>(value: borrow JsonValue, name: StringView) -> Result<T?, DecodeError> {
+        Decode.objectCheck(value)?;
+        match (value.get(name)) {
+            Some(v) => {
+                if (v.isNull()) {
+                    return Ok(null);
+                }
+                match (T.fromJson(v)) {
+                    Ok(t) => { return Ok(t); }
+                    Err(e) => { return Err(e.atKey(name)); }
+                }
+            }
+            null => { return Ok(null); }
+        }
+    }
+
+    /// Member `name`, decoded; `fallback` if it is missing (serde's `#[serde(default)]`).
+    public fn fieldOr<T: FromJson>(value: borrow JsonValue, name: StringView, fallback: T) -> Result<T, DecodeError> {
+        Decode.objectCheck(value)?;
+        match (value.get(name)) {
+            Some(v) => {
+                match (T.fromJson(v)) {
+                    Ok(t) => { return Ok(t); }
+                    Err(e) => { return Err(e.atKey(name)); }
+                }
+            }
+            null => { return Ok(fallback); }
+        }
+    }
+
+    /// Member `name`, an array, decoded element by element: `MissingField` if it is not there.
+    public fn vectorField<T: FromJson>(value: borrow JsonValue, name: StringView) -> Result<Vector<T>, DecodeError> {
+        Decode.objectCheck(value)?;
+        match (value.get(name)) {
+            Some(v) => {
+                match (Decode.vector<T>(v)) {
+                    Ok(t) => { return Ok(t); }
+                    Err(e) => { return Err(e.atKey(name)); }
+                }
+            }
+            null => { return Err(DecodeError.missingField(name)); }
+        }
+    }
+
+    /// Member `name`, an object, decoded value by value: `MissingField` if it is not there.
+    public fn mapField<T: FromJson>(
+        value: borrow JsonValue,
+        name: StringView,
+    ) -> Result<HashMap<String, T>, DecodeError> {
+        Decode.objectCheck(value)?;
+        match (value.get(name)) {
+            Some(v) => {
+                match (Decode.map<T>(v)) {
+                    Ok(t) => { return Ok(t); }
+                    Err(e) => { return Err(e.atKey(name)); }
+                }
+            }
+            null => { return Err(DecodeError.missingField(name)); }
+        }
+    }
+
+    /// An array, decoded element by element.
+    public fn vector<T: FromJson>(value: borrow JsonValue) -> Result<Vector<T>, DecodeError> {
+        match (value) {
+            JsonValue.Array(items) => {
+                var out = Vector<T>.create();
+                match (out.reserve(items.length)) {
+                    Ok() => {}
+                    Err(_) => { return Err(DecodeError.outOfMemory()); }
+                }
+                for (i in 0..items.length) {
+                    match (T.fromJson(items[i])) {
+                        Ok(t) => {
+                            match (out.push(t)) {
+                                Ok() => {}
+                                Err(_) => { return Err(DecodeError.outOfMemory()); }
+                            }
+                        }
+                        Err(e) => { return Err(e.atIndex(i)); }
+                    }
+                }
+                return Ok(out);
+            }
+            _ => { return Err(DecodeError.wrongType("an array", value)); }
+        }
+    }
+
+    /// `null` as null, anything else decoded.
+    public fn optional<T: FromJson>(value: borrow JsonValue) -> Result<T?, DecodeError> {
+        if (value.isNull()) {
+            return Ok(null);
+        }
+        return Ok(T.fromJson(value)?);
+    }
+
+    /// An object, decoded value by value into a map in the object's order.
+    public fn map<T: FromJson>(value: borrow JsonValue) -> Result<HashMap<String, T>, DecodeError> {
+        match (value) {
+            JsonValue.Object(o) => {
+                var out = HashMap<String, T>.create();
+                for (i in 0..o.length()) {
+                    let key = o.keyAt(i);
+                    match (T.fromJson(o.valueAt(i))) {
+                        Ok(t) => {
+                            let k = match (String.from(key)) {
+                                Ok(k) => k,
+                                Err(_) => { return Err(DecodeError.outOfMemory()); }
+                            };
+                            match (out.put(k, t)) {
+                                Ok(_) => {}
+                                Err(_) => { return Err(DecodeError.outOfMemory()); }
+                            }
+                        }
+                        Err(e) => { return Err(e.atKey(key)); }
+                    }
+                }
+                return Ok(out);
+            }
+            _ => { return Err(DecodeError.wrongType("an object", value)); }
+        }
+    }
+
+    /// `UnknownField` for the first member of the object `value` whose key is not in `known` (serde's
+    /// `deny_unknown_fields`); nothing for a value that is not an object.
+    public fn denyUnknownFields(value: borrow JsonValue, known: Slice<StringView>) -> Result<void, DecodeError> {
+        match (value) {
+            JsonValue.Object(o) => {
+                for (i in 0..o.length()) {
+                    let key = o.keyAt(i);
+                    var found = false;
+                    for (k in known) {
+                        if (k == key) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        return Err(DecodeError.unknownField(key));
+                    }
+                }
+                return Ok();
+            }
+            _ => { return Ok(); }
+        }
+    }
+
+    /// `WrongType` unless `value` is an object.
+    fn objectCheck(value: borrow JsonValue) -> Result<void, DecodeError> {
+        if (!value.isObject()) {
+            return Err(DecodeError.wrongType("an object", value));
+        }
+        return Ok();
+    }
+
+    /// The integer in `value`, which `what` must hold: from `lo` to `hi`.
+    fn integer(value: borrow JsonValue, what: StringView, lo: i64, hi: u64) -> Result<JsonNumber, DecodeError> {
+        match (value) {
+            JsonValue.Number(n) => {
+                match (n) {
+                    JsonNumber.PosInt(u) => {
+                        if (*u > hi) {
+                            return Err(DecodeError.outOfRange(what, value));
+                        }
+                    }
+                    JsonNumber.NegInt(i) => {
+                        if (*i < lo) {
+                            return Err(DecodeError.outOfRange(what, value));
+                        }
+                    }
+                    JsonNumber.Float(_) => { return Err(DecodeError.wrongType(what, value)); }
+                }
+                return Ok(*n);
+            }
+            _ => { return Err(DecodeError.wrongType(what, value)); }
+        }
+    }
+
+    fn unsigned(value: borrow JsonValue, what: StringView, hi: u64) -> Result<u64, DecodeError> {
+        let n = Decode.integer(value, what, 0, hi)?;
+        return Ok(n.asU64() ?? 0);
+    }
+
+    fn signed(value: borrow JsonValue, what: StringView, lo: i64, hi: u64) -> Result<i64, DecodeError> {
+        let n = Decode.integer(value, what, lo, hi)?;
+        return Ok(n.asI64() ?? 0);
+    }
+}
+
+impl Json {
+    /// `value` as compact JSON in a new vector.
+    public fn encode<T: ToJson>(value: borrow T) -> Result<Vector<u8>, JsonWriteError> =>
+        Json.encodeWith(value, WriteOptions.compact());
+
+    /// `value` as pretty JSON in a new vector.
+    public fn encodePretty<T: ToJson>(value: borrow T) -> Result<Vector<u8>, JsonWriteError> =>
+        Json.encodeWith(value, WriteOptions.indented());
+
+    /// `value` as `options` say, in a new vector.
+    public fn encodeWith<T: ToJson>(value: borrow T, options: WriteOptions) -> Result<Vector<u8>, JsonWriteError> {
+        var w = JsonWriter.withOptions(options);
+        value.toJson(mut w)?;
+        return w.finish();
+    }
+
+    /// A `T` from the JSON `text`, parsed with the default options.
+    public fn decode<T: FromJson>(text: Slice<u8>) -> Result<T, DecodeError> =>
+        Json.decodeWith<T>(text, ParseOptions.defaults());
+
+    /// A `T` from the JSON `text`, parsed with `options`.
+    public fn decodeWith<T: FromJson>(text: Slice<u8>, options: ParseOptions) -> Result<T, DecodeError> {
+        match (Json.parseWith(text, options)) {
+            Ok(tree) => { return T.fromJson(tree); }
+            Err(e) => { return Err(DecodeError.fromSyntax(e)); }
+        }
+    }
+}
+
+// The impls for the library's types.
+
+impl ToJson for JsonValue {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.json(this);
+}
+
+impl FromJson for JsonValue {
+    fn fromJson(value: borrow JsonValue) -> Result<JsonValue, DecodeError> {
+        match (value.clone()) {
+            Ok(v) => { return Ok(v); }
+            Err(_) => { return Err(DecodeError.outOfMemory()); }
+        }
+    }
+}
+
+impl ToJson for bool {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.bool(*this);
+}
+
+impl FromJson for bool {
+    fn fromJson(value: borrow JsonValue) -> Result<bool, DecodeError> {
+        match (value) {
+            JsonValue.Bool(b) => { return Ok(*b); }
+            _ => { return Err(DecodeError.wrongType("bool", value)); }
+        }
+    }
+}
+
+impl ToJson for String {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.string(this.view());
+}
+
+impl FromJson for String {
+    fn fromJson(value: borrow JsonValue) -> Result<String, DecodeError> {
+        match (value) {
+            JsonValue.String(s) => {
+                match (s.clone()) {
+                    Ok(c) => { return Ok(c); }
+                    Err(_) => { return Err(DecodeError.outOfMemory()); }
+                }
+            }
+            _ => { return Err(DecodeError.wrongType("a string", value)); }
+        }
+    }
+}
+
+impl ToJson for f64 {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.f64(*this);
+}
+
+impl FromJson for f64 {
+    /// Any number (an integer rounded to the nearest `f64`), as serde_json decodes one.
+    fn fromJson(value: borrow JsonValue) -> Result<f64, DecodeError> {
+        match (value.asF64()) {
+            Some(f) => { return Ok(f); }
+            null => { return Err(DecodeError.wrongType("f64", value)); }
+        }
+    }
+}
+
+impl ToJson for f32 {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.f32(*this);
+}
+
+impl FromJson for f32 {
+    /// Any number, rounded to the nearest `f32`; `OutOfRange` beyond `f32`'s range.
+    fn fromJson(value: borrow JsonValue) -> Result<f32, DecodeError> {
+        match (value.asF64()) {
+            Some(f) => {
+                let g = round<f32>(f);
+                if (!Floats.isFinite32(g)) {
+                    return Err(DecodeError.outOfRange("f32", value));
+                }
+                return Ok(g);
+            }
+            null => { return Err(DecodeError.wrongType("f32", value)); }
+        }
+    }
+}
+
+impl ToJson for u64 {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.u64(*this);
+}
+
+impl FromJson for u64 {
+    fn fromJson(value: borrow JsonValue) -> Result<u64, DecodeError> =>
+        Decode.unsigned(value, "u64", 0xFFFF_FFFF_FFFF_FFFF);
+}
+
+impl ToJson for u32 {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.u64(*this as u64);
+}
+
+impl FromJson for u32 {
+    fn fromJson(value: borrow JsonValue) -> Result<u32, DecodeError> {
+        let n = Decode.unsigned(value, "u32", 0xFFFF_FFFF)?;
+        return Ok(truncate<u32>(n));
+    }
+}
+
+impl ToJson for u16 {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.u64(*this as u64);
+}
+
+impl FromJson for u16 {
+    fn fromJson(value: borrow JsonValue) -> Result<u16, DecodeError> {
+        let n = Decode.unsigned(value, "u16", 0xFFFF)?;
+        return Ok(truncate<u16>(n));
+    }
+}
+
+impl ToJson for u8 {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.u64(*this as u64);
+}
+
+impl FromJson for u8 {
+    fn fromJson(value: borrow JsonValue) -> Result<u8, DecodeError> {
+        let n = Decode.unsigned(value, "u8", 0xFF)?;
+        return Ok(truncate<u8>(n));
+    }
+}
+
+impl ToJson for usize {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.u64(*this as u64);
+}
+
+impl FromJson for usize {
+    fn fromJson(value: borrow JsonValue) -> Result<usize, DecodeError> {
+        let max = checkedTruncate<u64>(0usize.wrappingSub(1)) ?? 0xFFFF_FFFF_FFFF_FFFF;
+        let n = Decode.unsigned(value, "usize", max)?;
+        return Ok(truncate<usize>(n));
+    }
+}
+
+impl ToJson for i64 {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.i64(*this);
+}
+
+impl FromJson for i64 {
+    fn fromJson(value: borrow JsonValue) -> Result<i64, DecodeError> =>
+        Decode.signed(value, "i64", -0x7FFF_FFFF_FFFF_FFFF - 1, 0x7FFF_FFFF_FFFF_FFFF);
+}
+
+impl ToJson for i32 {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.i64(*this as i64);
+}
+
+impl FromJson for i32 {
+    fn fromJson(value: borrow JsonValue) -> Result<i32, DecodeError> {
+        let n = Decode.signed(value, "i32", -0x8000_0000, 0x7FFF_FFFF)?;
+        return Ok(truncate<i32>(n));
+    }
+}
+
+impl ToJson for i16 {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.i64(*this as i64);
+}
+
+impl FromJson for i16 {
+    fn fromJson(value: borrow JsonValue) -> Result<i16, DecodeError> {
+        let n = Decode.signed(value, "i16", -0x8000, 0x7FFF)?;
+        return Ok(truncate<i16>(n));
+    }
+}
+
+impl ToJson for i8 {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> => w.i64(*this as i64);
+}
+
+impl FromJson for i8 {
+    fn fromJson(value: borrow JsonValue) -> Result<i8, DecodeError> {
+        let n = Decode.signed(value, "i8", -0x80, 0x7F)?;
+        return Ok(truncate<i8>(n));
+    }
+}
+
+impl ToJson for isize {
+    fn toJson(borrow this, w: borrow mut JsonWriter) -> Result<void, JsonWriteError> =>
+        w.i64(checkedTruncate<i64>(*this) ?? 0);
+}
+
+impl FromJson for isize {
+    fn fromJson(value: borrow JsonValue) -> Result<isize, DecodeError> {
+        let n = Decode.signed(value, "isize", -0x7FFF_FFFF_FFFF_FFFF - 1, 0x7FFF_FFFF_FFFF_FFFF)?;
+        match (checkedTruncate<isize>(n)) {
+            Some(v) => { return Ok(v); }
+            null => { return Err(DecodeError.outOfRange("isize", value)); }
+        }
+    }
+}

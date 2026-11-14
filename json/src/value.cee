@@ -1,0 +1,821 @@
+// The JSON tree: JsonValue, JsonNumber and JsonObject.
+//
+// A number keeps an integer exact, as serde_json does: a non-negative integer is a `u64`, a negative one an `i64`, and
+// anything else an `f64`. An object keeps its members in insertion order (serde_json's `preserve_order`) and finds a
+// key by a linear scan while it is small, by a hash index once it is large.
+
+/// A JSON number: `PosInt` for an integer from 0 up, `NegInt` for a negative integer, `Float` for the rest. A number
+/// that `Json.parse` makes, and one made with `fromU64`, `fromI64` or `fromF64`, keeps that invariant; a `Float` is
+/// finite.
+public enum JsonNumber {
+    PosInt(u64),
+    NegInt(i64),
+    Float(f64),
+}
+
+impl JsonNumber {
+    /// `n` as a number.
+    public fn fromU64(n: u64) -> JsonNumber => JsonNumber.PosInt(n);
+
+    /// `n` as a number: `PosInt` from 0 up, `NegInt` below.
+    public fn fromI64(n: i64) -> JsonNumber {
+        if (n >= 0) {
+            return JsonNumber.PosInt(checkedTruncate<u64>(n) ?? 0);
+        }
+        return JsonNumber.NegInt(n);
+    }
+
+    /// `f` as a number, or null when it is NaN or infinite, which JSON cannot hold (serde_json's `from_f64`).
+    public fn fromF64(f: f64) -> JsonNumber? {
+        if (!Floats.isFinite(f)) {
+            return null;
+        }
+        return JsonNumber.Float(f);
+    }
+
+    /// The number as a `u64`, if it is an integer that fits.
+    public fn asU64(borrow this) -> u64? {
+        match (this) {
+            JsonNumber.PosInt(n) => { return *n; }
+            JsonNumber.NegInt(n) => { return checkedTruncate<u64>(*n); }
+            JsonNumber.Float(_) => { return null; }
+        }
+    }
+
+    /// The number as an `i64`, if it is an integer that fits.
+    public fn asI64(borrow this) -> i64? {
+        match (this) {
+            JsonNumber.PosInt(n) => { return checkedTruncate<i64>(*n); }
+            JsonNumber.NegInt(n) => { return *n; }
+            JsonNumber.Float(_) => { return null; }
+        }
+    }
+
+    /// The number as an `f64`: an integer rounded to the nearest `f64` (exact up to 2^53).
+    public fn asF64(borrow this) -> f64 {
+        match (this) {
+            JsonNumber.PosInt(n) => { return round<f64>(*n); }
+            JsonNumber.NegInt(n) => { return round<f64>(*n); }
+            JsonNumber.Float(f) => { return *f; }
+        }
+    }
+
+    /// Whether the number is an integer (`PosInt` or `NegInt`).
+    public fn isInteger(borrow this) -> bool {
+        match (this) {
+            JsonNumber.Float(_) => { return false; }
+            _ => { return true; }
+        }
+    }
+
+    /// Whether the two are the same number, as serde_json compares them: integers by value, floats with `==` (so
+    /// `-0.0` equals `0.0`), and an integer never equals a float (`1` is not `1.0`).
+    public fn equals(borrow this, other: borrow JsonNumber) -> bool {
+        match (this) {
+            JsonNumber.Float(a) => {
+                match (other) {
+                    JsonNumber.Float(b) => { return *a == *b; }
+                    _ => { return false; }
+                }
+            }
+            _ => {}
+        }
+        if (!other.isInteger()) {
+            return false;
+        }
+        let a = this.asI64();
+        let b = other.asI64();
+        if (a.isSome() && b.isSome()) {
+            return a! == b!;
+        }
+        let c = this.asU64();
+        let d = other.asU64();
+        if (c.isSome() && d.isSome()) {
+            return c! == d!;
+        }
+        return false;
+    }
+}
+
+/// What kind of value a JsonValue is.
+public enum JsonKind {
+    Null,
+    Bool,
+    Number,
+    String,
+    Array,
+    Object,
+}
+
+impl JsonKind {
+    /// The kind's name, as error messages give it: `null`, `bool`, `number`, `string`, `array`, `object`.
+    public fn name(this) -> StringView => match (this) {
+        JsonKind.Null => "null",
+        JsonKind.Bool => "bool",
+        JsonKind.Number => "number",
+        JsonKind.String => "string",
+        JsonKind.Array => "array",
+        JsonKind.Object => "object",
+    };
+}
+
+/// A JSON value.
+public enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(JsonNumber),
+    String(String),
+    Array(Vector<JsonValue>),
+    Object(JsonObject),
+}
+
+impl JsonValue {
+    /// An empty object, to `insert` into.
+    public fn object() -> JsonValue => JsonValue.Object(JsonObject.create());
+
+    /// An empty array, to `push` onto.
+    public fn array() -> JsonValue => JsonValue.Array(Vector<JsonValue>.create());
+
+    /// A string holding a copy of `text`.
+    public fn string(text: StringView) -> Result<JsonValue, AllocError> {
+        let s = String.from(text)?;
+        return Ok(JsonValue.String(s));
+    }
+
+    /// `n` as a number.
+    public fn fromU64(n: u64) -> JsonValue => JsonValue.Number(JsonNumber.PosInt(n));
+
+    /// `n` as a number.
+    public fn fromI64(n: i64) -> JsonValue => JsonValue.Number(JsonNumber.fromI64(n));
+
+    /// `f` as a number; NaN and the infinities, which JSON cannot hold, become `Null` (as serde_json's `From<f64>`).
+    public fn fromF64(f: f64) -> JsonValue {
+        match (JsonNumber.fromF64(f)) {
+            Some(n) => { return JsonValue.Number(n); }
+            null => { return JsonValue.Null; }
+        }
+    }
+
+    /// `b` as a value.
+    public fn fromBool(b: bool) -> JsonValue => JsonValue.Bool(b);
+
+    /// Puts `value` at `key` in this object: a key already there keeps its place and gets the new value.
+    /// Panics if this is not an object; `asObjectMut` is the checked way.
+    public fn insert(borrow mut this, key: StringView, value: JsonValue) -> Result<void, AllocError> {
+        match (this) {
+            JsonValue.Object(o) => {
+                let _ = o.insert(key, value)?;
+                return Ok();
+            }
+            _ => { panic("JsonValue.insert on a value that is not an object"); }
+        }
+    }
+
+    /// Appends `value` to this array. Panics if this is not an array; `asArrayMut` is the checked way.
+    public fn push(borrow mut this, value: JsonValue) -> Result<void, AllocError> {
+        match (this) {
+            JsonValue.Array(items) => {
+                items.push(value)?;
+                return Ok();
+            }
+            _ => { panic("JsonValue.push on a value that is not an array"); }
+        }
+    }
+
+    /// What kind of value this is.
+    public fn kind(borrow this) -> JsonKind {
+        match (this) {
+            JsonValue.Null => { return JsonKind.Null; }
+            JsonValue.Bool(_) => { return JsonKind.Bool; }
+            JsonValue.Number(_) => { return JsonKind.Number; }
+            JsonValue.String(_) => { return JsonKind.String; }
+            JsonValue.Array(_) => { return JsonKind.Array; }
+            JsonValue.Object(_) => { return JsonKind.Object; }
+        }
+    }
+
+    public fn isNull(borrow this) -> bool => this.kind() == JsonKind.Null;
+
+    public fn isBool(borrow this) -> bool => this.kind() == JsonKind.Bool;
+
+    public fn isNumber(borrow this) -> bool => this.kind() == JsonKind.Number;
+
+    public fn isString(borrow this) -> bool => this.kind() == JsonKind.String;
+
+    public fn isArray(borrow this) -> bool => this.kind() == JsonKind.Array;
+
+    public fn isObject(borrow this) -> bool => this.kind() == JsonKind.Object;
+
+    /// The boolean, if this is one.
+    public fn asBool(borrow this) -> bool? {
+        match (this) {
+            JsonValue.Bool(b) => { return *b; }
+            _ => { return null; }
+        }
+    }
+
+    /// The number, if this is an integer that fits a `u64`.
+    public fn asU64(borrow this) -> u64? {
+        match (this) {
+            JsonValue.Number(n) => { return n.asU64(); }
+            _ => { return null; }
+        }
+    }
+
+    /// The number, if this is an integer that fits an `i64`.
+    public fn asI64(borrow this) -> i64? {
+        match (this) {
+            JsonValue.Number(n) => { return n.asI64(); }
+            _ => { return null; }
+        }
+    }
+
+    /// The number as an `f64`, if this is a number of any kind (serde_json's `as_f64`).
+    public fn asF64(borrow this) -> f64? {
+        match (this) {
+            JsonValue.Number(n) => { return n.asF64(); }
+            _ => { return null; }
+        }
+    }
+
+    /// The number, if this is one.
+    public fn asNumber(borrow this) -> JsonNumber? {
+        match (this) {
+            JsonValue.Number(n) => { return *n; }
+            _ => { return null; }
+        }
+    }
+
+    /// The text, if this is a string.
+    public fn asStr(borrow this) -> StringView? {
+        match (this) {
+            JsonValue.String(s) => { return s.view(); }
+            _ => { return null; }
+        }
+    }
+
+    /// The elements, if this is an array.
+    public fn asArray(borrow this) -> borrow(this) Vector<JsonValue>? {
+        match (this) {
+            JsonValue.Array(items) => { return items; }
+            _ => { return null; }
+        }
+    }
+
+    /// The elements, to change, if this is an array.
+    public fn asArrayMut(borrow mut this) -> borrow mut(this) Vector<JsonValue>? {
+        match (this) {
+            JsonValue.Array(items) => { return items; }
+            _ => { return null; }
+        }
+    }
+
+    /// The object, if this is one.
+    public fn asObject(borrow this) -> borrow(this) JsonObject? {
+        match (this) {
+            JsonValue.Object(o) => { return o; }
+            _ => { return null; }
+        }
+    }
+
+    /// The object, to change, if this is one.
+    public fn asObjectMut(borrow mut this) -> borrow mut(this) JsonObject? {
+        match (this) {
+            JsonValue.Object(o) => { return o; }
+            _ => { return null; }
+        }
+    }
+
+    /// The value at `key`, if this is an object that has it.
+    public fn get(borrow this, key: StringView) -> borrow(this) JsonValue? {
+        match (this) {
+            JsonValue.Object(o) => { return o.get(key); }
+            _ => { return null; }
+        }
+    }
+
+    /// The value at `key`, to change, if this is an object that has it.
+    public fn getMut(borrow mut this, key: StringView) -> borrow mut(this) JsonValue? {
+        match (this) {
+            JsonValue.Object(o) => { return o.getMut(key); }
+            _ => { return null; }
+        }
+    }
+
+    /// Element `index`, if this is an array that long.
+    public fn at(borrow this, index: usize) -> borrow(this) JsonValue? {
+        match (this) {
+            JsonValue.Array(items) => {
+                if (index < items.length) {
+                    return borrow items[index];
+                }
+                return null;
+            }
+            _ => { return null; }
+        }
+    }
+
+    /// Element `index`, to change, if this is an array that long.
+    public fn atMut(borrow mut this, index: usize) -> borrow mut(this) JsonValue? {
+        match (this) {
+            JsonValue.Array(items) => {
+                if (index < items.length) {
+                    return borrow mut items[index];
+                }
+                return null;
+            }
+            _ => { return null; }
+        }
+    }
+
+    /// The number of elements of an array or members of an object; 0 for anything else.
+    public fn length(borrow this) -> usize {
+        match (this) {
+            JsonValue.Array(items) => { return items.length; }
+            JsonValue.Object(o) => { return o.length(); }
+            _ => { return 0; }
+        }
+    }
+
+    /// The value a JSON Pointer (RFC 6901) names: `""` is this value, `"/a/0/b"` is member `b` of element 0 of
+    /// member `a`. In a token, `~1` stands for `/` and `~0` for `~`. An array index is decimal without leading zeros;
+    /// `-` (past the end) names nothing. Null when the pointer is malformed or names nothing.
+    public fn pointer(borrow this, path: StringView) -> borrow(this) JsonValue? {
+        if (path.length == 0) {
+            return this;
+        }
+        if (path[0] != '/') {
+            return null;
+        }
+        return Pointers.walk(this, path[1..]);
+    }
+
+    /// The value a JSON Pointer names, to change: as `pointer`.
+    public fn pointerMut(borrow mut this, path: StringView) -> borrow mut(this) JsonValue? {
+        if (path.length == 0) {
+            return this;
+        }
+        if (path[0] != '/') {
+            return null;
+        }
+        return Pointers.stepMut(this, path[1..]);
+    }
+
+    /// Whether the two are the same JSON: numbers as `JsonNumber.equals`, arrays element by element, objects as maps
+    /// whatever their order (as serde_json's `preserve_order` maps compare).
+    public fn equals(borrow this, other: borrow JsonValue) -> bool {
+        match (this) {
+            JsonValue.Null => { return other.isNull(); }
+            JsonValue.Bool(a) => {
+                match (other) {
+                    JsonValue.Bool(b) => { return *a == *b; }
+                    _ => { return false; }
+                }
+            }
+            JsonValue.Number(a) => {
+                match (other) {
+                    JsonValue.Number(b) => { return a.equals(b); }
+                    _ => { return false; }
+                }
+            }
+            JsonValue.String(a) => {
+                match (other) {
+                    JsonValue.String(b) => { return a.view() == b.view(); }
+                    _ => { return false; }
+                }
+            }
+            JsonValue.Array(a) => {
+                match (other) {
+                    JsonValue.Array(b) => {
+                        if (a.length != b.length) {
+                            return false;
+                        }
+                        for (i in 0..a.length) {
+                            if (!a[i].equals(b[i])) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    }
+                    _ => { return false; }
+                }
+            }
+            JsonValue.Object(a) => {
+                match (other) {
+                    JsonValue.Object(b) => { return a.equals(b); }
+                    _ => { return false; }
+                }
+            }
+        }
+    }
+
+    /// A deep copy.
+    public fn clone(borrow this) -> Result<JsonValue, AllocError> {
+        match (this) {
+            JsonValue.Null => { return Ok(JsonValue.Null); }
+            JsonValue.Bool(b) => { return Ok(JsonValue.Bool(*b)); }
+            JsonValue.Number(n) => { return Ok(JsonValue.Number(*n)); }
+            JsonValue.String(s) => { return Ok(JsonValue.String(s.clone()?)); }
+            JsonValue.Array(items) => {
+                var copy = Vector<JsonValue>.withCapacity(items.length)?;
+                for (i in 0..items.length) {
+                    copy.push(items[i].clone()?)?;
+                }
+                return Ok(JsonValue.Array(copy));
+            }
+            JsonValue.Object(o) => { return Ok(JsonValue.Object(o.clone()?)); }
+        }
+    }
+
+    /// Destroys the value without recursing: dropping a tree destroys it level by level on the machine's stack, which a
+    /// tree much deeper than the default 128 levels (parsed with a larger `maxDepth`, or built by hand) can exhaust.
+    /// The containers are taken apart onto a heap stack; if that stack cannot grow, the rest is dropped as usual.
+    public fn dispose(this) {
+        var pending = Vector<JsonValue>.create();
+        if (pending.push(this).isErr()) {
+            return;
+        }
+        while (true) {
+            let next = match (pending.pop()) {
+                Some(v) => v,
+                null => { break; }
+            };
+            match (next) {
+                JsonValue.Array(var items) => {
+                    while (true) {
+                        let item = match (items.pop()) {
+                            Some(v) => v,
+                            null => { break; }
+                        };
+                        if (pending.push(item).isErr()) {
+                            return;
+                        }
+                    }
+                }
+                JsonValue.Object(var o) => {
+                    while (true) {
+                        let member = match (o.popMember()) {
+                            Some(m) => m,
+                            null => { break; }
+                        };
+                        if (pending.push(member.value).isErr()) {
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A member of an object: its key and its value.
+public struct JsonMember {
+    public key: String;
+    public value: JsonValue;
+}
+
+/// Objects at least this large look keys up through a hash index.
+const INDEX_FROM: usize = 12;
+
+/// A JSON object: members in insertion order, each key once.
+public struct JsonObject {
+    entries: Vector<JsonMember>;
+    // Empty, or a power of two at least twice the members: 0 for a free slot, else the key's hash's low 32 bits (its
+    // home slot and a fingerprint) above the member's index plus one. An index that could not grow is dropped, and
+    // the lookups scan until the next insert builds it again: it never makes an insert fail.
+    slots: Vector<u64>;
+    k0: u64;
+    k1: u64;
+    seeded: bool;
+
+    /// An empty object; it allocates nothing.
+    public fn create() -> JsonObject => JsonObject {
+        entries: Vector<JsonMember>.create(),
+        slots: Vector<u64>.create(),
+        k0: 0,
+        k1: 0,
+        seeded: false,
+    };
+
+    /// How many members.
+    public fn length(borrow this) -> usize => this.entries.length;
+
+    public fn isEmpty(borrow this) -> bool => this.entries.length == 0;
+
+    /// Takes the last member out (for `JsonValue.dispose`).
+    fn popMember(borrow mut this) -> JsonMember? {
+        this.slots.clear();
+        return this.entries.pop();
+    }
+
+    /// The members, in order.
+    public fn members(borrow this) -> Slice<JsonMember> => this.entries.view();
+
+    /// The key of member `i` (0 ≤ i < length).
+    public fn keyAt(borrow this, i: usize) -> StringView => this.entries[i].key.view();
+
+    /// The value of member `i` (0 ≤ i < length).
+    public fn valueAt(borrow this, i: usize) -> borrow(this) JsonValue => borrow this.entries[i].value;
+
+    /// The value of member `i`, to change.
+    public fn valueAtMut(borrow mut this, i: usize) -> borrow mut(this) JsonValue => borrow mut this.entries[i].value;
+
+    /// Where `key` is among the members.
+    public fn indexOf(borrow this, key: StringView) -> usize? {
+        if (this.slots.length == 0) {
+            for (i in 0..this.entries.length) {
+                if (this.entries[i].key.view() == key) {
+                    return i;
+                }
+            }
+            return null;
+        }
+        let h = this.hashOf(key) & 0xFFFF_FFFF;
+        let mask = this.slots.length - 1;
+        var at = truncate<usize>(h) & mask;
+        while (true) {
+            let s = this.slots[at];
+            if (s == 0) {
+                return null;
+            }
+            if (s >> 32 == h) {
+                let i = truncate<usize>(s & 0xFFFF_FFFF) - 1;
+                if (this.entries[i].key.view() == key) {
+                    return i;
+                }
+            }
+            at = (at + 1) & mask;
+        }
+        return null;
+    }
+
+    /// Whether `key` is there.
+    public fn contains(borrow this, key: StringView) -> bool => this.indexOf(key).isSome();
+
+    /// The value at `key`, if it is there.
+    public fn get(borrow this, key: StringView) -> borrow(this) JsonValue? {
+        match (this.indexOf(key)) {
+            Some(i) => { return borrow this.entries[i].value; }
+            null => { return null; }
+        }
+    }
+
+    /// The value at `key`, to change.
+    public fn getMut(borrow mut this, key: StringView) -> borrow mut(this) JsonValue? {
+        match (this.indexOf(key)) {
+            Some(i) => { return borrow mut this.entries[i].value; }
+            null => { return null; }
+        }
+    }
+
+    /// Puts `value` at `key` (copied): the old value if the key was there, which keeps its place; else the member is
+    /// appended. On failure the object is as it was.
+    public fn insert(borrow mut this, key: StringView, value: JsonValue) -> Result<JsonValue?, AllocError> {
+        match (this.indexOf(key)) {
+            Some(i) => { return Ok(replace(mut this.entries[i].value, value)); }
+            null => {}
+        }
+        let owned = String.from(key)?;
+        this.append(owned, value)?;
+        return Ok(null);
+    }
+
+    /// `insert` with a key the object takes.
+    public fn put(borrow mut this, key: String, value: JsonValue) -> Result<JsonValue?, AllocError> {
+        match (this.indexOf(key.view())) {
+            Some(i) => { return Ok(replace(mut this.entries[i].value, value)); }
+            null => {}
+        }
+        this.append(key, value)?;
+        return Ok(null);
+    }
+
+    /// Appends a member whose key is known not to be there.
+    fn append(borrow mut this, key: String, value: JsonValue) -> Result<void, AllocError> {
+        this.entries.push(JsonMember { key: key, value: value })?;
+        let n = this.entries.length;
+        if (n < INDEX_FROM) {
+            return Ok();
+        }
+        if (this.slots.length < 2 * n) {
+            this.rebuild();
+            return Ok();
+        }
+        this.place(n - 1);
+        return Ok();
+    }
+
+    /// Takes the member at `key` out, keeping the others' order: its value, if it was there.
+    public fn remove(borrow mut this, key: StringView) -> JsonValue? {
+        let i = this.indexOf(key)?;
+        let member = this.entries.remove(i);
+        this.slots.clear();
+        if (this.entries.length >= INDEX_FROM) {
+            this.rebuild();
+        }
+        return member.value;
+    }
+
+    /// Whether the two have the same keys with equal values, whatever their order.
+    public fn equals(borrow this, other: borrow JsonObject) -> bool {
+        if (this.entries.length != other.entries.length) {
+            return false;
+        }
+        for (i in 0..this.entries.length) {
+            match (other.get(this.entries[i].key.view())) {
+                Some(v) => {
+                    if (!this.entries[i].value.equals(v)) {
+                        return false;
+                    }
+                }
+                null => { return false; }
+            }
+        }
+        return true;
+    }
+
+    /// A deep copy.
+    public fn clone(borrow this) -> Result<JsonObject, AllocError> {
+        var copy = JsonObject.create();
+        copy.entries.reserve(this.entries.length)?;
+        for (i in 0..this.entries.length) {
+            let key = this.entries[i].key.clone()?;
+            let value = this.entries[i].value.clone()?;
+            copy.append(key, value)?;
+        }
+        return Ok(copy);
+    }
+
+    fn hashOf(borrow this, key: StringView) -> u64 {
+        var h = Hasher.create(this.k0, this.k1);
+        h.bytes(key.bytes());
+        return h.finish();
+    }
+
+    /// Makes the index again, for the members there are; drops it if it cannot grow.
+    fn rebuild(borrow mut this) {
+        if (!this.seeded) {
+            var key = [0u8; 16];
+            match (Random.fill(mut key[..])) {
+                Ok() => {
+                    this.k0 = key[..].readLE<u64>(0);
+                    this.k1 = key[..].readLE<u64>(8);
+                }
+                Err(_) => {
+                    this.k0 = 0x736f_6d65_7073_6575;
+                    this.k1 = 0x646f_7261_6e64_6f6d;
+                }
+            }
+            this.seeded = true;
+        }
+        var size: usize = 32;
+        while (size < 4 * this.entries.length) {
+            size = size * 2;
+        }
+        this.slots.clear();
+        match (this.slots.resize(size, 0)) {
+            Ok() => {}
+            Err(_) => {
+                this.slots = Vector<u64>.create();
+                return;
+            }
+        }
+        for (i in 0..this.entries.length) {
+            this.place(i);
+        }
+    }
+
+    /// Enters member `i` in the index, which has room.
+    fn place(borrow mut this, i: usize) {
+        let h = this.hashOf(this.entries[i].key.view()) & 0xFFFF_FFFF;
+        let mask = this.slots.length - 1;
+        var at = truncate<usize>(h) & mask;
+        while (this.slots[at] != 0) {
+            at = (at + 1) & mask;
+        }
+        this.slots[at] = (h << 32) | ((i as u64) + 1);
+    }
+}
+
+/// The steps of a JSON Pointer.
+struct Pointers {
+    /// The value the tokens of `rest` (a pointer without its first `/`) name below `current`.
+    fn walk(current: borrow JsonValue, rest: StringView) -> borrow(current) JsonValue? {
+        let end = rest.indexOfByte('/') ?? rest.length;
+        let token = rest[..end];
+        let next = match (current) {
+            JsonValue.Object(o) => {
+                var found: usize? = null;
+                if (token.indexOfByte('~').isNull()) {
+                    found = o.indexOf(token);
+                } else {
+                    for (i in 0..o.length()) {
+                        if (Pointers.tokenNames(token, o.keyAt(i))) {
+                            found = i;
+                            break;
+                        }
+                    }
+                }
+                o.valueAt(found?)
+            }
+            JsonValue.Array(items) => {
+                let i = Pointers.index(token)?;
+                if (i >= items.length) {
+                    return null;
+                }
+                borrow items[i]
+            }
+            _ => { return null; }
+        };
+        if (end == rest.length) {
+            return next;
+        }
+        return Pointers.walk(next, rest[end + 1..]);
+    }
+
+    /// The value the tokens of `rest` (a pointer without its first `/`) name below `current`, to change.
+    fn stepMut(current: borrow mut JsonValue, rest: StringView) -> borrow mut(current) JsonValue? {
+        let end = rest.indexOfByte('/') ?? rest.length;
+        let token = rest[..end];
+        let next = match (current) {
+            JsonValue.Object(o) => {
+                var found: usize? = null;
+                if (token.indexOfByte('~').isNull()) {
+                    found = o.indexOf(token);
+                } else {
+                    for (i in 0..o.length()) {
+                        if (Pointers.tokenNames(token, o.keyAt(i))) {
+                            found = i;
+                            break;
+                        }
+                    }
+                }
+                o.valueAtMut(found?)
+            }
+            JsonValue.Array(items) => {
+                let i = Pointers.index(token)?;
+                if (i >= items.length) {
+                    return null;
+                }
+                borrow mut items[i]
+            }
+            _ => { return null; }
+        };
+        if (end == rest.length) {
+            return next;
+        }
+        return Pointers.stepMut(next, rest[end + 1..]);
+    }
+
+    /// An array index token: decimal, without a sign or leading zeros.
+    fn index(token: StringView) -> usize? {
+        if (token.length == 0 || (token.length > 1 && token[0] == '0')) {
+            return null;
+        }
+        for (b in token.bytes()) {
+            if (b < '0' || b > '9') {
+                return null;
+            }
+        }
+        return NumberParsing.parseUsize(token.bytes());
+    }
+
+    /// Whether `token`, with its escapes (`~0` and `~1`) read, is `key`.
+    fn tokenNames(token: StringView, key: StringView) -> bool {
+        var i: usize = 0;
+        var k: usize = 0;
+        while (i < token.length) {
+            var b = token[i];
+            if (b == '~') {
+                if (i + 1 >= token.length) {
+                    return false;
+                }
+                let e = token[i + 1];
+                if (e == '0') {
+                    b = '~';
+                } else if (e == '1') {
+                    b = '/';
+                } else {
+                    return false;
+                }
+                i += 1;
+            }
+            if (k >= key.length || key[k] != b) {
+                return false;
+            }
+            i += 1;
+            k += 1;
+        }
+        return k == key.length;
+    }
+}
+
+/// Float facts the language has no method for.
+struct Floats {
+    /// Whether `f` is neither NaN nor infinite.
+    fn isFinite(f: f64) -> bool => (f.bits() >> 52) & 0x7FF != 0x7FF;
+
+    /// Whether `f` is neither NaN nor infinite.
+    fn isFinite32(f: f32) -> bool => (f.bits() >> 23) & 0xFF != 0xFF;
+}

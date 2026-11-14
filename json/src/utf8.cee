@@ -1,0 +1,129 @@
+// UTF-8 by the Unicode Standard's Table 3-7, for the places the runtime's validator does not reach: the position of
+// the first bad byte, lossy replacement, and code points for `\u` escapes.
+
+struct Utf8 {
+    /// The length of the well-formed sequence at `i`, or 0 if the bytes there are not one.
+    fn sequenceLength(bytes: Slice<u8>, i: usize) -> usize {
+        let b = bytes[i];
+        if (b < 0x80) {
+            return 1;
+        }
+        let n = Utf8.expected(b);
+        if (n == 0 || i + n > bytes.length) {
+            return 0;
+        }
+        if (Utf8.validPrefix(bytes, i) != n) {
+            return 0;
+        }
+        return n;
+    }
+
+    /// How many bytes at `i` make one ill-formed sequence: its maximal subpart, at least one byte.
+    fn invalidLength(bytes: Slice<u8>, i: usize) -> usize {
+        let n = Utf8.validPrefix(bytes, i);
+        return if (n == 0) 1 else n;
+    }
+
+    /// The offset of the first byte that is not part of well-formed UTF-8, if there is one.
+    fn firstInvalid(bytes: Slice<u8>) -> usize? {
+        var i: usize = 0;
+        while (i < bytes.length) {
+            let n = Utf8.sequenceLength(bytes, i);
+            if (n == 0) {
+                return i;
+            }
+            i += n;
+        }
+        return null;
+    }
+
+    /// The code point of the well-formed sequence of `n` bytes at `i`.
+    fn decode(bytes: Slice<u8>, i: usize, n: usize) -> u32 {
+        let b = bytes[i] as u32;
+        if (n <= 1) {
+            return b;
+        }
+        if (n == 2) {
+            return ((b & 0x1F) << 6) | ((bytes[i + 1] as u32) & 0x3F);
+        }
+        if (n == 3) {
+            return ((b & 0x0F) << 12) | (((bytes[i + 1] as u32) & 0x3F) << 6) | ((bytes[i + 2] as u32) & 0x3F);
+        }
+        return ((b & 0x07) << 18) | (((bytes[i + 1] as u32) & 0x3F) << 12) | (((bytes[i + 2] as u32) & 0x3F) << 6) |
+            ((bytes[i + 3] as u32) & 0x3F);
+    }
+
+    /// Writes the UTF-8 of the scalar value `cp` into `buffer`: how many bytes.
+    fn encode(cp: u32, buffer: SliceMut<u8>) -> usize {
+        if (cp < 0x80) {
+            buffer[0] = truncate<u8>(cp);
+            return 1;
+        }
+        if (cp < 0x800) {
+            buffer[0] = truncate<u8>(0xC0 | (cp >> 6));
+            buffer[1] = truncate<u8>(0x80 | (cp & 0x3F));
+            return 2;
+        }
+        if (cp < 0x10000) {
+            buffer[0] = truncate<u8>(0xE0 | (cp >> 12));
+            buffer[1] = truncate<u8>(0x80 | ((cp >> 6) & 0x3F));
+            buffer[2] = truncate<u8>(0x80 | (cp & 0x3F));
+            return 3;
+        }
+        buffer[0] = truncate<u8>(0xF0 | (cp >> 18));
+        buffer[1] = truncate<u8>(0x80 | ((cp >> 12) & 0x3F));
+        buffer[2] = truncate<u8>(0x80 | ((cp >> 6) & 0x3F));
+        buffer[3] = truncate<u8>(0x80 | (cp & 0x3F));
+        return 4;
+    }
+
+    /// How long a sequence the lead byte `b` (0x80 and up) starts: 0 if it starts none.
+    fn expected(b: u8) -> usize {
+        if (b >= 0xC2 && b <= 0xDF) {
+            return 2;
+        }
+        if (b >= 0xE0 && b <= 0xEF) {
+            return 3;
+        }
+        if (b >= 0xF0 && b <= 0xF4) {
+            return 4;
+        }
+        return 0;
+    }
+
+    /// How many bytes at `i`, from a lead byte of 0x80 and up, follow Table 3-7 before the first that does not (or the
+    /// end): the whole sequence's length when it is well-formed, else its maximal subpart's (0 for a byte that leads
+    /// nothing).
+    fn validPrefix(bytes: Slice<u8>, i: usize) -> usize {
+        let b = bytes[i];
+        let n = Utf8.expected(b);
+        if (n == 0) {
+            return 0;
+        }
+        var lo: u8 = 0x80;
+        var hi: u8 = 0xBF;
+        if (b == 0xE0) {
+            lo = 0xA0;
+        } else if (b == 0xED) {
+            hi = 0x9F;
+        } else if (b == 0xF0) {
+            lo = 0x90;
+        } else if (b == 0xF4) {
+            hi = 0x8F;
+        }
+        var k: usize = 1;
+        while (k < n) {
+            if (i + k >= bytes.length) {
+                return k;
+            }
+            let c = bytes[i + k];
+            if (c < lo || c > hi) {
+                return k;
+            }
+            lo = 0x80;
+            hi = 0xBF;
+            k += 1;
+        }
+        return n;
+    }
+}

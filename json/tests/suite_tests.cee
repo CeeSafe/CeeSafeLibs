@@ -1,0 +1,210 @@
+// JSONTestSuite (tests/JSONTestSuite, README there), and round trips of generated values.
+//
+// Every `y_` file must parse and every `n_` file must be refused. The `i_` files are those RFC 8259 leaves to the
+// parser; what this one does with each is recorded in tests/JSONTestSuite/i_results.txt, and must not change.
+
+const SUITE: StringView = "tests/JSONTestSuite/test_parsing";
+
+fn readFile(path: StringView) -> Vector<u8> {
+    var f = File.open(path)!;
+    var out = Vector<u8>.create();
+    var buffer = [0u8; 65536];
+    while (true) {
+        let n = f.read(mut buffer[..])!;
+        if (n == 0) {
+            break;
+        }
+        out.extend(buffer[..n])!;
+    }
+    return out;
+}
+
+fn pathOf(name: StringView) -> String {
+    var p = String.from(SUITE)!;
+    p.append("/")!;
+    p.append(name)!;
+    return p;
+}
+
+@test
+fn jsonTestSuite() -> Result<void, TestFailure> {
+    let names = Directory.list(SUITE)!;
+    let recorded = readFile("tests/JSONTestSuite/i_results.txt");
+    let expectations = StringView.fromUtf8(recorded.view())!;
+    var yes: u64 = 0;
+    var no: u64 = 0;
+    var implementation: u64 = 0;
+    var failures: u64 = 0;
+    for (i in 0..names.length) {
+        let name = names[i].view();
+        if (!name.endsWith(".json")) {
+            continue;
+        }
+        let path = pathOf(name);
+        let text = readFile(path.view());
+        let outcome = Json.parse(text.view());
+        let accepted = outcome.isOk();
+        if (name.startsWith("y_")) {
+            yes += 1;
+            if (!accepted) {
+                Console.write("refused y_ file: ");
+                Console.writeLine(name);
+                failures += 1;
+            }
+        } else if (name.startsWith("n_")) {
+            no += 1;
+            if (accepted) {
+                Console.write("accepted n_ file: ");
+                Console.writeLine(name);
+                failures += 1;
+            }
+        } else if (name.startsWith("i_")) {
+            implementation += 1;
+            var line = String.create();
+            line.append(if (accepted) "accepted " else "refused ")!;
+            line.append(name)!;
+            match (outcome) {
+                Ok(_) => {}
+                Err(e) => {
+                    line.append(": ")!;
+                    line.append(e.message())!;
+                }
+            }
+            Console.writeLine(line.view());
+            var wanted = String.create();
+            wanted.append(line.view())!;
+            wanted.append("\n")!;
+            if (!expectations.contains(wanted.view())) {
+                Console.write("i_ outcome changed: ");
+                Console.writeLine(line.view());
+                failures += 1;
+            }
+        }
+    }
+    Console.write("y_ files: ");
+    Console.writeLine(yes);
+    Console.write("n_ files: ");
+    Console.writeLine(no);
+    Console.write("i_ files: ");
+    Console.writeLine(implementation);
+    Check.equalU64(95, yes)?;
+    Check.equalU64(188, no)?;
+    Check.equalU64(35, implementation)?;
+    return Check.equalU64(0, failures);
+}
+
+@test
+fn suiteValuesRoundTrip() -> Result<void, TestFailure> {
+    // Each y_ file's value, written compact and pretty, parses back to an equal value.
+    let names = Directory.list(SUITE)!;
+    for (i in 0..names.length) {
+        let name = names[i].view();
+        if (!name.startsWith("y_")) {
+            continue;
+        }
+        let path = pathOf(name);
+        let text = readFile(path.view());
+        let v = Json.parse(text.view())!;
+        var compact = Vector<u8>.create();
+        v.write(mut compact)!;
+        Check.isTrue(Json.parse(compact.view())!.equals(v), "compact round trip")?;
+        var pretty = Vector<u8>.create();
+        v.writePretty(mut pretty)!;
+        Check.isTrue(Json.parse(pretty.view())!.equals(v), "pretty round trip")?;
+        var again = Vector<u8>.create();
+        Json.parse(compact.view())!.write(mut again)!;
+        Check.equalBytes(compact.view(), again.view())?; // writing is a fixed point
+    }
+    return Ok();
+}
+
+/// A small deterministic generator (a 64-bit LCG), so that failures repeat.
+struct Generator {
+    state: u64;
+
+    fn next(borrow mut this) -> u64 {
+        this.state = this.state.wrappingMul(6364136223846793005).wrappingAdd(1442695040888963407);
+        return this.state >> 11;
+    }
+
+    fn below(borrow mut this, n: u64) -> u64 => this.next() % n;
+
+    fn text(borrow mut this) -> String {
+        let pieces = ["a", "Z", "0", " ", "\"", "\\", "/", "\n", "\t", "\u{1}", "\u{1F}", "é", "€", "𝄞", "</", "~"];
+        var s = String.create();
+        let n = this.below(8);
+        for (i in 0..n) {
+            s.append(pieces[truncate<usize>(this.below(16))])!;
+        }
+        return s;
+    }
+
+    fn number(borrow mut this) -> JsonValue {
+        let k = this.below(6);
+        if (k == 0) {
+            return JsonValue.fromU64(this.next() << 11 | this.below(2048));
+        }
+        if (k == 1) {
+            return JsonValue.fromI64(0 - truncate<i64>(this.next()));
+        }
+        if (k == 2) {
+            return JsonValue.fromU64(this.below(100));
+        }
+        // A float from random bits, finite ones only.
+        var bits = (this.next() << 11) ^ this.next();
+        if ((bits >> 52) & 0x7FF == 0x7FF) {
+            bits = bits & 0x800F_FFFF_FFFF_FFFF;
+        }
+        return JsonValue.fromF64(f64.fromBits(bits));
+    }
+
+    fn value(borrow mut this, depth: u32) -> JsonValue {
+        let k = if (depth >= 5) this.below(4) else this.below(7);
+        if (k == 0) {
+            return JsonValue.Null;
+        }
+        if (k == 1) {
+            return JsonValue.fromBool(this.below(2) == 0);
+        }
+        if (k == 2) {
+            return this.number();
+        }
+        if (k == 3) {
+            let s = this.text();
+            return JsonValue.String(s);
+        }
+        if (k == 4 || k == 5) {
+            var a = JsonValue.array();
+            let n = this.below(5);
+            for (i in 0..n) {
+                a.push(this.value(depth + 1))!;
+            }
+            return a;
+        }
+        var o = JsonValue.object();
+        let n = this.below(20);
+        for (i in 0..n) {
+            let key = this.text();
+            let v = this.value(depth + 1);
+            o.insert(key.view(), v)!;
+        }
+        return o;
+    }
+}
+
+@test
+fn generatedValuesRoundTrip() -> Result<void, TestFailure> {
+    var g = Generator { state: 42 };
+    var options = WriteOptions.compact();
+    for (i in 0..400) {
+        let v = g.value(0);
+        options.pretty = i % 2 == 0;
+        options.asciiOnly = i % 3 == 0;
+        options.escapeEndTag = i % 5 == 0;
+        var out = Vector<u8>.create();
+        v.writeWith(mut out, options)!;
+        let back = Json.parse(out.view())!;
+        Check.isTrue(back.equals(v), "parse(write(v)) == v")?;
+    }
+    return Ok();
+}

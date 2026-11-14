@@ -1,0 +1,265 @@
+// Writing: compact and pretty output, numbers, escapes, options, and the streaming writer's checks.
+
+const SAMPLE: StringView = "{\"name\":\"edge\",\"ports\":[80,443],\"tls\":{\"on\":true,\"cert\":null},\"empty\":[],\"none\":{},\"ratio\":0.5,\"offset\":-3}";
+
+@test
+fn compactOutput() -> Result<void, TestFailure> {
+    compactIs(SAMPLE, SAMPLE)?;
+    compactIs(" [ 1 , { } , [ ] , \"a\" ] ", "[1,{},[],\"a\"]")?;
+    compactIs("{\"b\":1,\"a\":2}", "{\"b\":1,\"a\":2}")?; // insertion order is kept
+    return Ok();
+}
+
+@test
+fn prettyOutput() -> Result<void, TestFailure> {
+    let expected = """
+        {
+          "name": "edge",
+          "ports": [
+            80,
+            443
+          ],
+          "tls": {
+            "on": true,
+            "cert": null
+          },
+          "empty": [],
+          "none": {},
+          "ratio": 0.5,
+          "offset": -3
+        }
+        """;
+    prettyIs(SAMPLE, expected)?;
+    prettyIs("[]", "[]")?;
+    prettyIs("{}", "{}")?;
+    prettyIs("1", "1")?;
+    prettyIs("[[]]", "[\n  []\n]")?;
+    prettyIs("[{\"a\":[1]}]", "[\n  {\n    \"a\": [\n      1\n    ]\n  }\n]")?;
+    return Ok();
+}
+
+@test
+fn integerOutput() -> Result<void, TestFailure> {
+    compactIs("[0,1,-1,18446744073709551615,-9223372036854775808]", "[0,1,-1,18446744073709551615,-9223372036854775808]")?;
+    var w = JsonWriter.compact();
+    w.beginArray()!;
+    w.u64(0xFFFF_FFFF_FFFF_FFFF)!;
+    w.i64(-0x7FFF_FFFF_FFFF_FFFF - 1)!;
+    w.i64(0)!;
+    w.number(JsonNumber.fromI64(-5))!;
+    w.endArray()!;
+    let out = w.finish()!;
+    Check.equalText("[18446744073709551615,-9223372036854775808,0,-5]", bytesText(out))?;
+    return Ok();
+}
+
+@test
+fn floatOutput() -> Result<void, TestFailure> {
+    // serde_json's form: ryu's shortest digits, with `.0` on integral values and an exponent past 16 digits.
+    floatIs(0.0, "0.0")?;
+    floatIs(-0.0, "-0.0")?;
+    floatIs(1.0, "1.0")?;
+    floatIs(-1.5, "-1.5")?;
+    floatIs(0.1, "0.1")?;
+    floatIs(0.3, "0.3")?;
+    floatIs(0.1 + 0.2, "0.30000000000000004")?;
+    floatIs(100.0, "100.0")?;
+    floatIs(123456.789, "123456.789")?;
+    floatIs(1e15, "1000000000000000.0")?;
+    floatIs(1e16, "1e16")?;
+    floatIs(1.5e16, "1.5e16")?;
+    floatIs(1e20, "1e20")?;
+    floatIs(1e21, "1e21")?;
+    floatIs(1.2345678901234567e19, "1.2345678901234567e19")?;
+    floatIs(0.0001, "0.0001")?;
+    floatIs(0.00001, "0.00001")?;
+    floatIs(0.000001, "1e-6")?;
+    floatIs(0.0000012, "1.2e-6")?;
+    floatIs(1.5e-7, "1.5e-7")?;
+    floatIs(5e-324, "5e-324")?;
+    floatIs(2.2250738585072014e-308, "2.2250738585072014e-308")?;
+    floatIs(1.7976931348623157e308, "1.7976931348623157e308")?;
+    floatIs(-1.7976931348623157e308, "-1.7976931348623157e308")?;
+    floatIs(9007199254740993.0, "9007199254740992.0")?;
+    var w = JsonWriter.compact();
+    w.f32(0.1f32)!;
+    Check.equalText("0.1", bytesText(w.intoBytes()))?;
+    return Ok();
+}
+
+@test
+fn floatsRoundTrip() -> Result<void, TestFailure> {
+    // Shortest digits read back as the same bits, for floats of every magnitude.
+    var bits: u64 = 0x0000_0000_0000_0001;
+    for (i in 0..2000) {
+        let f = f64.fromBits(bits);
+        if ((f.bits() >> 52) & 0x7FF != 0x7FF) {
+            for (sign in 0..2) {
+                let g = if (sign == 0) f else -f;
+                var w = JsonWriter.compact();
+                w.f64(g)!;
+                let out = w.finish()!;
+                let back = Json.parse(out.view())!;
+                let h = back.asF64()!;
+                Check.isTrue(h.bits() == g.bits(), "round trip")?;
+            }
+        }
+        bits = bits.wrappingMul(6364136223846793005).wrappingAdd(1442695040888963407);
+    }
+    return Ok();
+}
+
+@test
+fn nonFiniteFloatsAreRefused() -> Result<void, TestFailure> {
+    let nan = 0.0 / 0.0;
+    let inf = 1.0 / 0.0;
+    var w = JsonWriter.compact();
+    w.beginArray()!;
+    Check.isTrue(w.f64(nan).err()! == JsonWriteError.NonFiniteNumber, "NaN")?;
+    Check.isTrue(w.f64(inf).err()! == JsonWriteError.NonFiniteNumber, "inf")?;
+    Check.isTrue(w.f64(-inf).err()! == JsonWriteError.NonFiniteNumber, "-inf")?;
+    Check.isTrue(w.f32(round<f32>(inf)).err()! == JsonWriteError.NonFiniteNumber, "f32 inf")?;
+    w.endArray()!;
+    Check.equalText("[]", bytesText(w.finish()!))?; // nothing was written for them
+    // A tree cannot hold one through fromF64, and refuses one put in by hand.
+    Check.isTrue(JsonValue.fromF64(nan).isNull(), "fromF64(NaN) is null")?;
+    Check.isTrue(JsonNumber.fromF64(inf).isNull(), "JsonNumber.fromF64(inf)")?;
+    var v = JsonValue.array();
+    v.push(JsonValue.Number(JsonNumber.Float(nan)))!;
+    var out = Vector<u8>.create();
+    Check.isTrue(v.write(mut out).err()! == JsonWriteError.NonFiniteNumber, "tree with NaN")?;
+    return Ok();
+}
+
+@test
+fn stringEscaping() -> Result<void, TestFailure> {
+    var w = JsonWriter.compact();
+    w.string("a\"b\\c/d\u{8}\u{C}\n\r\t\u{0}\u{1F}\u{7F}é€𝄞")!;
+    Check.equalText("\"a\\\"b\\\\c/d\\b\\f\\n\\r\\t\\u0000\\u001f\u{7F}é€𝄞\"", bytesText(w.finish()!))?;
+    return Ok();
+}
+
+@test
+fn escapeOptions() -> Result<void, TestFailure> {
+    var options = WriteOptions.compact();
+    options.asciiOnly = true;
+    var w = JsonWriter.withOptions(options);
+    w.string("é€𝄞x")!;
+    Check.equalText("\"\\u00e9\\u20ac\\ud834\\udd1ex\"", bytesText(w.finish()!))?;
+    let back = parsed("\"\\u00e9\\u20ac\\ud834\\udd1ex\"");
+    Check.equalText("é€𝄞x", back.asStr()!)?;
+    options.asciiOnly = false;
+    options.escapeEndTag = true;
+    var h = JsonWriter.withOptions(options);
+    h.string("</script><p>a/b</p>")!;
+    Check.equalText("\"<\\/script><p>a/b<\\/p>\"", bytesText(h.finish()!))?;
+    return Ok();
+}
+
+@test
+fn bytesThatMayNotBeUtf8() -> Result<void, TestFailure> {
+    let bad = [0x61u8, 0xFF, 0x62, 0xE2, 0x82, 0x63, 0xF0, 0x9F, 0x98, 0x80];
+    var w = JsonWriter.compact();
+    w.beginArray()!;
+    Check.isTrue(w.stringBytes(bad[..]).err()! == JsonWriteError.InvalidUtf8, "refused")?;
+    w.stringBytes("ok".bytes())!;
+    w.stringLossy(bad[..])!;
+    w.stringLossy("\"plain\"".bytes())!;
+    w.endArray()!;
+    Check.equalText("[\"ok\",\"a\u{FFFD}b\u{FFFD}c😀\",\"\\\"plain\\\"\"]", bytesText(w.finish()!))?;
+    var k = JsonWriter.compact();
+    k.beginObject()!;
+    Check.isTrue(k.keyBytes(bad[..]).err()! == JsonWriteError.InvalidUtf8, "key refused")?;
+    k.keyBytes("k".bytes())!;
+    k.u64(1)!;
+    k.endObject()!;
+    Check.equalText("{\"k\":1}", bytesText(k.finish()!))?;
+    return Ok();
+}
+
+@test
+fn streamingPretty() -> Result<void, TestFailure> {
+    var w = JsonWriter.pretty();
+    w.beginObject()!;
+    w.key("name")!;
+    w.string("edge")!;
+    w.key("listen")!;
+    w.beginArray()!;
+    w.beginObject()!;
+    w.key("port")!;
+    w.u64(443)!;
+    w.key("tls")!;
+    w.bool(true)!;
+    w.endObject()!;
+    w.endArray()!;
+    w.key("weight")!;
+    w.f64(1.5)!;
+    w.key("backup")!;
+    w.nullValue()!;
+    w.key("routes")!;
+    w.beginArray()!;
+    w.endArray()!;
+    w.endObject()!;
+    let expected = """
+        {
+          "name": "edge",
+          "listen": [
+            {
+              "port": 443,
+              "tls": true
+            }
+          ],
+          "weight": 1.5,
+          "backup": null,
+          "routes": []
+        }
+        """;
+    Check.equalText(expected, bytesText(w.finish()!))?;
+    return Ok();
+}
+
+@test
+fn writerChecksItsUse() -> Result<void, TestFailure> {
+    var a = JsonWriter.compact();
+    a.beginObject()!;
+    Check.isTrue(a.u64(1).err()! == JsonWriteError.ExpectedKey, "value without key")?;
+    a.key("k")!;
+    Check.isTrue(a.key("j").err()! == JsonWriteError.UnexpectedKey, "two keys")?;
+    Check.isTrue(a.endObject().err()! == JsonWriteError.UnbalancedEnd, "end after a key")?;
+    a.u64(1)!;
+    Check.isTrue(a.endArray().err()! == JsonWriteError.UnbalancedEnd, "wrong end")?;
+    a.endObject()!;
+    Check.isTrue(a.isComplete(), "complete")?;
+    Check.isTrue(a.u64(2).err()! == JsonWriteError.AlreadyComplete, "second value")?;
+    Check.isTrue(a.endObject().err()! == JsonWriteError.UnbalancedEnd, "end of nothing")?;
+    Check.equalText("{\"k\":1}", bytesText(a.finish()!))?;
+
+    var b = JsonWriter.compact();
+    Check.isTrue(b.key("k").err()! == JsonWriteError.UnexpectedKey, "key at the top")?;
+    b.beginArray()!;
+    Check.isTrue(b.key("k").err()! == JsonWriteError.UnexpectedKey, "key in an array")?;
+    Check.isTrue(b.finish().err()! == JsonWriteError.Incomplete, "open array")?;
+    Check.isTrue(JsonWriter.compact().finish().err()! == JsonWriteError.Incomplete, "nothing written")?;
+
+    var options = WriteOptions.compact();
+    options.maxDepth = 2;
+    var c = JsonWriter.withOptions(options);
+    c.beginArray()!;
+    c.beginArray()!;
+    Check.isTrue(c.beginArray().err()! == JsonWriteError.DepthLimitExceeded, "depth")?;
+    Check.equalU64(2, c.depth() as u64)?;
+    return Ok();
+}
+
+@test
+fn appendsToAVector() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    out.extend("x=".bytes())!;
+    parsed("[1,2]").write(mut out)!;
+    Check.equalText("x=[1,2]", bytesText(out))?;
+    var w = JsonWriter.appendingTo(out, WriteOptions.compact());
+    w.bool(false)!;
+    let back = w.finish()!;
+    Check.equalText("x=[1,2]false", bytesText(back))?;
+    return Ok();
+}

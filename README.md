@@ -11,6 +11,7 @@ CeeSafe package (`ceesafe.toml`), with its own README and tests (`ceesafec test`
 | `sha256` | SHA-256 (FIPS 180-4), HMAC-SHA-256 (RFC 2104) and PBKDF2-HMAC-SHA-256 (RFC 8018), in CeeSafe. |
 | `bcrypt` | bcrypt as OpenBSD defines it: `$2b$` hashes, and verifying `$2a$` and `$2y$`. |
 | `encoding` | Hex and base64 (RFC 4648), including the URL-safe alphabet. |
+| `json` | JSON (RFC 8259) in the spirit of serde_json: a tree with exact integers and ordered objects, a strict parser without recursion, compact and pretty writers, a streaming writer, JSON Pointer, and typed encoding and decoding through `ToJson` and `FromJson`. |
 | `diskio` | File calls `lib/std` lacks: positioned reads, fsync, rename, mkdir -p, directory sync and exclusive creation. |
 
 Everything is CeeSafe: there is no C in the repository. `tls` and `pkey` call OpenSSL 3 directly (their
