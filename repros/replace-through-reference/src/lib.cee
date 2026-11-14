@@ -1,0 +1,39 @@
+// ceesafec 0.47.0: `replace` (and `swap`) cannot take the referent of a `borrow mut` parameter.
+//
+// `ceesafec check` in this directory reports, for `take`:
+//
+//   error[N0248]: cannot borrow 'out' as mutable: parameters are immutable
+//
+// and with the `mut` removed, `replace(out, …)`:
+//
+//   error[N0249]: this argument is a place the call changes; write 'mut' before it
+//
+// so no spelling is accepted: `mut *out` is N0251 ('*' copies the value), and `let r = borrow mut out;` is N0246
+// (a reference to a reference). Yet the referent is a mutable place: assigning it (`assign`) and replacing a field
+// of it (`field`) are both accepted. `swap(mut out, mut tmp)` fails the same way (N0248).
+//
+// Expected: `replace(mut out, v)` with `out: borrow mut T` is the referent's replacement, as `replace(mut h.v, v)` is
+// for `h: borrow mut Holder` (the `mut` reborrows the reference; it does not borrow the parameter variable itself).
+//
+// Found while writing json's `JsonValue.writeWith(out: borrow mut Vector<u8>, …)`, which wanted to hand `out` to a
+// JsonWriter (which owns its vector) and take it back. Workaround there: the writer starts with a new vector, and
+// `out = w.intoBytes()` (an assignment, accepted) when `out` was empty, else `out.extend(w.written())`.
+//
+// Suggested fix: in the N0248 check for `mut x` arguments, treat a parameter whose type is `borrow mut T` as a
+// mutable place of type `T` (as a field path through it already is), rather than as the immutable parameter
+// binding.
+
+public struct Holder {
+    public v: Vector<u8>;
+}
+
+/// Refused (N0248), and so is every other spelling of it.
+public fn take(out: borrow mut Vector<u8>) -> Vector<u8> => replace(mut out, Vector<u8>.create());
+
+/// Accepted: a field through the reference.
+public fn field(h: borrow mut Holder) -> Vector<u8> => replace(mut h.v, Vector<u8>.create());
+
+/// Accepted: assigning the referent.
+public fn assign(out: borrow mut Vector<u8>) {
+    out = Vector<u8>.create();
+}

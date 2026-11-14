@@ -1,0 +1,30 @@
+// ceesafec 0.47.0: dropping a tree 100000 levels deep (an enum nested through a Vector) crashes `ceesafec run --interp`
+// with SIGSEGV (exit status 139) and no message; the compiled program (`ceesafec build && ./out/deepdrop`) drops it
+// and prints "built" then "dropped".
+//
+// type-system.md §18.5 (R-9) says a tree's drop uses stack in proportion to its depth, so some limit is expected; the
+// issue is how it ends in the interpreter: a host segfault, with even the "built" line lost (standard output is not
+// flushed), rather than a CeeSafe panic ("stack overflow while dropping") as a program would want reported.
+//
+// Found with json: a 100000-level array parsed with a raised `maxDepth`. Workaround there: `JsonValue.dispose()`
+// takes a tree apart onto a heap stack, and the test calls it.
+//
+// Suggested fix: give the interpreter's drop glue a depth counter (or run it on an explicit work list, which would
+// also remove the native limit for vectors of the type itself), and panic cleanly past it.
+
+enum Tree {
+    Leaf,
+    Node(Vector<Tree>),
+}
+
+fn main() {
+    var t = Tree.Leaf;
+    for (i in 0..100000) {
+        var children = Vector<Tree>.create();
+        children.push(t)!;
+        t = Tree.Node(children);
+    }
+    Console.writeLine("built");
+    { let gone = t; }
+    Console.writeLine("dropped");
+}

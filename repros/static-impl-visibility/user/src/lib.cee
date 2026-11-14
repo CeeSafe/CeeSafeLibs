@@ -1,0 +1,41 @@
+// ceesafec 0.47.0: a static function of an `impl I for T` written in another package than `I`'s must be `public`, or
+// generic code in `I`'s package that calls it through a bound does not check.
+//
+// `ceesafec fetch && ceesafec check` in this directory reports, at the call in `use`:
+//
+//   error[N0222]: 'iface.build' cannot be used with 'Thing': for these type arguments its body has an error:
+//   'Thing.make' is not public: only its own package can call it (type-system.md §2) (type-system.md §20.4)
+//
+// (When the call is inside the dependency's own generic code, as json's `Decode.vector<T>` calling `T.fromJson`, it
+// is instead N0364 at the manifest, "the dependency 'json' has errors", with the same note.)
+//
+// type-system.md §2 says: "A function of an `impl I for T` block takes no modifier but `public`, which has no effect:
+// the method is as visible as the interface." Here `public` has an effect: writing `public fn make` makes it check.
+// Methods with a receiver are not affected: `twice` without `public`, called through the bound in `doubled`, is
+// accepted.
+//
+// Found with json's `FromJson.fromJson(value) -> Result<Self, DecodeError>`, a static function: every program's
+// `impl FromJson for MyType` had to write `public fn fromJson`. Workaround: json's README and tests write `public`
+// on that function (harmless where it is not needed).
+//
+// Suggested fix: when an instantiation calls `T.f()` for an interface's static function through a bound, check its
+// visibility as the interface's (as §2 says, and as is already done for methods), not as the impl function's own.
+
+import iface.Make;
+import iface.build;
+import iface.doubled;
+
+struct Thing {
+    n: u32;
+}
+
+impl Make for Thing {
+    fn make(seed: u32) -> Thing => Thing { n: seed };
+
+    fn twice(borrow this) -> u32 => this.n * 2;
+}
+
+public fn use() -> u32 {
+    let t = build<Thing>(21);
+    return doubled(t);
+}

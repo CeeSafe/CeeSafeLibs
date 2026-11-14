@@ -1,0 +1,13 @@
+// The interface's package: an interface with a static function, and generic code that calls it through a bound.
+// See ../user/src/lib.cee for the issue.
+
+public interface Make {
+    fn make(seed: u32) -> Self;
+    fn twice(borrow this) -> u32;
+}
+
+/// Calls the static function through the bound: this is where the error is reported.
+public fn build<T: Make>(seed: u32) -> T => T.make(seed);
+
+/// Calls the method through the bound: no error.
+public fn doubled<T: Make>(value: borrow T) -> u32 => value.twice();

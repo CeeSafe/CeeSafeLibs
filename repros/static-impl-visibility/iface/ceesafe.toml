@@ -1,0 +1,6 @@
+[package]
+name = "iface"
+version = "0.1.0"
+kind = "library"
+
+[dependencies]
