@@ -932,3 +932,120 @@ fn readsAgainAfterATimeout() -> Result<void, TestFailure> {
     Check.isTrue(timedOut, "the first read timed out while the server was silent")?;
     return Check.isTrue(got.view() == "late".bytes(), "and the session still reads what comes next");
 }
+
+// ── TlsEngine: the caller moves the bytes ──────────────────────────────────────────────────────────────────────
+
+/// Sends everything the engine has queued.
+async fn sendQueued(engine: borrow mut TlsEngine, tcp: borrow AsyncTcpStream) -> Result<void, TlsError> {
+    var out = Vector<u8>.create();
+    engine.takeAllOutput(mut out)?;
+    if (out.length > 0) {
+        await writeTcp(tcp, out.view())?;
+    }
+    return Ok();
+}
+
+/// Reads what the socket has and feeds it to the engine; `Truncated` at the end of the stream.
+async fn feedSome(engine: borrow mut TlsEngine, tcp: borrow AsyncTcpStream) -> Result<void, TlsError> {
+    var buffer = [0u8; 16384];
+    let n = match (await tcp.read(mut buffer[..])) {
+        Ok(n) => n,
+        Err(e) => { return Err(TlsError.Io(e)); }
+    };
+    if (n == 0) {
+        return Err(TlsError.Truncated);
+    }
+    return engine.feed(buffer[0..n]);
+}
+
+/// The client of `sendAndSummarize`, written over a `TlsEngine` and a plain socket.
+async fn engineSendAndSummarize(
+    port: u16,
+    config: borrow TlsConfig,
+    name: StringView,
+    payload: Slice<u8>,
+    seen: borrow mut RoundTrip,
+) -> Result<void, TlsError> {
+    let tcp = await connectTcp(port)?;
+    var engine = TlsEngine.client(config, name)?;
+    loop {
+        let done = engine.handshake()?;
+        await sendQueued(mut engine, tcp)?;
+        if (done) {
+            break;
+        }
+        await feedSome(mut engine, tcp)?;
+    }
+    seen.version = engine.version();
+    engine.write(payload)?;
+    engine.shutdown()?;
+    await sendQueued(mut engine, tcp)?;
+    var reply = [0u8; 17];
+    var got: usize = 0;
+    while (got < reply.length) {
+        match (engine.read(mut reply[got..])?) {
+            Some(0) => { return Err(TlsError.Truncated); }
+            Some(n) => { got += n; }
+            null => { await feedSome(mut engine, tcp)?; }
+        }
+    }
+    seen.reply = reply;
+    return Ok();
+}
+
+async fn engineRoundTrip(
+    server: borrow TlsConfig,
+    client: borrow TlsConfig,
+    name: StringView,
+    payload: Slice<u8>,
+    seen: borrow mut RoundTrip,
+    result: borrow mut Result<void, TlsError>,
+) -> Result<void, TlsError> {
+    let listener = listen();
+    let port = match (listener.port()) {
+        Ok(p) => p,
+        Err(_) => { return Err(TlsError.Config); }
+    };
+    await Async.scope(TlsError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            match (await summarize(listener, server)) {
+                Ok() => {}
+                Err(_) => {} // a client that fails its handshake fails the server's too
+            }
+            return Ok();
+        });
+        s.spawn(async () => {
+            result = await engineSendAndSummarize(port, client, name, payload, mut seen);
+            return Ok();
+        });
+    })?;
+    return Ok();
+}
+
+@test
+fn engineRoundTripsWithAStream() -> Result<void, TestFailure> {
+    let server = serverConfig("localhost");
+    let client = testClient();
+    let payload = pattern(1024 * 1024 + 5);
+    var seen = RoundTrip { reply: [0u8; 17], version: 0, peerCertificate: false };
+    var result: Result<void, TlsError> = Err(TlsError.Closed);
+    let outcome = Async.run(engineRoundTrip(server, client, "localhost", payload.view(), mut seen, mut result));
+    expectOk(borrow outcome, "the scenario runs")?;
+    expectOk(borrow result, "the engine's exchange succeeds")?;
+    let reply = seen.reply;
+    Check.equalU64(payload.length as u64, readU64(reply[..], 0))?;
+    Check.equalU64(checksum(payload.view()), readU64(reply[..], 8))?;
+    Check.equalU64(9, reply[16] as u64)?; // the server saw SNI "localhost"
+    return Check.equalU64(0x0304, seen.version as u64);
+}
+
+@test
+fn engineRejectsWrongHostName() -> Result<void, TestFailure> {
+    let server = serverConfig("localhost");
+    let client = testClient();
+    var seen = RoundTrip { reply: [0u8; 17], version: 0, peerCertificate: false };
+    var result: Result<void, TlsError> = Ok();
+    let outcome = Async.run(engineRoundTrip(server, client, "example.org", "x".bytes(), mut seen, mut result));
+    expectOk(borrow outcome, "the scenario runs")?;
+    return Check.isTrue(isVerifyError(borrow result), "a certificate for another name is refused");
+}

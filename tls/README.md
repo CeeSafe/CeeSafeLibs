@@ -27,6 +27,10 @@ var session = await TlsStream.accept(tcp, server)?;
 - **STARTTLS.** `connect` and `accept` take a stream that is already connected, so an upgrade is the same call made
   after the plain-text exchange. Throw away anything read from the plain stream after the STARTTLS command
   (RFC 3207 §6).
+- **TLS inside another protocol.** `TlsEngine` is a client session that does no I/O: `handshake()`, `feed(bytes)`,
+  `takeOutput`/`takeAllOutput`, `read` (null: feed more) and `write` return at once, and the caller moves the
+  ciphertext. It serves protocols that frame TLS themselves or use it for part of a session, such as TDS (SQL
+  Server), which wraps the handshake in its own packets and may drop TLS after the login.
 - **Hot reload.** Wrap the server configuration in `SharedTlsConfig`, share it with an `Arc`, call `current()` for
   each accept, and call `replace(newConfig)` when a certificate is renewed. Established connections keep the
   configuration they started with.

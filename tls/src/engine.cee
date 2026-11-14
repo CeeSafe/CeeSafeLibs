@@ -1,0 +1,195 @@
+/// A TLS client session that does no I/O of its own (a "sans-I/O" engine): the caller moves the ciphertext.
+///
+/// `TlsStream` reads and writes an `AsyncTcpStream` itself. Some protocols carry TLS inside their own framing
+/// instead, or use it for part of a session only: TDS (SQL Server) wraps the handshake in PRELOGIN packets and may
+/// drop TLS again after the login. For them, an engine:
+///
+/// ```ceesafe
+/// var engine = TlsEngine.client(config, "db.example.org")?;
+/// while (!engine.handshake()?) {
+///     // send engine.takeOutput(…) to the peer, framed as the protocol wants; feed what comes back
+///     engine.feed(received)?;
+/// }
+/// engine.write(plaintext)?;          // then send takeOutput's ciphertext
+/// engine.feed(ciphertext)?;          // then read the plaintext
+/// let n = engine.read(mut buffer[..])?;   // null: more ciphertext is needed
+/// ```
+///
+/// Every function returns at once. After any of them, `pendingOutput()` may be above 0: those bytes go to the peer.
+@noncopy
+public struct TlsEngine {
+    private conn: usize;
+    private peerClosed: bool;
+    private broken: bool;
+
+    /// Safety: `conn` is a live connection this value owns.
+    drop {
+        unsafe { cstls_conn_free(this.conn as *mut void); }
+    }
+
+    /// A client session for `serverName`, which is sent with SNI (unless it is an IP address) and, when `config`
+    /// verifies peers, checked against the server's certificate. An empty `serverName` sends no SNI and checks no
+    /// name. The handshake starts at the first `handshake()`.
+    /// Safety: the context is live for the call; the connection takes its own reference to it. Null is checked.
+    public fn client(config: borrow TlsConfig, serverName: StringView) -> Result<TlsEngine, TlsError> {
+        if (config.isServer()) {
+            return Err(TlsError.Config);
+        }
+        if (serverName.length > 253) {
+            return Err(TlsError.Config);
+        }
+        let raw = unsafe { cstls_conn_new(
+            config.handle() as *mut void,
+            0,
+            serverName.ptr,
+            serverName.length,
+            1,
+        ) } as usize;
+        if (raw == 0) {
+            return Err(TlsError.OutOfMemory);
+        }
+        return Ok(TlsEngine { conn: raw, peerClosed: false, broken: false });
+    }
+
+    /// Advances the handshake: true once it is complete, false while it waits for bytes from the peer (send
+    /// `takeOutput` first). A failure is `Verify(code)` for a certificate the configuration does not accept, else
+    /// `Handshake(code)`; the alert telling the peer why may still be in the output.
+    /// Safety: `conn` is live while `this` is.
+    public fn handshake(borrow mut this) -> Result<bool, TlsError> {
+        if (this.broken) {
+            return Err(TlsError.Closed);
+        }
+        let r = unsafe { cstls_conn_handshake(this.conn as *mut void) };
+        if (r == 1) {
+            return Ok(true);
+        }
+        if (r < 0) {
+            this.broken = true;
+            let verified = unsafe { cstls_conn_verify_result(this.conn as *mut void) };
+            let code = unsafe { cstls_take_error() };
+            if (verified != 0) {
+                return Err(TlsError.Verify(verified));
+            }
+            return Err(TlsError.Handshake(code));
+        }
+        return Ok(false);
+    }
+
+    /// Gives the engine ciphertext received from the peer; it keeps all of it.
+    /// Safety: `feed` reads exactly `bytes.length` bytes.
+    public fn feed(borrow mut this, bytes: Slice<u8>) -> Result<void, TlsError> {
+        if (bytes.length == 0) {
+            return Ok();
+        }
+        var at: usize = 0;
+        while (at < bytes.length) {
+            let rest = bytes[at..];
+            let fed = unsafe { cstls_conn_feed(this.conn as *mut void, rest.ptr, rest.length) };
+            if (fed <= 0) {
+                this.broken = true;
+                return Err(TlsError.OutOfMemory);
+            }
+            at += truncate<usize>(fed);
+        }
+        return Ok();
+    }
+
+    /// How many bytes of ciphertext wait to be sent to the peer.
+    /// Safety: `conn` is live while `this` is.
+    public fn pendingOutput(borrow this) -> usize => unsafe { cstls_conn_pending_out(this.conn as *mut void) };
+
+    /// Moves up to `out.length` bytes of ciphertext for the peer into `out`: how many.
+    /// Safety: `drain` writes at most `out.length` bytes into it.
+    public fn takeOutput(borrow mut this, out: SliceMut<u8>) -> usize {
+        if (out.length == 0) {
+            return 0;
+        }
+        return truncate<usize>(unsafe { cstls_conn_drain(this.conn as *mut void, out.ptr, out.length) });
+    }
+
+    /// Appends every byte of ciphertext waiting for the peer to `out`.
+    public fn takeAllOutput(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, TlsError> {
+        loop {
+            let pending = this.pendingOutput();
+            if (pending == 0) {
+                return Ok();
+            }
+            let at = out.length;
+            grown(out.resize(at + pending, 0))?;
+            let room = out.viewMut();
+            let n = this.takeOutput(mut room[at..]);
+            out.truncate(at + n);
+            if (n == 0) {
+                return Ok();
+            }
+        }
+    }
+
+    /// Decrypts into `buffer`: how many bytes, at least 1; 0 once the peer has closed the session cleanly
+    /// (close_notify); `null` when the engine needs more ciphertext first (`feed`). An empty `buffer` reads 0.
+    /// Safety: `read` writes at most `buffer.length` bytes into it.
+    public fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize?, TlsError> {
+        if (buffer.length == 0 || this.peerClosed) {
+            return Ok(Some(0));
+        }
+        if (this.broken) {
+            return Err(TlsError.Closed);
+        }
+        let r = unsafe { cstls_conn_read(this.conn as *mut void, buffer.ptr, buffer.length) };
+        if (r > 0) {
+            return Ok(Some(truncate<usize>(r)));
+        }
+        if (r == 0) {
+            this.peerClosed = true;
+            return Ok(Some(0));
+        }
+        if (r == -1) {
+            return Ok(null);
+        }
+        this.broken = true;
+        return Err(TlsError.Protocol(unsafe { cstls_take_error() }));
+    }
+
+    /// Encrypts all of `bytes`; the ciphertext waits in the output (`takeOutput`).
+    /// Safety: each `write` call reads only the slice it is given.
+    public fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, TlsError> {
+        if (this.broken) {
+            return Err(TlsError.Closed);
+        }
+        var at: usize = 0;
+        while (at < bytes.length) {
+            let rest = bytes[at..];
+            let r = unsafe { cstls_conn_write(this.conn as *mut void, rest.ptr, rest.length) };
+            if (r > 0) {
+                at += truncate<usize>(r);
+            } else {
+                // Memory BIOs never fill, and renegotiation is off, so a write that needs input is an error here.
+                this.broken = true;
+                return Err(TlsError.Protocol(unsafe { cstls_take_error() }));
+            }
+        }
+        return Ok();
+    }
+
+    /// Queues close_notify in the output, ending this side of the session.
+    /// Safety: `conn` is live while `this` is.
+    public fn shutdown(borrow mut this) -> Result<void, TlsError> {
+        if (this.broken) {
+            return Ok();
+        }
+        let r = unsafe { cstls_conn_shutdown(this.conn as *mut void) };
+        if (r < 0) {
+            return Err(TlsError.Protocol(unsafe { cstls_take_error() }));
+        }
+        return Ok();
+    }
+
+    /// The negotiated protocol version: `0x0303` for TLS 1.2, `0x0304` for TLS 1.3.
+    /// Safety: `conn` is live while `this` is.
+    public fn version(borrow this) -> u16 => truncate<u16>(unsafe { cstls_conn_version(this.conn as *mut void) });
+
+    /// The ALPN protocol agreed on, copied into `out`: its length, or 0 when none was.
+    /// Safety: the shim copies at most `out.length` bytes.
+    public fn alpn(borrow this, out: SliceMut<u8>) -> usize =>
+        unsafe { cstls_conn_alpn(this.conn as *mut void, out.ptr, out.length) };
+}
