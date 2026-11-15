@@ -44,6 +44,8 @@ extern "C" {
     @effects()
     fn EVP_sha256() -> *void;
     @effects()
+    fn EVP_sha384() -> *void;
+    @effects()
     fn EVP_DigestVerifyInit(
         ctx: *mut void,
         keyContext: *mut void,
@@ -85,12 +87,16 @@ extern "C" {
     public fn PEM_read_bio_PrivateKey(bio: *mut void, key: *mut void, callback: *void, arg: *mut void) -> *mut void;
 }
 
-// OpenSSL's key types (evp.h: EVP_PKEY_RSA is NID_rsaEncryption, EVP_PKEY_ED25519 NID_ED25519).
+// OpenSSL's key types (evp.h: EVP_PKEY_RSA is NID_rsaEncryption, EVP_PKEY_ED25519 NID_ED25519, EVP_PKEY_EC
+// NID_X9_62_id_ecPublicKey).
 const EVP_PKEY_RSA: i32 = 6;
 const EVP_PKEY_ED25519: i32 = 1087;
+const EVP_PKEY_EC: i32 = 408;
 
 const KIND_RSA: i32 = 1;
 const KIND_ED25519: i32 = 2;
+const KIND_EC_P256: i32 = 3;
+const KIND_EC_P384: i32 = 4;
 
 const PKS_BAD_KEY: i64 = -1;
 const PKS_NO_MEMORY: i64 = -3;
@@ -199,7 +205,7 @@ unsafe fn privateKey(key: *u8, length: usize) -> *mut void {
     return d2i_AutoPrivateKey(0 as *mut void, borrow mut at as *mut *u8, truncate<i64>(length));
 }
 
-/// 1 RSA, 2 Ed25519, -1 any other kind.
+/// 1 RSA, 2 Ed25519, 3 EC P-256, 4 EC P-384, -1 any other kind (another curve).
 /// Safety: `pkey` is a live key.
 unsafe fn kindOf(pkey: *mut void) -> i32 {
     let id = EVP_PKEY_get_base_id(pkey);
@@ -209,10 +215,59 @@ unsafe fn kindOf(pkey: *mut void) -> i32 {
     if (id == EVP_PKEY_ED25519) {
         return KIND_ED25519;
     }
+    if (id == EVP_PKEY_EC) {
+        let bits = EVP_PKEY_get_bits(pkey);
+        if (bits == 256) {
+            return KIND_EC_P256;
+        }
+        if (bits == 384) {
+            return KIND_EC_P384;
+        }
+    }
     return -1;
 }
 
-/// The kind of a PKCS #8 private key: 1 RSA, 2 Ed25519, -1 unreadable or unsupported.
+/// The digest a key signs with: SHA-256 for RSA and P-256, SHA-384 for P-384, none for Ed25519 (it hashes itself).
+/// Safety: none (OpenSSL's static digests).
+unsafe fn digestOf(kind: i32) -> *void {
+    if (kind == KIND_RSA || kind == KIND_EC_P256) {
+        return EVP_sha256();
+    }
+    if (kind == KIND_EC_P384) {
+        return EVP_sha384();
+    }
+    return 0 as *void;
+}
+
+/// ECDSA (FIPS 186-4) with SHA-256 for a P-256 key or SHA-384 for P-384: `key` is SubjectPublicKeyInfo DER and
+/// `signature` the DER ECDSA-Sig-Value X.509 and PKCS #10 carry.
+/// Safety: each pointer holds its length.
+@effects()
+unsafe fn pks_verify_ecdsa(
+    key: *u8,
+    keyLength: usize,
+    data: *u8,
+    dataLength: usize,
+    sig: *u8,
+    sigLength: usize,
+) -> i32 {
+    if (keyLength > LONG_MAX) {
+        return -1;
+    }
+    var at = key;
+    let pkey = d2i_PUBKEY(0 as *mut void, borrow mut at as *mut *u8, truncate<i64>(keyLength));
+    if (pkey.isNull()) {
+        return -1;
+    }
+    let kind = kindOf(pkey);
+    if (kind != KIND_EC_P256 && kind != KIND_EC_P384) {
+        EVP_PKEY_free(pkey);
+        return -1;
+    }
+    return verifyWith(pkey, digestOf(kind), data, dataLength, sig, sigLength);
+}
+
+/// The kind of a PKCS #8 private key: 1 RSA, 2 Ed25519, 3 EC P-256, 4 EC P-384, -1 unreadable or unsupported.
 /// Safety: `key` holds `keyLength` bytes.
 @effects()
 unsafe fn pks_key_kind(key: *u8, keyLength: usize) -> i32 {
@@ -225,8 +280,8 @@ unsafe fn pks_key_kind(key: *u8, keyLength: usize) -> i32 {
     return kind;
 }
 
-/// Signs `data`: RSA PKCS #1 v1.5 over SHA-256(data); Ed25519 over `data` itself (DKIM passes the hash, RFC 8463).
-/// The signature's length, written to `out`.
+/// Signs `data`: RSA PKCS #1 v1.5 over SHA-256(data); ECDSA over SHA-256 (P-256) or SHA-384 (P-384), as DER;
+/// Ed25519 over `data` itself (DKIM passes the hash, RFC 8463). The signature's length, written to `out`.
 /// Safety: `key` and `data` hold their lengths; `out` has room for `cap` bytes.
 @effects()
 unsafe fn pks_sign(key: *u8, keyLength: usize, data: *u8, dataLength: usize, out: *mut u8, cap: usize) -> i64 {
@@ -246,7 +301,7 @@ unsafe fn pks_sign(key: *u8, keyLength: usize, data: *u8, dataLength: usize, out
     }
     var result = PKS_FAILED;
     var length: usize = 0;
-    let digest = if (kind == KIND_RSA) EVP_sha256() else 0 as *void;
+    let digest = digestOf(kind);
     if (EVP_DigestSignInit(ctx, 0 as *mut void, digest, 0 as *mut void, pkey) == 1 &&
         EVP_DigestSign(ctx, 0 as *mut u8, borrow mut length as *mut usize, data, dataLength) == 1) {
         if (length > cap) {
@@ -283,7 +338,8 @@ unsafe fn writePrivate(pkey: *mut void, out: *mut u8, cap: usize) -> i64 {
     return length as i64;
 }
 
-/// A new key: kind 1 RSA of `bits` (1024 to 8192), kind 2 Ed25519. Writes its PKCS #8 DER; its length.
+/// A new key: kind 1 RSA of `bits` (1024 to 8192), kind 2 Ed25519, kind 3 EC P-256, kind 4 EC P-384. Writes its
+/// PKCS #8 DER; its length.
 /// Safety: `out` has room for `cap` bytes.
 @effects()
 unsafe fn pks_generate(kind: i32, bits: i32, out: *mut u8, cap: usize) -> i64 {
@@ -296,6 +352,11 @@ unsafe fn pks_generate(kind: i32, bits: i32, out: *mut u8, cap: usize) -> i64 {
         pkey = EVP_PKEY_Q_keygen(0 as *mut void, 0 as *CChar, "RSA\0".ptr as *CChar, truncate<usize>(bits));
     } else if (kind == KIND_ED25519) {
         pkey = EVP_PKEY_Q_keygen(0 as *mut void, 0 as *CChar, "ED25519\0".ptr as *CChar);
+    } else if (kind == KIND_EC_P256) {
+        // EVP_EC_gen("P-256")
+        pkey = EVP_PKEY_Q_keygen(0 as *mut void, 0 as *CChar, "EC\0".ptr as *CChar, "P-256\0".ptr as *CChar);
+    } else if (kind == KIND_EC_P384) {
+        pkey = EVP_PKEY_Q_keygen(0 as *mut void, 0 as *CChar, "EC\0".ptr as *CChar, "P-384\0".ptr as *CChar);
     } else {
         return PKS_BAD_KEY;
     }
@@ -307,7 +368,8 @@ unsafe fn pks_generate(kind: i32, bits: i32, out: *mut u8, cap: usize) -> i64 {
     return result;
 }
 
-/// The public half as DKIM publishes it: SubjectPublicKeyInfo DER for RSA, the raw 32 bytes for Ed25519. Its length.
+/// The public half: SubjectPublicKeyInfo DER for RSA and EC (DKIM's p=, X.509's), the raw 32 bytes for Ed25519.
+/// Its length.
 /// Safety: `key` holds `keyLength` bytes; `out` has room for `cap` bytes.
 @effects()
 unsafe fn pks_public(key: *u8, keyLength: usize, out: *mut u8, cap: usize) -> i64 {
@@ -317,7 +379,7 @@ unsafe fn pks_public(key: *u8, keyLength: usize, out: *mut u8, cap: usize) -> i6
     }
     let kind = kindOf(pkey);
     var result = PKS_BAD_KEY;
-    if (kind == KIND_RSA) {
+    if (kind == KIND_RSA || kind == KIND_EC_P256 || kind == KIND_EC_P384) {
         let length = i2d_PUBKEY(pkey, 0 as *mut *mut u8);
         if (length <= 0) {
             result = PKS_FAILED;

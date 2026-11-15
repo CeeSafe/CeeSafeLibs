@@ -26,6 +26,10 @@ fn keyErrorOf(code: i64) -> KeyError {
 public enum KeyKind {
     Rsa,
     Ed25519,
+    /// ECDSA on NIST P-256 (secp256r1), signing with SHA-256.
+    EcP256,
+    /// ECDSA on NIST P-384 (secp384r1), signing with SHA-384.
+    EcP384,
 }
 
 /// The largest key, public key or signature the shim writes: an 8192-bit RSA key's PKCS #8 DER is under 5 KB.
@@ -60,7 +64,12 @@ public struct PrivateKey {
         }
         var bytes = Vector<u8>.create();
         grown(bytes.extend(der))?;
-        return Ok(PrivateKey { bytes: bytes, kind: if (code == 1) KeyKind.Rsa else KeyKind.Ed25519 });
+        let kind =
+            if (code == 1) KeyKind.Rsa
+                else if (code == 2) KeyKind.Ed25519
+                else if (code == 3) KeyKind.EcP256
+                else KeyKind.EcP384;
+        return Ok(PrivateKey { bytes: bytes, kind: kind });
     }
 
     /// A PEM private key (PKCS #8 `PRIVATE KEY`, or `RSA PRIVATE KEY`), as from another server or openssl.
@@ -74,13 +83,15 @@ public struct PrivateKey {
         return PrivateKey.fromDer(der.view());
     }
 
-    /// A new key: RSA of `bits` (2048 is DKIM's usual size; 1024 is the least RFC 8301 allows), or Ed25519 (`bits`
-    /// is ignored).
+    /// A new key: RSA of `bits` (2048 is DKIM's usual size; 1024 is the least RFC 8301 allows), or Ed25519, P-256 or
+    /// P-384 (`bits` is ignored).
     /// Safety: the shim writes at most `KEY_BUFFER` bytes into the buffer.
     public fn generate(kind: KeyKind, bits: u32) -> Result<PrivateKey, KeyError> {
         let k = match (kind) {
             KeyKind.Rsa => 1,
             KeyKind.Ed25519 => 2,
+            KeyKind.EcP256 => 3,
+            KeyKind.EcP384 => 4,
         };
         var der = Vector<u8>.create();
         grown(der.resize(KEY_BUFFER, 0))?;
@@ -95,11 +106,14 @@ public struct PrivateKey {
 
     public fn isRsa(borrow this) -> bool => match (this.kind) {
         KeyKind.Rsa => true,
-        KeyKind.Ed25519 => false,
+        _ => false,
     };
 
-    /// The public key as DKIM's `p=` holds it (before base64): SubjectPublicKeyInfo DER for RSA, the raw 32 bytes
-    /// for Ed25519.
+    /// Its kind.
+    public fn keyKind(borrow this) -> KeyKind => this.kind;
+
+    /// The public key: SubjectPublicKeyInfo DER for RSA and EC (DKIM's `p=` before base64, X.509's), the raw 32
+    /// bytes for Ed25519.
     /// Safety: as `fromPem`.
     public fn publicKey(borrow this, out: borrow mut Vector<u8>) -> Result<void, KeyError> {
         let key = this.bytes.view();
@@ -109,8 +123,8 @@ public struct PrivateKey {
         return written(out, code);
     }
 
-    /// Signs `data`: RSA PKCS #1 v1.5 over its SHA-256, or Ed25519 over `data` itself (DKIM's ed25519-sha256 passes
-    /// the SHA-256 hash as `data`, RFC 8463).
+    /// Signs `data`: RSA PKCS #1 v1.5 over its SHA-256; ECDSA over its SHA-256 (P-256) or SHA-384 (P-384), as a DER
+    /// ECDSA-Sig-Value; or Ed25519 over `data` itself (DKIM's ed25519-sha256 passes the SHA-256 hash, RFC 8463).
     /// Safety: as `fromPem`.
     public fn sign(borrow this, data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, KeyError> {
         let key = this.bytes.view();
@@ -169,6 +183,14 @@ public struct Signatures {
     public fn verifyEd25519(key: Slice<u8>, data: Slice<u8>, signature: Slice<u8>) -> Verdict =>
         verdictOf(
             unsafe { pks_verify_ed25519(key.ptr, key.length, data.ptr, data.length, signature.ptr, signature.length) },
+        );
+
+    /// Whether `signature` (DER ECDSA-Sig-Value) is `key`'s ECDSA signature of `data`: SHA-256 for a P-256 key,
+    /// SHA-384 for P-384. `key` is SubjectPublicKeyInfo DER.
+    /// Safety: as `verifyRsaSha256`.
+    public fn verifyEcdsa(key: Slice<u8>, data: Slice<u8>, signature: Slice<u8>) -> Verdict =>
+        verdictOf(
+            unsafe { pks_verify_ecdsa(key.ptr, key.length, data.ptr, data.length, signature.ptr, signature.length) },
         );
 }
 

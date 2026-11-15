@@ -118,3 +118,53 @@ fn isBadKey(r: Result<PrivateKey, KeyError>) -> bool => match (r) {
     Err(KeyError.BadKey) => true,
     Err(_) => false,
 };
+
+// ECDSA. Its signatures are randomized, so openssl's are verified instead of compared (tests/fixtures/sign-ec256.pem
+// and sign-ec384.pem, PKCS #8, their public keys ec256.spki.der and ec384.spki.der, and signatures made by
+//     openssl dgst -sha256 -sign sign-ec256.pem -out ec256.sig data.bin
+//     openssl dgst -sha384 -sign sign-ec384.pem -out ec384.sig data.bin
+// ), and ours are verified with the public key openssl wrote for the same private key.
+
+fn ecdsaRoundTrip(pemName: StringView, spkiName: StringView, sigName: StringView, kind: KeyKind) -> Result<void, TestFailure> {
+    let data = fixture("data.bin");
+    let spki = fixture(spkiName);
+    Check.isTrue(good(Signatures.verifyEcdsa(spki.view(), data.view(), fixture(sigName).view())), "openssl's signature")?;
+    let pem = fixture(pemName);
+    let key = PrivateKey.fromPem(pem.view())!;
+    Check.isTrue(key.keyKind() == kind, "the curve")?;
+    var sig = Vector<u8>.create();
+    key.sign(data.view(), mut sig)!;
+    Check.isTrue(good(Signatures.verifyEcdsa(spki.view(), data.view(), sig.view())), "ours, with openssl's public key")?;
+    var mine = Vector<u8>.create();
+    key.publicKey(mut mine)!;
+    Check.isTrue(sameBytes(mine.view(), spki.view()), "the same SubjectPublicKeyInfo as openssl's")?;
+    var changed = Vector<u8>.create();
+    changed.extend(data.view())!;
+    changed[0] = changed[0] ^ 1;
+    return Check.isTrue(bad(Signatures.verifyEcdsa(spki.view(), changed.view(), sig.view())), "changed data");
+}
+
+@test
+fn ecdsaP256AndP384() -> Result<void, TestFailure> {
+    ecdsaRoundTrip("sign-ec256.pem", "ec256.spki.der", "ec256.sig", KeyKind.EcP256)?;
+    return ecdsaRoundTrip("sign-ec384.pem", "ec384.spki.der", "ec384.sig", KeyKind.EcP384);
+}
+
+@test
+fn generatesEcKeys() -> Result<void, TestFailure> {
+    let data = fixture("data.bin");
+    for (kind in [KeyKind.EcP256, KeyKind.EcP384]) {
+        let key = PrivateKey.generate(kind, 0)!;
+        Check.isTrue(key.keyKind() == kind && !key.isRsa(), "its kind")?;
+        var sig = Vector<u8>.create();
+        key.sign(data.view(), mut sig)!;
+        var spki = Vector<u8>.create();
+        key.publicKey(mut spki)!;
+        Check.isTrue(good(Signatures.verifyEcdsa(spki.view(), data.view(), sig.view())), "verifies")?;
+        let again = PrivateKey.fromDer(key.der())!;
+        Check.isTrue(again.keyKind() == kind, "read back from its DER")?;
+    }
+    // an RSA public key is not an ECDSA one
+    let rsa = fixture("rsa.spki.der");
+    return Check.isFalse(good(Signatures.verifyEcdsa(rsa.view(), data.view(), fixture("ec256.sig").view())), "RSA key");
+}
