@@ -39,6 +39,9 @@ var session = await TlsStream.accept(tcp, server)?;
 - **Also available.** ALPN (`alpn([...])` on either side), client certificates (`verifyPeer(true)` plus `trustPem` on
   a server, `useCertificate` on a client), `minVersion(TlsVersion.Tls13)`, and `version()`, `alpn()`, `serverName()`
   and `hasPeerCertificate()` on a session.
+- **Pinning.** `TlsEngine.peerCertificate(mut der)` gives the peer's certificate as DER, and
+  `TlsCertificates.der(pemOrDer, mut der)` turns a PEM (or DER) file's first certificate into DER, so that a client
+  can accept exactly one certificate (with `verifyPeer(false)`), as SQL Server's `ServerCertificate` does.
 - **DANE** (RFC 6698; RFC 7672 for SMTP). `enableDane()` once on a client configuration, then
   `TlsStream.connectDaneWithin(tcp, config, mxName, records, ms)` authenticates the server by its TLSA records (`Tlsa`,
   `Tlsa.parse(rdata)`, `usableForSmtp()`) instead of by trusted roots. DANE-EE records skip name checks, and

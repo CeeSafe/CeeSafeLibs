@@ -158,6 +158,10 @@ extern "C" {
     @effects()
     fn X509_free(x509: *mut void);
     @effects()
+    fn i2d_X509(x509: *mut void, out: *mut *mut u8) -> i32;
+    @effects(alloc)
+    fn d2i_X509(x509: *mut void, input: *mut *u8, length: i64) -> *mut void;
+    @effects()
     fn X509_check_private_key(x509: *mut void, key: *mut void) -> i32;
     @effects(alloc)
     fn X509_STORE_add_cert(store: *mut void, x509: *mut void) -> i32;
@@ -1016,4 +1020,57 @@ unsafe fn cstls_error_text(code: u64, out: *mut u8, capacity: usize) -> usize {
 unsafe fn cstls_verify_text(code: i64, out: *mut u8, capacity: usize) -> usize {
     let text = X509_verify_cert_error_string(code);
     return copyOut(text as *u8, cLength(text), out, capacity);
+}
+
+/// The DER encoding of `cert` into `out` when it fits in `capacity`: its length either way, -1 if it has none.
+/// Safety: `cert` is a live X509; `out` has room for `capacity` bytes.
+@effects()
+unsafe fn derOf(cert: *mut void, out: *mut u8, capacity: usize) -> i64 {
+    let length = i2d_X509(cert, 0 as *mut *mut u8);
+    if (length <= 0) {
+        return -1;
+    }
+    if (truncate<usize>(length) <= capacity) {
+        var cursor = out;
+        i2d_X509(cert, borrow mut cursor as *mut *mut u8);
+    }
+    return length as i64;
+}
+
+/// The DER bytes of the peer's certificate into `out` (see `derOf`); 0 when the peer sent none.
+/// Safety: `conn` is live; `out` has room for `capacity` bytes.
+@effects()
+unsafe fn cstls_conn_peer_der(conn: *mut void, out: *mut u8, capacity: usize) -> i64 {
+    let cert = SSL_get0_peer_certificate(connOf(conn).ssl);
+    if (cert.isNull()) {
+        return 0;
+    }
+    return derOf(cert, out, capacity);
+}
+
+/// The first certificate of `bytes`, PEM or DER, as DER into `out` (see `derOf`); -1 when `bytes` holds none.
+/// Safety: `bytes` is readable for `length` bytes; `out` has room for `capacity` bytes.
+@effects(alloc)
+unsafe fn cstls_cert_der(bytes: *u8, length: usize, out: *mut u8, capacity: usize) -> i64 {
+    ERR_clear_error();
+    if (length > 0x7FFFFFFF) {
+        return -1;
+    }
+    var cert = 0 as *mut void;
+    let bio = BIO_new_mem_buf(bytes as *void, truncate<i32>(length));
+    if (!bio.isNull()) {
+        cert = PEM_read_bio_X509(bio, 0 as *mut void, 0 as *void, 0 as *mut void);
+        BIO_free(bio);
+    }
+    if (cert.isNull()) {
+        var cursor = bytes;
+        cert = d2i_X509(0 as *mut void, borrow mut cursor as *mut *u8, truncate<i64>(length));
+    }
+    ERR_clear_error();
+    if (cert.isNull()) {
+        return -1;
+    }
+    let n = derOf(cert, out, capacity);
+    X509_free(cert);
+    return n;
 }

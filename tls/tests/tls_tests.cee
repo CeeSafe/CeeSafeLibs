@@ -180,6 +180,8 @@ struct RoundTrip {
     reply: [u8; 17];
     version: u16;
     peerCertificate: bool;
+    /// The server's certificate as the engine saw it (DER).
+    peerDer: Vector<u8>;
 }
 
 /// Server side: reads everything the client sends, then answers with its count, checksum and the SNI length.
@@ -244,7 +246,7 @@ fn roundTripLargePayload() -> Result<void, TestFailure> {
     let server = serverConfig("localhost");
     let client = testClient();
     let payload = pattern(3 * 1024 * 1024 + 17);
-    var seen = RoundTrip { reply: [0u8; 17], version: 0, peerCertificate: false };
+    var seen = RoundTrip { reply: [0u8; 17], version: 0, peerCertificate: false, peerDer: Vector<u8>.create() };
     let outcome = Async.run(roundTrip(server, client, payload.view(), mut seen));
     expectOk(borrow outcome, "the exchange succeeds")?;
     let reply = seen.reply;
@@ -977,6 +979,7 @@ async fn engineSendAndSummarize(
         await feedSome(mut engine, tcp)?;
     }
     seen.version = engine.version();
+    let _ = engine.peerCertificate(mut seen.peerDer)?;
     engine.write(payload)?;
     engine.shutdown()?;
     await sendQueued(mut engine, tcp)?;
@@ -1027,7 +1030,7 @@ fn engineRoundTripsWithAStream() -> Result<void, TestFailure> {
     let server = serverConfig("localhost");
     let client = testClient();
     let payload = pattern(1024 * 1024 + 5);
-    var seen = RoundTrip { reply: [0u8; 17], version: 0, peerCertificate: false };
+    var seen = RoundTrip { reply: [0u8; 17], version: 0, peerCertificate: false, peerDer: Vector<u8>.create() };
     var result: Result<void, TlsError> = Err(TlsError.Closed);
     let outcome = Async.run(engineRoundTrip(server, client, "localhost", payload.view(), mut seen, mut result));
     expectOk(borrow outcome, "the scenario runs")?;
@@ -1036,6 +1039,11 @@ fn engineRoundTripsWithAStream() -> Result<void, TestFailure> {
     Check.equalU64(payload.length as u64, readU64(reply[..], 0))?;
     Check.equalU64(checksum(payload.view()), readU64(reply[..], 8))?;
     Check.equalU64(9, reply[16] as u64)?; // the server saw SNI "localhost"
+    // The certificate the engine saw is the server's, byte for byte (pinning compares them so).
+    var pinned = Vector<u8>.create();
+    TlsCertificates.der(fixture("localhost.pem").view(), mut pinned)!;
+    Check.isTrue(seen.peerDer.length > 100 && seen.peerDer.view() == pinned.view(), "the peer's certificate")?;
+    Check.isTrue(TlsCertificates.der("not a certificate".bytes(), mut pinned).isErr(), "garbage refused")?;
     return Check.equalU64(0x0304, seen.version as u64);
 }
 
@@ -1043,7 +1051,7 @@ fn engineRoundTripsWithAStream() -> Result<void, TestFailure> {
 fn engineRejectsWrongHostName() -> Result<void, TestFailure> {
     let server = serverConfig("localhost");
     let client = testClient();
-    var seen = RoundTrip { reply: [0u8; 17], version: 0, peerCertificate: false };
+    var seen = RoundTrip { reply: [0u8; 17], version: 0, peerCertificate: false, peerDer: Vector<u8>.create() };
     var result: Result<void, TlsError> = Ok();
     let outcome = Async.run(engineRoundTrip(server, client, "example.org", "x".bytes(), mut seen, mut result));
     expectOk(borrow outcome, "the scenario runs")?;

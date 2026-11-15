@@ -184,6 +184,27 @@ public struct TlsEngine {
         return Ok();
     }
 
+    /// The peer's certificate as DER, put in `out` (replacing what it held); false when the peer sent none (a
+    /// client that sent no certificate, or before the handshake). Compare it with a pinned one, as SQL Server's
+    /// `ServerCertificate` does; `TlsCertificates.der` turns a PEM file into DER.
+    /// Safety: the connection is live, and `out` has the room the first call reported.
+    public fn peerCertificate(borrow this, out: borrow mut Vector<u8>) -> Result<bool, TlsError> {
+        out.clear();
+        let length = unsafe { cstls_conn_peer_der(this.conn as *mut void, 0 as *mut u8, 0) };
+        if (length == 0) {
+            return Ok(false);
+        }
+        if (length < 0) {
+            return Err(TlsError.Certificate);
+        }
+        if (out.resize(truncate<usize>(length), 0).isErr()) {
+            return Err(TlsError.OutOfMemory);
+        }
+        let room = out.viewMut();
+        let _ = unsafe { cstls_conn_peer_der(this.conn as *mut void, room.ptr, room.length) };
+        return Ok(true);
+    }
+
     /// The negotiated protocol version: `0x0303` for TLS 1.2, `0x0304` for TLS 1.3.
     /// Safety: `conn` is live while `this` is.
     public fn version(borrow this) -> u16 => truncate<u16>(unsafe { cstls_conn_version(this.conn as *mut void) });
@@ -192,4 +213,24 @@ public struct TlsEngine {
     /// Safety: the shim copies at most `out.length` bytes.
     public fn alpn(borrow this, out: SliceMut<u8>) -> usize =>
         unsafe { cstls_conn_alpn(this.conn as *mut void, out.ptr, out.length) };
+}
+
+/// Certificates outside a session.
+public struct TlsCertificates {
+    /// The first certificate of `bytes` (PEM, with its `-----BEGIN CERTIFICATE-----` line, or DER) as DER, put in
+    /// `out`. `Certificate` when `bytes` holds none.
+    /// Safety: OpenSSL reads `bytes` and writes at most the room `out` was given, during the calls only.
+    public fn der(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, TlsError> {
+        out.clear();
+        let length = unsafe { cstls_cert_der(bytes.ptr, bytes.length, 0 as *mut u8, 0) };
+        if (length < 0) {
+            return Err(TlsError.Certificate);
+        }
+        if (out.resize(truncate<usize>(length), 0).isErr()) {
+            return Err(TlsError.OutOfMemory);
+        }
+        let room = out.viewMut();
+        let _ = unsafe { cstls_cert_der(bytes.ptr, bytes.length, room.ptr, room.length) };
+        return Ok();
+    }
 }
