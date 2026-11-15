@@ -107,9 +107,10 @@ impl FromJson for Server {
 }
 ```
 
-`fromJson` is written `public`: ceesafec 0.47 refuses a static function of an impl in another package than the
-interface's when the json package's generic code calls it (`Decode.vector<Server>`), although the specification says
-`public` has no effect there (repros/static-impl-visibility). `toJson` needs nothing.
+`fromJson` is written `public` here for ceesafec 0.48.2 and earlier, which refuse a static function of an impl in
+another package than the interface's when the json package's generic code calls it (`Decode.vector<Server>`). From
+0.48.3 (CeeSafe's F16 fix) it is as visible as the interface, as the specification says, and `public` changes
+nothing (repros/static-impl-visibility). `toJson` needs nothing.
 
 A decoding error names where it is: `$.servers[1].port: expected u16, found string` (`DecodeError.message()`;
 `reason` is a `DecodeReason`). The library implements both interfaces for the integer types (range-checked on

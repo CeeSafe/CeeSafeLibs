@@ -1,3 +1,5 @@
+// Fixed in ceesafec 0.48.3 (finding F17): the interpreter drops it with a work list and prints both lines.
+//
 // ceesafec 0.47.0: dropping a tree 100000 levels deep (an enum nested through a Vector) crashes `ceesafec run --interp`
 // with SIGSEGV (exit status 139) and no message; the compiled program (`ceesafec build && ./out/deepdrop`) drops it
 // and prints "built" then "dropped".

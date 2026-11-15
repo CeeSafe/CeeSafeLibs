@@ -1,3 +1,5 @@
+// Fixed in ceesafec 0.48.3 (CeeSafe commit 747c3c30, finding F16): this now checks.
+//
 // ceesafec 0.47.0: a static function of an `impl I for T` written in another package than `I`'s must be `public`, or
 // generic code in `I`'s package that calls it through a bound does not check.
 //

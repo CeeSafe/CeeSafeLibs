@@ -1,3 +1,5 @@
+// Fixed in ceesafec 0.48.2 (CeeSafe commit a03ab34e, finding F15): `replace(mut out, …)` now checks.
+//
 // ceesafec 0.47.0: `replace` (and `swap`) cannot take the referent of a `borrow mut` parameter.
 //
 // `ceesafec check` in this directory reports, for `take`:
