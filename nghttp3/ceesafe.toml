@@ -1,0 +1,9 @@
+[package]
+name = "nghttp3"
+version = "1.19.0"
+kind = "library"
+# HTTP/3 and QPACK: nghttp3 1.19.0 as released (upstream/), compiled through one generated wrapper per source
+# (c/vendor/, tools/vendor_quic.py), and the shim web_http3 (CeeSafe.Web) binds to (c/h3_shim.c). A version change
+# is a run of tools/vendor_quic.py, never an edit by hand.
+c = ["c/h3_shim.c", "c/vendor/lib_nghttp3_balloc.c", "c/vendor/lib_nghttp3_buf.c", "c/vendor/lib_nghttp3_callbacks.c", "c/vendor/lib_nghttp3_conn.c", "c/vendor/lib_nghttp3_conv.c", "c/vendor/lib_nghttp3_debug.c", "c/vendor/lib_nghttp3_err.c", "c/vendor/lib_nghttp3_frame.c", "c/vendor/lib_nghttp3_gaptr.c", "c/vendor/lib_nghttp3_http.c", "c/vendor/lib_nghttp3_idtr.c", "c/vendor/lib_nghttp3_ksl.c", "c/vendor/lib_nghttp3_map.c", "c/vendor/lib_nghttp3_mem.c", "c/vendor/lib_nghttp3_objalloc.c", "c/vendor/lib_nghttp3_opl.c", "c/vendor/lib_nghttp3_pq.c", "c/vendor/lib_nghttp3_qpack.c", "c/vendor/lib_nghttp3_qpack_huffman.c", "c/vendor/lib_nghttp3_qpack_huffman_data.c", "c/vendor/lib_nghttp3_range.c", "c/vendor/lib_nghttp3_ratelim.c", "c/vendor/lib_nghttp3_rcbuf.c", "c/vendor/lib_nghttp3_ringbuf.c", "c/vendor/lib_nghttp3_settings.c", "c/vendor/lib_nghttp3_str.c", "c/vendor/lib_nghttp3_stream.c", "c/vendor/lib_nghttp3_tnode.c", "c/vendor/lib_nghttp3_unreachable.c", "c/vendor/lib_nghttp3_vec.c", "c/vendor/lib_nghttp3_version.c", "c/vendor/lib_sfparse_sfparse.c"]
+include-dirs = ["upstream/config", "upstream/lib/includes"]
