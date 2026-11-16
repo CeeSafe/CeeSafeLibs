@@ -1,0 +1,2 @@
+// nghttp3 as a CeeSafe package: its C only (ceesafe.toml's `c`). The CeeSafe API over it is CeeSafe.Web's
+// (web_quic, web_http3), which declares the shim's functions it calls.
