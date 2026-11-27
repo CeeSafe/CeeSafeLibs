@@ -546,3 +546,1144 @@ fn interleave(data: Slice<u8>, version: usize, e: usize) -> Vector<u8>? {
     }
     return Some(out);
 }
+
+// ---- Decoding -------------------------------------------------------------------------------------------------------
+// A code's modules back to its bytes (the format information's nearest valid word, the mask taken off, the codewords
+// read in the encoder's order, the blocks put back together and each corrected by Reed-Solomon: Berlekamp-Massey,
+// Chien and Forney), and a grayscale image to its modules (a local threshold, the three finder patterns found by their
+// 1:1:3:1:1 runs as ZXing finds them, the version from their distance, the alignment pattern near where it should be,
+// and each module read through the perspective those four points give). Numeric, alphanumeric, byte and kanji
+// segments; ECI and structured append are read past.
+
+/// What a QR code held.
+public struct QrDecoded {
+    /// The data: the byte segments as they are, numeric and alphanumeric as their ASCII characters, kanji as Shift JIS.
+    public data: Vector<u8>;
+    public version: u32;
+    public ecc: Ecc;
+}
+
+/// Reads QR codes (ISO/IEC 18004).
+///
+/// ```cee
+/// // A camera frame's luminance (Android's Y plane): `stride` bytes from one row to the next.
+/// match (QrReader.read(frame, width, height, stride)) { Some(code) => use(code.data.view()), null => {} }
+/// ```
+public struct QrReader {
+    /// The QR code in a grayscale image, `luminance` 0 (black) to 255 (white), `width` by `height`, each row `stride`
+    /// bytes after the one before (`stride` >= `width`): dark modules on light, at any angle, seen in perspective.
+    /// Null when no code is found or it cannot be read.
+    public fn read(luminance: Slice<u8>, width: usize, height: usize, stride: usize) -> QrDecoded? {
+        if (width < 21 || height < 21 || stride < width || luminance.length < stride * (height - 1) + width) {
+            return null;
+        }
+        let image = Binary.of(luminance, width, height, stride)?;
+        var finders = Vector<Finder>.create();
+        findFinders(borrow image, mut finders);
+        let three = chooseThree(finders.view())?;
+        return readAt(borrow image, three);
+    }
+
+    /// A code's modules, `size` by `size`, row by row (dark true), as `QrCode.dark` gives them. Null when they are
+    /// no code, or too damaged to correct.
+    public fn readModules(modules: Slice<bool>, size: usize) -> QrDecoded? {
+        if (size < 21 || size > 177 || size % 4 != 1 || modules.length < size * size) {
+            return null;
+        }
+        return decodeModules(modules, size);
+    }
+}
+
+// -- GF(256) of x^8 + x^4 + x^3 + x^2 + 1, as the encoder's.
+
+struct Gf {
+    exp: [u8; 512];
+    log: [u8; 256];
+}
+
+fn gfTables() -> Gf {
+    var g = Gf { exp: [0u8; 512], log: [0u8; 256] };
+    var x: u32 = 1;
+    for (i in 0usize..255) {
+        g.exp[i] = truncate<u8>(x);
+        g.log[x as usize] = truncate<u8>(i);
+        x = x << 1;
+        if ((x & 0x100) != 0) {
+            x = x ^ 0x11D;
+        }
+    }
+    for (i in 255usize..512) {
+        g.exp[i] = g.exp[i - 255];
+    }
+    return g;
+}
+
+fn gmul(g: borrow Gf, a: u8, b: u8) -> u8 {
+    if (a == 0 || b == 0) {
+        return 0;
+    }
+    return g.exp[(g.log[a as usize] as usize) + (g.log[b as usize] as usize)];
+}
+
+fn gdiv(g: borrow Gf, a: u8, b: u8) -> u8 {
+    if (a == 0) {
+        return 0;
+    }
+    return g.exp[(g.log[a as usize] as usize) + 255 - (g.log[b as usize] as usize)];
+}
+
+/// α to the power `-j`.
+fn ginv(g: borrow Gf, j: usize) -> u8 => g.exp[(255 - j % 255) % 255];
+
+/// Corrects a block of codewords (data then `nsym` error correction codewords, the first the highest power) in
+/// place; false when it has more errors than it can correct.
+fn correct(g: borrow Gf, cw: SliceMut<u8>, nsym: usize) -> bool {
+    let n = cw.length;
+    var synd = [0u8; 30];
+    var any = false;
+    for (i in 0usize..nsym) {
+        var s: u8 = 0;
+        let a = g.exp[i];
+        for (c in cw) {
+            s = gmul(g, s, a) ^ c;
+        }
+        synd[i] = s;
+        any = any || s != 0;
+    }
+    if (!any) {
+        return true;
+    }
+    // Berlekamp-Massey: the error locator Λ.
+    var lambda = [0u8; 32];
+    var prev = [0u8; 32];
+    lambda[0] = 1;
+    prev[0] = 1;
+    var degree: usize = 0;
+    var shift: usize = 1;
+    var last: u8 = 1;
+    for (r in 0usize..nsym) {
+        var d = synd[r];
+        for (i in 1usize..degree + 1) {
+            d = d ^ gmul(g, lambda[i], synd[r - i]);
+        }
+        if (d == 0) {
+            shift += 1;
+        } else {
+            let before = lambda;
+            let coef = gdiv(g, d, last);
+            for (i in 0usize..32 - shift) {
+                lambda[i + shift] = lambda[i + shift] ^ gmul(g, coef, prev[i]);
+            }
+            if (2 * degree <= r) {
+                degree = r + 1 - degree;
+                prev = before;
+                last = d;
+                shift = 1;
+            } else {
+                shift += 1;
+            }
+        }
+    }
+    if (degree == 0 || 2 * degree > nsym) {
+        return false;
+    }
+    // Chien: the positions (counted from the last codeword) where Λ(α^-j) is 0.
+    var spots = [0usize; 16];
+    var found: usize = 0;
+    for (j in 0usize..n) {
+        let x = ginv(g, j);
+        var v: u8 = 0;
+        var k = degree + 1;
+        while (k > 0) {
+            k -= 1;
+            v = gmul(g, v, x) ^ lambda[k];
+        }
+        if (v == 0) {
+            if (found == 16) {
+                return false;
+            }
+            spots[found] = j;
+            found += 1;
+        }
+    }
+    if (found != degree) {
+        return false;
+    }
+    // Forney, the first root α^0: e = X Ω(X^-1) / Λ'(X^-1), Ω = S Λ mod x^nsym.
+    var omega = [0u8; 30];
+    for (i in 0usize..nsym) {
+        var v: u8 = 0;
+        for (k in 0usize..(if (i < degree) i else degree) + 1) {
+            v = v ^ gmul(g, lambda[k], synd[i - k]);
+        }
+        omega[i] = v;
+    }
+    for (f in 0usize..found) {
+        let j = spots[f];
+        let xinv = ginv(g, j);
+        var top: u8 = 0;
+        var k = nsym;
+        while (k > 0) {
+            k -= 1;
+            top = gmul(g, top, xinv) ^ omega[k];
+        }
+        // Λ'(x): the odd terms, each one power lower.
+        var bottom: u8 = 0;
+        var power: u8 = 1;
+        let square = gmul(g, xinv, xinv);
+        var odd: usize = 1;
+        while (odd <= degree) {
+            bottom = bottom ^ gmul(g, lambda[odd], power);
+            power = gmul(g, power, square);
+            odd += 2;
+        }
+        if (bottom == 0) {
+            return false;
+        }
+        let magnitude = gmul(g, g.exp[j % 255], gdiv(g, top, bottom));
+        cw[n - 1 - j] = cw[n - 1 - j] ^ magnitude;
+    }
+    for (i in 0usize..nsym) {
+        var s: u8 = 0;
+        let a = g.exp[i];
+        for (c in cw) {
+            s = gmul(g, s, a) ^ c;
+        }
+        if (s != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// -- Modules to bytes.
+
+fn eccOfFormatBits(b: u32) -> Ecc => match (b) {
+    1 => Ecc.Low,
+    0 => Ecc.Medium,
+    3 => Ecc.Quartile,
+    _ => Ecc.High,
+};
+
+fn formatWord(data: u32) -> u32 {
+    var rem = data;
+    for (i in 0..10) {
+        rem = (rem << 1) ^ ((rem >> 9) * 0x537);
+    }
+    return ((data << 10) | rem) ^ 0x5412;
+}
+
+fn ones(v: u32) -> u32 {
+    var n: u32 = 0;
+    var x = v;
+    while (x != 0) {
+        n += x & 1;
+        x = x >> 1;
+    }
+    return n;
+}
+
+/// The format information (the level's bits and the mask) nearest either copy read, within three bits; -1 for none.
+fn readFormat(modules: Slice<bool>, size: usize) -> i32 {
+    var a: u32 = 0;
+    var b: u32 = 0;
+    for (i in 0usize..15) {
+        // As drawFormatBits places bit i: the first copy around the top left finder, the second split between the
+        // other two.
+        let x = if (i < 8) 8usize else if (i == 8) 7usize else 14 - i;
+        let y = if (i < 6) i else if (i < 8) i + 1 else 8usize;
+        if (modules[y * size + x]) {
+            a = a | (1u32 << truncate<u32>(i));
+        }
+        let x2 = if (i < 8) size - 1 - i else 8usize;
+        let y2 = if (i < 8) 8usize else size - 15 + i;
+        if (modules[y2 * size + x2]) {
+            b = b | (1u32 << truncate<u32>(i));
+        }
+    }
+    var best: i32 = -1;
+    var bestDistance: u32 = 4;
+    for (data in 0u32..32) {
+        let word = formatWord(data);
+        let d = ones(word ^ a).min(ones(word ^ b));
+        if (d < bestDistance) {
+            bestDistance = d;
+            best = truncate<i32>(data);
+        }
+    }
+    return best;
+}
+
+fn masked(mask: u32, x: usize, y: usize) -> bool => match (mask) {
+    0 => (x + y) % 2 == 0,
+    1 => y % 2 == 0,
+    2 => x % 3 == 0,
+    3 => (x + y) % 3 == 0,
+    4 => (x / 3 + y / 2) % 2 == 0,
+    5 => x * y % 2 + x * y % 3 == 0,
+    6 => (x * y % 2 + x * y % 3) % 2 == 0,
+    _ => ((x + y) % 2 + x * y % 3) % 2 == 0,
+};
+
+fn decodeModules(modules: Slice<bool>, size: usize) -> QrDecoded? {
+    let version = (size - 17) / 4;
+    let format = readFormat(modules, size);
+    if (format < 0) {
+        return null;
+    }
+    let ecc = eccOfFormatBits(truncate<u32>(format) >> 3);
+    let mask = truncate<u32>(format) & 7;
+    // The function patterns, drawn as the encoder draws them: the modules that are not data.
+    var shape = QrCode {
+        version: truncate<u32>(version),
+        size: size,
+        ecc: ecc,
+        mask: 0,
+        modules: falses(size * size)?,
+        function: falses(size * size)?,
+    };
+    shape.drawFunctionPatterns();
+    let e = eccIndex(ecc);
+    let raw = rawDataModules(version) / 8;
+    var all = bytesFor(raw)?;
+    var byte: u8 = 0;
+    var bits: usize = 0;
+    var right = size - 1;
+    while (right >= 1) {
+        if (right == 6) {
+            right = 5;
+        }
+        for (vert in 0usize..size) {
+            for (j in 0usize..2) {
+                let x = right - j;
+                let upward = ((right + 1) & 2) == 0;
+                let y = if (upward) size - 1 - vert else vert;
+                if (!shape.function[y * size + x] && all.length < raw) {
+                    let dark = modules[y * size + x] != masked(mask, x, y);
+                    byte = (byte << 1) | (if (dark) 1u8 else 0u8);
+                    bits += 1;
+                    if (bits == 8) {
+                        if (all.push(byte) is Err(_)) {
+                            return null;
+                        }
+                        byte = 0;
+                        bits = 0;
+                    }
+                }
+            }
+        }
+        if (right < 2) {
+            break;
+        }
+        right -= 2;
+    }
+    if (all.length < raw) {
+        return null;
+    }
+    // The blocks back from their interleaving, each corrected; their data in order.
+    let blocks = BLOCKS[e * 41 + version] as usize;
+    let eccLength = ECC_PER_BLOCK[e * 41 + version] as usize;
+    let shortBlocks = blocks - raw % blocks;
+    let shortLength = raw / blocks;
+    let width = shortLength + 1;
+    var table = zeros(blocks * width)?;
+    var k: usize = 0;
+    for (i in 0usize..width) {
+        for (j in 0usize..blocks) {
+            if (i != shortLength - eccLength || j >= shortBlocks) {
+                table[j * width + i] = all[k];
+                k += 1;
+            }
+        }
+    }
+    let g = gfTables();
+    var data = bytesFor(dataCodewords(version, e))?;
+    var block = [0u8; 160];
+    for (j in 0usize..blocks) {
+        let dataLength = shortLength - eccLength + (if (j < shortBlocks) 0 else 1);
+        for (i in 0usize..dataLength) {
+            block[i] = table[j * width + i];
+        }
+        for (i in 0usize..eccLength) {
+            block[dataLength + i] = table[j * width + width - eccLength + i];
+        }
+        if (!correct(borrow g, mut block[0..dataLength + eccLength], eccLength)) {
+            return null;
+        }
+        for (i in 0usize..dataLength) {
+            if (data.push(block[i]) is Err(_)) {
+                return null;
+            }
+        }
+    }
+    let text = segments(data.view(), version)?;
+    return Some(QrDecoded { data: text, version: truncate<u32>(version), ecc: ecc });
+}
+
+fn bytesFor(n: usize) -> Vector<u8>? => match (Vector<u8>.withCapacity(n)) {
+    Ok(v) => Some(v),
+    Err(_) => null,
+};
+
+fn zeros(n: usize) -> Vector<u8>? {
+    var v = bytesFor(n)?;
+    for (i in 0usize..n) {
+        if (v.push(0) is Err(_)) {
+            return null;
+        }
+    }
+    return Some(v);
+}
+
+struct Bits {
+    at: usize;
+}
+
+/// The next `n` bits of `data` from bit `bits.at`, high first; null past the end.
+fn take(data: Slice<u8>, bits: borrow mut Bits, n: usize) -> u32? {
+    if (bits.at + n > data.length * 8) {
+        return null;
+    }
+    var v: u32 = 0;
+    for (i in 0usize..n) {
+        let p = bits.at + i;
+        v = (v << 1) | (((data[p / 8] >> truncate<u8>(7 - p % 8)) & 1) as u32);
+    }
+    bits.at += n;
+    return Some(v);
+}
+
+const ALPHANUMERIC: [u8; 45] = [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+    'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', ' ', '$', '%', '*', '+', '-', '.', '/', ':',
+];
+
+/// The data codewords' segments as bytes.
+fn segments(data: Slice<u8>, version: usize) -> Vector<u8>? {
+    var out = Vector<u8>.create();
+    var bits = Bits { at: 0 };
+    let band = if (version <= 9) 0usize else if (version <= 26) 1usize else 2usize;
+    loop {
+        if (bits.at + 4 > data.length * 8) {
+            break;
+        }
+        let mode = take(data, mut bits, 4)?;
+        if (mode == 0) {
+            break;
+        }
+        if (mode == 1) {
+            let count = take(data, mut bits, [10usize, 12, 14][band])? as usize;
+            var left = count;
+            while (left >= 3) {
+                let v = take(data, mut bits, 10)?;
+                if (v >= 1000) {
+                    return null;
+                }
+                if (out.push(truncate<u8>(v / 100) + '0') is Err(_)) {
+                    return null;
+                }
+                if (out.push(truncate<u8>(v / 10 % 10) + '0') is Err(_)) {
+                    return null;
+                }
+                if (out.push(truncate<u8>(v % 10) + '0') is Err(_)) {
+                    return null;
+                }
+                left -= 3;
+            }
+            if (left == 2) {
+                let v = take(data, mut bits, 7)?;
+                if (v >= 100) {
+                    return null;
+                }
+                if (out.push(truncate<u8>(v / 10) + '0') is Err(_)) {
+                    return null;
+                }
+                if (out.push(truncate<u8>(v % 10) + '0') is Err(_)) {
+                    return null;
+                }
+            } else if (left == 1) {
+                let v = take(data, mut bits, 4)?;
+                if (v >= 10) {
+                    return null;
+                }
+                if (out.push(truncate<u8>(v) + '0') is Err(_)) {
+                    return null;
+                }
+            }
+        } else if (mode == 2) {
+            let count = take(data, mut bits, [9usize, 11, 13][band])? as usize;
+            var left = count;
+            while (left >= 2) {
+                let v = take(data, mut bits, 11)? as usize;
+                if (v >= 45 * 45) {
+                    return null;
+                }
+                if (out.push(ALPHANUMERIC[v / 45]) is Err(_)) {
+                    return null;
+                }
+                if (out.push(ALPHANUMERIC[v % 45]) is Err(_)) {
+                    return null;
+                }
+                left -= 2;
+            }
+            if (left == 1) {
+                let v = take(data, mut bits, 6)? as usize;
+                if (v >= 45) {
+                    return null;
+                }
+                if (out.push(ALPHANUMERIC[v]) is Err(_)) {
+                    return null;
+                }
+            }
+        } else if (mode == 4) {
+            let count = take(data, mut bits, [8usize, 16, 16][band])? as usize;
+            for (i in 0usize..count) {
+                if (out.push(truncate<u8>(take(data, mut bits, 8)?)) is Err(_)) {
+                    return null;
+                }
+            }
+        } else if (mode == 8) {
+            let count = take(data, mut bits, [8usize, 10, 12][band])? as usize;
+            for (i in 0usize..count) {
+                let v = take(data, mut bits, 13)?;
+                let joined = ((v / 0xC0) << 8) | (v % 0xC0);
+                let sjis = if (joined + 0x8140 <= 0x9FFC) joined + 0x8140 else joined + 0xC140;
+                if (out.push(truncate<u8>(sjis >> 8)) is Err(_)) {
+                    return null;
+                }
+                if (out.push(truncate<u8>(sjis)) is Err(_)) {
+                    return null;
+                }
+            }
+        } else if (mode == 7) {
+            // ECI: its designator, one to three bytes, read past.
+            let first = take(data, mut bits, 8)?;
+            if ((first & 0x80) != 0) {
+                let _ = take(data, mut bits, if ((first & 0x40) == 0) 8 else 16)?;
+            }
+        } else if (mode == 3) {
+            let _ = take(data, mut bits, 16)?; // structured append: this symbol's place and parity
+        } else if (mode == 5) {
+            // FNC1 in the first position: nothing follows it.
+        } else if (mode == 9) {
+            let _ = take(data, mut bits, 8)?; // FNC1 in the second position: its application indicator
+        } else {
+            return null;
+        }
+    }
+    return Some(out);
+}
+
+// -- An image to modules.
+
+/// An image made black and white: each pixel against the mean of the 5 by 5 blocks of 8 pixels around its own
+/// (ZXing's hybrid binarizer), so a shadow across a code does not hide half of it.
+struct Binary {
+    width: usize;
+    height: usize;
+    dark: Vector<bool>;
+}
+
+const BLOCK: usize = 8;
+
+impl Binary {
+    fn of(luminance: Slice<u8>, width: usize, height: usize, stride: usize) -> Binary? {
+        let bw = (width + BLOCK - 1) / BLOCK;
+        let bh = (height + BLOCK - 1) / BLOCK;
+        var means = match (Vector<u32>.withCapacity(bw * bh)) {
+            Ok(v) => v,
+            Err(_) => { return null; }
+        };
+        for (by in 0usize..bh) {
+            for (bx in 0usize..bw) {
+                var sum: u32 = 0;
+                var least: u32 = 255;
+                var most: u32 = 0;
+                var count: u32 = 0;
+                for (y in by * BLOCK..(by * BLOCK + BLOCK).min(height)) {
+                    for (x in bx * BLOCK..(bx * BLOCK + BLOCK).min(width)) {
+                        let v = luminance[y * stride + x] as u32;
+                        sum += v;
+                        least = least.min(v);
+                        most = most.max(v);
+                        count += 1;
+                    }
+                }
+                var mean = sum / count;
+                if (most - least <= 24) {
+                    // A block of one shade: taken as light, unless its neighbours say the shade is dark.
+                    mean = least / 2;
+                    if (by > 0 && bx > 0) {
+                        let around = (means[(by - 1) * bw + bx] + 2 * means[by * bw + bx - 1] +
+                            means[(by - 1) * bw + bx - 1]) / 4;
+                        if (least < around) {
+                            mean = around;
+                        }
+                    }
+                }
+                if (means.push(mean) is Err(_)) {
+                    return null;
+                }
+            }
+        }
+        var dark = falses(width * height)?;
+        for (by in 0usize..bh) {
+            for (bx in 0usize..bw) {
+                var sum: u32 = 0;
+                var count: u32 = 0;
+                for (ny in (if (by >= 2) by - 2 else 0)..(by + 3).min(bh)) {
+                    for (nx in (if (bx >= 2) bx - 2 else 0)..(bx + 3).min(bw)) {
+                        sum += means[ny * bw + nx];
+                        count += 1;
+                    }
+                }
+                let threshold = sum / count;
+                for (y in by * BLOCK..(by * BLOCK + BLOCK).min(height)) {
+                    for (x in bx * BLOCK..(bx * BLOCK + BLOCK).min(width)) {
+                        dark[y * width + x] = (luminance[y * stride + x] as u32) <= threshold;
+                    }
+                }
+            }
+        }
+        return Some(Binary { width: width, height: height, dark: dark });
+    }
+
+    fn at(borrow this, x: usize, y: usize) -> bool => this.dark[y * this.width + x];
+}
+
+/// A finder pattern's centre, its module size, and how many scans found it.
+struct Finder {
+    x: f64;
+    y: f64;
+    size: f64;
+    count: u32;
+}
+
+fn real(n: usize) -> f64 => round<f64>(n);
+
+/// Whether five runs are a finder's 1:1:3:1:1.
+fn finderRatio(c: [usize; 5]) -> bool {
+    let total = c[0] + c[1] + c[2] + c[3] + c[4];
+    if (total < 7) {
+        return false;
+    }
+    let m = real(total) / 7.0;
+    let v = m / 2.0;
+    return (m - real(c[0])).abs() < v && (m - real(c[1])).abs() < v && (3.0 * m - real(c[2])).abs() < 3.0 * v &&
+        (m - real(c[3])).abs() < v && (m - real(c[4])).abs() < v;
+}
+
+/// The middle of the third run of five that end before `end`.
+fn centreFrom(c: [usize; 5], end: usize) -> f64 => real(end - c[4] - c[3]) - real(c[2]) / 2.0;
+
+/// The finder's centre along a column through `x`, from row `start`; -1 when there is none.
+fn crossVertical(image: borrow Binary, x: usize, start: usize, most: usize, total: usize) -> f64 {
+    var c = [0usize; 5];
+    var i = truncate<i64>(start);
+    while (i >= 0 && image.at(x, truncate<usize>(i))) {
+        c[2] += 1;
+        i -= 1;
+    }
+    if (i < 0) {
+        return -1.0;
+    }
+    while (i >= 0 && !image.at(x, truncate<usize>(i)) && c[1] <= most) {
+        c[1] += 1;
+        i -= 1;
+    }
+    if (i < 0 || c[1] > most) {
+        return -1.0;
+    }
+    while (i >= 0 && image.at(x, truncate<usize>(i)) && c[0] <= most) {
+        c[0] += 1;
+        i -= 1;
+    }
+    if (c[0] > most) {
+        return -1.0;
+    }
+    var j = start + 1;
+    let h = image.height;
+    while (j < h && image.at(x, j)) {
+        c[2] += 1;
+        j += 1;
+    }
+    if (j == h) {
+        return -1.0;
+    }
+    while (j < h && !image.at(x, j) && c[3] < most) {
+        c[3] += 1;
+        j += 1;
+    }
+    if (j == h || c[3] >= most) {
+        return -1.0;
+    }
+    while (j < h && image.at(x, j) && c[4] < most) {
+        c[4] += 1;
+        j += 1;
+    }
+    if (c[4] >= most) {
+        return -1.0;
+    }
+    let now = c[0] + c[1] + c[2] + c[3] + c[4];
+    let off = if (now > total) now - total else total - now;
+    if (5 * off >= 2 * total || !finderRatio(c)) {
+        return -1.0;
+    }
+    return centreFrom(c, j);
+}
+
+/// As crossVertical, along a row through `y` from column `start`.
+fn crossHorizontal(image: borrow Binary, start: usize, y: usize, most: usize, total: usize) -> f64 {
+    var c = [0usize; 5];
+    var i = truncate<i64>(start);
+    while (i >= 0 && image.at(truncate<usize>(i), y)) {
+        c[2] += 1;
+        i -= 1;
+    }
+    if (i < 0) {
+        return -1.0;
+    }
+    while (i >= 0 && !image.at(truncate<usize>(i), y) && c[1] <= most) {
+        c[1] += 1;
+        i -= 1;
+    }
+    if (i < 0 || c[1] > most) {
+        return -1.0;
+    }
+    while (i >= 0 && image.at(truncate<usize>(i), y) && c[0] <= most) {
+        c[0] += 1;
+        i -= 1;
+    }
+    if (c[0] > most) {
+        return -1.0;
+    }
+    var j = start + 1;
+    let w = image.width;
+    while (j < w && image.at(j, y)) {
+        c[2] += 1;
+        j += 1;
+    }
+    if (j == w) {
+        return -1.0;
+    }
+    while (j < w && !image.at(j, y) && c[3] < most) {
+        c[3] += 1;
+        j += 1;
+    }
+    if (j == w || c[3] >= most) {
+        return -1.0;
+    }
+    while (j < w && image.at(j, y) && c[4] < most) {
+        c[4] += 1;
+        j += 1;
+    }
+    if (c[4] >= most) {
+        return -1.0;
+    }
+    let now = c[0] + c[1] + c[2] + c[3] + c[4];
+    let off = if (now > total) now - total else total - now;
+    if (5 * off >= total || !finderRatio(c)) {
+        return -1.0;
+    }
+    return centreFrom(c, j);
+}
+
+/// A row's five runs ending at `end` that look like a finder, checked down its column and along its row again;
+/// added to `finders`, or counted again where one was found before. Whether it was one.
+fn candidate(image: borrow Binary, c: [usize; 5], row: usize, end: usize, finders: borrow mut Vector<Finder>) -> bool {
+    let total = c[0] + c[1] + c[2] + c[3] + c[4];
+    let cx = centreFrom(c, end);
+    if (cx < 0.0) {
+        return false;
+    }
+    let cy = crossVertical(image, truncate<usize>(cx), row, c[2], total);
+    if (cy < 0.0) {
+        return false;
+    }
+    let x = crossHorizontal(image, truncate<usize>(cx), truncate<usize>(cy), c[2], total);
+    if (x < 0.0) {
+        return false;
+    }
+    let size = real(total) / 7.0;
+    for (k in 0usize..finders.length) {
+        let f = finders[k];
+        if ((cy - f.y).abs() <= size && (x - f.x).abs() <= size && ((size - f.size).abs() <= 1.0 ||
+            (size - f.size).abs() <= f.size)) {
+            let n = round<f64>(f.count);
+            finders[k] = Finder {
+                x: (f.x * n + x) / (n + 1.0),
+                y: (f.y * n + cy) / (n + 1.0),
+                size: (f.size * n + size) / (n + 1.0),
+                count: f.count + 1,
+            };
+            return true;
+        }
+    }
+    let _ = finders.push(Finder { x: x, y: cy, size: size, count: 1 });
+    return true;
+}
+
+/// Every finder-like pattern, scanning rows a few pixels apart.
+fn findFinders(image: borrow Binary, finders: borrow mut Vector<Finder>) {
+    let w = image.width;
+    let h = image.height;
+    let skip = ((3 * h) / (4 * 97)).max(1).min(3);
+    var y = skip - 1;
+    while (y < h) {
+        var c = [0usize; 5];
+        var state: usize = 0;
+        for (x in 0usize..w) {
+            if (image.at(x, y)) {
+                if ((state & 1) == 1) {
+                    state += 1;
+                }
+                c[state] += 1;
+            } else if ((state & 1) == 0) {
+                if (state == 4) {
+                    if (finderRatio(c) && candidate(image, c, y, x, finders)) {
+                        c = [0usize; 5];
+                        state = 0;
+                    } else {
+                        c = [c[2], c[3], c[4], 1, 0];
+                        state = 3;
+                    }
+                } else {
+                    state += 1;
+                    c[state] += 1;
+                }
+            } else {
+                c[state] += 1;
+            }
+        }
+        if (state == 4 && finderRatio(c)) {
+            let _ = candidate(image, c, y, w, finders);
+        }
+        y += skip;
+    }
+}
+
+/// Three finders: the top left (the corner of the right angle), the top right and the bottom left.
+struct Three {
+    tl: Finder;
+    tr: Finder;
+    bl: Finder;
+}
+
+fn squared(a: Finder, b: Finder) -> f64 => (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y);
+
+/// The three finders that best make a code's corners: alike in size, at a right angle with two equal sides.
+fn chooseThree(all: Slice<Finder>) -> Three? {
+    if (all.length < 3) {
+        return null;
+    }
+    // The ones seen most first, at most eight of them; only those seen on two scans or more when there are three
+    // such (ZXing's quorum: noise makes specks that look like a finder on one row).
+    var confirmed: usize = 0;
+    for (f in all) {
+        if (f.count >= 2) {
+            confirmed += 1;
+        }
+    }
+    let least: u32 = if (confirmed >= 3) 2 else 1;
+    var order = [0usize; 8];
+    var taken = 0usize;
+    var used = falses(all.length)?;
+    for (k in 0usize..all.length) {
+        used[k] = all[k].count < least;
+    }
+    while (taken < 8) {
+        var best = all.length;
+        for (k in 0usize..all.length) {
+            if (!used[k] && (best == all.length || all[k].count > all[best].count)) {
+                best = k;
+            }
+        }
+        if (best == all.length) {
+            break;
+        }
+        used[best] = true;
+        order[taken] = best;
+        taken += 1;
+    }
+    var bestScore = 1000000.0;
+    var chosen: Three? = null;
+    for (i in 0usize..taken) {
+        for (j in i + 1..taken) {
+            for (k in j + 1..taken) {
+                let a = all[order[i]];
+                let b = all[order[j]];
+                let c = all[order[k]];
+                let small = a.size.min(b.size).min(c.size);
+                let large = a.size.max(b.size).max(c.size);
+                if (large > small * 1.5) {
+                    continue;
+                }
+                let ab = squared(a, b);
+                let ac = squared(a, c);
+                let bc = squared(b, c);
+                // The corner is across from the longest side.
+                var corner = a;
+                var p = b;
+                var q = c;
+                var longest = bc;
+                if (ac >= ab && ac >= bc) {
+                    corner = b;
+                    p = a;
+                    q = c;
+                    longest = ac;
+                } else if (ab >= ac && ab >= bc) {
+                    corner = c;
+                    p = a;
+                    q = b;
+                    longest = ab;
+                }
+                let s1 = squared(corner, p);
+                let s2 = squared(corner, q);
+                if (longest <= 0.0 || s1 < 49.0 * small * small || s2 < 49.0 * small * small) {
+                    continue;
+                }
+                let angle = (s1 + s2 - longest).abs() / longest;
+                let sides = (s1.sqrt() - s2.sqrt()).abs() / s1.sqrt().max(s2.sqrt());
+                let score = angle + sides;
+                if (angle < 0.5 && sides < 0.5 && score < bestScore) {
+                    bestScore = score;
+                    let cross = (p.x - corner.x) * (q.y - corner.y) - (p.y - corner.y) * (q.x - corner.x);
+                    chosen = Some(if (cross > 0.0) Three { tl: corner, tr: p, bl: q } else Three {
+                        tl: corner,
+                        tr: q,
+                        bl: p,
+                    });
+                }
+            }
+        }
+    }
+    return chosen;
+}
+
+/// A projective transform, as a 3 by 3 matrix (ZXing's PerspectiveTransform).
+struct Perspective {
+    a11: f64;
+    a12: f64;
+    a13: f64;
+    a21: f64;
+    a22: f64;
+    a23: f64;
+    a31: f64;
+    a32: f64;
+    a33: f64;
+}
+
+impl Perspective {
+    /// The unit square's corners (0,0), (1,0), (1,1), (0,1) to these four points.
+    fn squareTo(x0: f64, y0: f64, x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64) -> Perspective {
+        let dx3 = x0 - x1 + x2 - x3;
+        let dy3 = y0 - y1 + y2 - y3;
+        if (dx3 == 0.0 && dy3 == 0.0) {
+            return Perspective {
+                a11: x1 - x0, a21: x2 - x1, a31: x0,
+                a12: y1 - y0, a22: y2 - y1, a32: y0,
+                a13: 0.0, a23: 0.0, a33: 1.0,
+            };
+        }
+        let dx1 = x1 - x2;
+        let dx2 = x3 - x2;
+        let dy1 = y1 - y2;
+        let dy2 = y3 - y2;
+        let denominator = dx1 * dy2 - dx2 * dy1;
+        let a13 = (dx3 * dy2 - dx2 * dy3) / denominator;
+        let a23 = (dx1 * dy3 - dx3 * dy1) / denominator;
+        return Perspective {
+            a11: x1 - x0 + a13 * x1, a21: x3 - x0 + a23 * x3, a31: x0,
+            a12: y1 - y0 + a13 * y1, a22: y3 - y0 + a23 * y3, a32: y0,
+            a13: a13, a23: a23, a33: 1.0,
+        };
+    }
+
+    /// The inverse's adjoint: these four points to the unit square.
+    fn adjoint(borrow this) -> Perspective => Perspective {
+        a11: this.a22 * this.a33 - this.a23 * this.a32,
+        a21: this.a23 * this.a31 - this.a21 * this.a33,
+        a31: this.a21 * this.a32 - this.a22 * this.a31,
+        a12: this.a13 * this.a32 - this.a12 * this.a33,
+        a22: this.a11 * this.a33 - this.a13 * this.a31,
+        a32: this.a12 * this.a31 - this.a11 * this.a32,
+        a13: this.a12 * this.a23 - this.a13 * this.a22,
+        a23: this.a13 * this.a21 - this.a11 * this.a23,
+        a33: this.a11 * this.a22 - this.a12 * this.a21,
+    };
+
+    /// `this` after `other` (row vectors: `other` first).
+    fn then(borrow this, other: borrow Perspective) -> Perspective => Perspective {
+        a11: this.a11 * other.a11 + this.a21 * other.a12 + this.a31 * other.a13,
+        a21: this.a11 * other.a21 + this.a21 * other.a22 + this.a31 * other.a23,
+        a31: this.a11 * other.a31 + this.a21 * other.a32 + this.a31 * other.a33,
+        a12: this.a12 * other.a11 + this.a22 * other.a12 + this.a32 * other.a13,
+        a22: this.a12 * other.a21 + this.a22 * other.a22 + this.a32 * other.a23,
+        a32: this.a12 * other.a31 + this.a22 * other.a32 + this.a32 * other.a33,
+        a13: this.a13 * other.a11 + this.a23 * other.a12 + this.a33 * other.a13,
+        a23: this.a13 * other.a21 + this.a23 * other.a22 + this.a33 * other.a23,
+        a33: this.a13 * other.a31 + this.a23 * other.a32 + this.a33 * other.a33,
+    };
+
+    fn x(borrow this, x: f64, y: f64) -> f64 =>
+        (this.a11 * x + this.a21 * y + this.a31) / (this.a13 * x + this.a23 * y + this.a33);
+
+    fn y(borrow this, x: f64, y: f64) -> f64 =>
+        (this.a12 * x + this.a22 * y + this.a32) / (this.a13 * x + this.a23 * y + this.a33);
+}
+
+/// The quadrilateral (x0,y0)..(x3,y3) to the quadrilateral (u0,v0)..(u3,v3).
+fn quadToQuad(q: [f64; 8], to: [f64; 8]) -> Perspective {
+    let toSquare = Perspective.squareTo(q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]).adjoint();
+    let fromSquare = Perspective.squareTo(to[0], to[1], to[2], to[3], to[4], to[5], to[6], to[7]);
+    return fromSquare.then(borrow toSquare);
+}
+
+/// Whether the image is dark at (x, y), rounded down; null outside it.
+fn darkAt(image: borrow Binary, x: f64, y: f64) -> bool? {
+    if (!(x >= 0.0) || !(y >= 0.0)) {
+        return null;
+    }
+    let ix = truncate<usize>(x);
+    let iy = truncate<usize>(y);
+    if (ix >= image.width || iy >= image.height) {
+        return null;
+    }
+    return Some(image.at(ix, iy));
+}
+
+/// The alignment pattern's centre nearest (ex, ey): a dark centre, a light ring and a dark ring, along the code's own
+/// axes (`ux`, `uy` one module across, `vx`, `vy` one module down); its score out of 25 too, or null.
+fn findAlignment(image: borrow Binary, ex: f64, ey: f64, ux: f64, uy: f64, vx: f64, vy: f64, module: f64) -> Finder? {
+    // Every position with the best score, nearest the estimate first; their middle is the centre (seen in
+    // perspective, the module there is larger than the average, and a patch of positions matches all 25).
+    for (reach in [4.0, 8.0, 15.0]) {
+        let r = reach * module;
+        let step = (module / 3.0).max(1.0);
+        var bestScore: u32 = 22;
+        var sumX = 0.0;
+        var sumY = 0.0;
+        var count = 0.0;
+        var dy = -r;
+        while (dy <= r) {
+            var dx = -r;
+            while (dx <= r) {
+                let cx = ex + dx;
+                let cy = ey + dy;
+                var score: u32 = 0;
+                for (b in 0usize..5) {
+                    for (a in 0usize..5) {
+                        let fa = real(a) - 2.0;
+                        let fb = real(b) - 2.0;
+                        let want = fa.abs().max(fb.abs()) != 1.0;
+                        match (darkAt(image, cx + fa * ux + fb * vx, cy + fa * uy + fb * vy)) {
+                            Some(d) => {
+                                if (d == want) {
+                                    score += 1;
+                                }
+                            }
+                            null => {}
+                        }
+                    }
+                }
+                if (score > bestScore) {
+                    bestScore = score;
+                    sumX = 0.0;
+                    sumY = 0.0;
+                    count = 0.0;
+                }
+                if (score == bestScore) {
+                    sumX += cx;
+                    sumY += cy;
+                    count += 1.0;
+                }
+                dx += step;
+            }
+            dy += step;
+        }
+        if (count > 0.0) {
+            return Some(Finder { x: sumX / count, y: sumY / count, size: module, count: bestScore });
+        }
+    }
+    return null;
+}
+
+/// The code at the three finders: its size from their distance (and its neighbours, should that be a little off),
+/// the alignment pattern, and each module read through the perspective.
+fn readAt(image: borrow Binary, three: Three) -> QrDecoded? {
+    let module = (three.tl.size + three.tr.size + three.bl.size) / 3.0;
+    let across = squared(three.tl, three.tr).sqrt() / module;
+    let down = squared(three.tl, three.bl).sqrt() / module;
+    let estimate = truncate<i64>(((across + down) / 2.0).round()) + 7;
+    var tries = [estimate, estimate, estimate, estimate, estimate];
+    let rest = estimate % 4;
+    let nearest = if (rest == 1) estimate else if (rest == 0) estimate + 1 else if (rest == 2) estimate - 1
+        else estimate - 2;
+    tries[0] = nearest;
+    tries[1] = if (rest == 3) estimate + 2 else nearest + 4;
+    tries[2] = nearest - 4;
+    tries[3] = nearest + 4;
+    tries[4] = nearest + 8;
+    for (dim in tries) {
+        if (dim < 21 || dim > 177) {
+            continue;
+        }
+        match (readSized(image, three, truncate<usize>(dim), module)) {
+            Some(code) => { return Some(code); }
+            null => {}
+        }
+    }
+    return null;
+}
+
+fn readSized(image: borrow Binary, three: Three, dim: usize, module: f64) -> QrDecoded? {
+    let d = real(dim);
+    let far = d - 3.5;
+    // The bottom right corner: the alignment pattern where there is one, else the parallelogram's fourth point.
+    var brx = three.tr.x - three.tl.x + three.bl.x;
+    var bry = three.tr.y - three.tl.y + three.bl.y;
+    var corner = far;
+    if (dim > 21) {
+        let ux = (three.tr.x - three.tl.x) / (d - 7.0);
+        let uy = (three.tr.y - three.tl.y) / (d - 7.0);
+        let vx = (three.bl.x - three.tl.x) / (d - 7.0);
+        let vy = (three.bl.y - three.tl.y) / (d - 7.0);
+        let toward = 1.0 - 3.0 / (d - 7.0);
+        let ex = three.tl.x + toward * (brx - three.tl.x);
+        let ey = three.tl.y + toward * (bry - three.tl.y);
+        match (findAlignment(image, ex, ey, ux, uy, vx, vy, module)) {
+            Some(a) => {
+                brx = a.x;
+                bry = a.y;
+                corner = far - 3.0;
+            }
+            null => {}
+        }
+    }
+    let t = quadToQuad([3.5, 3.5, far, 3.5, corner, corner, 3.5, far], [
+        three.tl.x, three.tl.y, three.tr.x, three.tr.y, brx, bry, three.bl.x, three.bl.y,
+    ]);
+    var grid = falses(dim * dim)?;
+    for (y in 0usize..dim) {
+        let my = real(y) + 0.5;
+        for (x in 0usize..dim) {
+            let mx = real(x) + 0.5;
+            match (darkAt(image, t.x(mx, my), t.y(mx, my))) {
+                Some(dark) => { grid[y * dim + x] = dark; }
+                null => { return null; }
+            }
+        }
+    }
+    match (decodeModules(grid.view(), dim)) {
+        Some(code) => { return Some(code); }
+        null => {}
+    }
+    // Seen from behind (a mirror, or a camera's front image): the same modules transposed.
+    var flipped = falses(dim * dim)?;
+    for (y in 0usize..dim) {
+        for (x in 0usize..dim) {
+            flipped[x * dim + y] = grid[y * dim + x];
+        }
+    }
+    return decodeModules(flipped.view(), dim);
+}

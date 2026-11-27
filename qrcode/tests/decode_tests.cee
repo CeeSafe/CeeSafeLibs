@@ -1,0 +1,206 @@
+// Decoding: the encoder's codes read back from their modules (every level, masks, versions 1 to 40, with modules
+// flipped up to what the level corrects), and from grayscale images drawn from them: straight, turned, in perspective,
+// with noise and uneven light.
+
+fn bytesOf(text: StringView) -> Vector<u8> {
+    var v = Vector<u8>.create();
+    for (b in text.bytes()) {
+        v.push(b)!;
+    }
+    return v;
+}
+
+fn patterned(n: usize, seed: usize) -> Vector<u8> {
+    var v = Vector<u8>.create();
+    for (i in 0..n) {
+        v.push(truncate<u8>((i * 31 + seed * 17 + 5) % 256))!;
+    }
+    return v;
+}
+
+fn modulesOf(qr: borrow QrCode) -> Vector<bool> {
+    var m = Vector<bool>.create();
+    for (y in 0usize..qr.size) {
+        for (x in 0usize..qr.size) {
+            m.push(qr.dark(x, y))!;
+        }
+    }
+    return m;
+}
+
+fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0usize..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn levelOf(k: usize) -> Ecc => match (k) {
+    0 => Ecc.Low,
+    1 => Ecc.Medium,
+    2 => Ecc.Quartile,
+    _ => Ecc.High,
+};
+
+@test
+fn modulesReadBackAtEveryLevelAndMask() -> Result<void, TestFailure> {
+    let versions: [u32; 9] = [1, 2, 5, 7, 10, 14, 22, 33, 40];
+    for (v in versions) {
+        for (k in 0usize..4) {
+            let level = levelOf(k);
+            for (mask in [0i32, 3, 5, 7]) {
+                let data = patterned(v as usize * 3 + 1, v as usize + truncate<usize>(mask));
+                let qr = QrCode.encodeWith(data.view(), level, v, mask)!;
+                let modules = modulesOf(borrow qr);
+                match (QrReader.readModules(modules.view(), qr.size)) {
+                    Some(code) => {
+                        Check.isTrue(sameBytes(code.data.view(), data.view()), "the data read back")?;
+                        Check.equalU64(qr.version as u64, code.version as u64)?;
+                    }
+                    null => { return Check.isTrue(false, "a code read from its modules"); }
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// The data modules of a version-`v` code (the ones the encoder does not draw a pattern on), as found by flipping:
+/// a few chosen spread over the code, away from the finders, timing and format.
+fn spread(size: usize, n: usize, seed: usize) -> Vector<usize> {
+    var out = Vector<usize>.create();
+    var k = seed;
+    while (out.length < n) {
+        k = (k * 1103515245 + 12345) % 2147483648;
+        let x = 9 + k % (size - 17);
+        let y = 9 + (k / 7919) % (size - 17);
+        let at = y * size + x;
+        var seen = false;
+        for (p in out.view()) {
+            seen = seen || p == at;
+        }
+        if (!seen) {
+            out.push(at)!;
+        }
+    }
+    return out;
+}
+
+@test
+fn flippedModulesAreCorrected() -> Result<void, TestFailure> {
+    // A version 5 code at level High holds 4 blocks of 28 error correction codewords: 14 wrong bytes each. Flipping a
+    // module spoils at most one byte, so 20 flips spread over the code are corrected.
+    let data = bytesOf("MRVL1:968292385607792169076553501160296942588563605209549570124755");
+    let qr = QrCode.encodeWith(data.view(), Ecc.High, 5, -1)!;
+    var modules = modulesOf(borrow qr);
+    for (at in spread(qr.size, 20, 3).view()) {
+        modules[at] = !modules[at];
+    }
+    match (QrReader.readModules(modules.view(), qr.size)) {
+        Some(code) => { Check.isTrue(sameBytes(code.data.view(), data.view()), "corrected")?; }
+        null => { return Check.isTrue(false, "a damaged code read"); }
+    }
+    // Damage past what the level corrects is refused, not misread.
+    let low = QrCode.encodeWith(data.view(), Ecc.Low, 4, -1)!;
+    var ruined = modulesOf(borrow low);
+    for (at in spread(low.size, 60, 11).view()) {
+        ruined[at] = !ruined[at];
+    }
+    match (QrReader.readModules(ruined.view(), low.size)) {
+        Some(code) => { Check.isTrue(sameBytes(code.data.view(), data.view()), "never misread")?; }
+        null => {}
+    }
+    return Ok();
+}
+
+/// A picture of `qr`, `w` by `h` grey pixels: each pixel's place on the code (its quiet zone of four modules
+/// included) from the projective map (a, b, c; d, e, f; g, h2, 1), dark 40 and light 210, shaded from left to right
+/// by `shade`, with noise of +-`noise`.
+fn picture(qr: borrow QrCode, w: usize, h: usize, m: [f64; 8], shade: f64, noise: u32) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    var k: u32 = 7;
+    for (py in 0usize..h) {
+        for (px in 0usize..w) {
+            let x = round<f64>(px);
+            let y = round<f64>(py);
+            let z = m[6] * x + m[7] * y + 1.0;
+            let u = (m[0] * x + m[1] * y + m[2]) / z - 4.0;
+            let v = (m[3] * x + m[4] * y + m[5]) / z - 4.0;
+            var dark = false;
+            if (u >= 0.0 && v >= 0.0) {
+                dark = qr.dark(truncate<usize>(u), truncate<usize>(v));
+            }
+            var level = if (dark) 40.0 else 210.0;
+            level = level * (1.0 - shade * x / round<f64>(w));
+            k = truncate<u32>((k as u64) * 1664525 + 1013904223);
+            let jitter = round<f64>((k >> 24) % (2 * noise + 1)) - round<f64>(noise);
+            let value = (level + jitter).max(0.0).min(255.0);
+            out.push(truncate<u8>(value))!;
+        }
+    }
+    return out;
+}
+
+/// The map from a picture to the code for a code of `size` (and its quiet zone) turned by `angle` radians about the
+/// picture's centre, `pixels` per module, with the perspective (`g`, `h2`).
+fn turned(size: usize, w: usize, h: usize, pixels: f64, angle: f64, g: f64, h2: f64) -> [f64; 8] {
+    let total = round<f64>(size + 8);
+    let cs = angle.cos() / pixels;
+    let sn = angle.sin() / pixels;
+    let cx = round<f64>(w) / 2.0;
+    let cy = round<f64>(h) / 2.0;
+    // u = cs (x - cx) + sn (y - cy) + total / 2, before the perspective's divisor.
+    return [cs, sn, total / 2.0 - cs * cx - sn * cy, -sn, cs, total / 2.0 + sn * cx - cs * cy, g, h2];
+}
+
+fn readsPicture(text: StringView, level: Ecc, angle: f64, g: f64, h2: f64, shade: f64, noise: u32) -> bool {
+    let data = bytesOf(text);
+    let qr = QrCode.encode(data.view(), level)!;
+    // Room around the code for the perspective to stretch it: 200 pixels across, straight, in 440 by 420.
+    let w: usize = 440;
+    let h: usize = 420;
+    let pixels = 200.0 / round<f64>(qr.size + 8);
+    let image = picture(borrow qr, w, h, turned(qr.size, w, h, pixels, angle, g, h2), shade, noise);
+    return match (QrReader.read(image.view(), w, h, w)) {
+        Some(code) => sameBytes(code.data.view(), data.view()),
+        null => false,
+    };
+}
+
+const SAFETY: StringView = "MRVL1:968292385607792169076553501160296942588563605209549570124755";
+
+@test
+fn aStraightPictureReads() -> Result<void, TestFailure> {
+    Check.isTrue(readsPicture("hello", Ecc.Medium, 0.0, 0.0, 0.0, 0.0, 0), "version 1, straight")?;
+    return Check.isTrue(readsPicture(SAFETY, Ecc.Medium, 0.0, 0.0, 0.0, 0.0, 0), "the safety QR, straight");
+}
+
+@test
+fn aTurnedPictureReads() -> Result<void, TestFailure> {
+    for (angle in [0.3, 1.2, 2.0, 3.0, -0.7]) {
+        Check.isTrue(readsPicture(SAFETY, Ecc.Medium, angle, 0.0, 0.0, 0.0, 0), "turned")?;
+    }
+    return Ok();
+}
+
+@test
+fn aPictureInPerspectiveWithNoiseAndShadeReads() -> Result<void, TestFailure> {
+    Check.isTrue(readsPicture(SAFETY, Ecc.Medium, 0.2, 0.0006, 0.0004, 0.0, 0), "in perspective")?;
+    Check.isTrue(readsPicture(SAFETY, Ecc.Medium, 0.1, 0.0, 0.0, 0.5, 0), "shaded")?;
+    Check.isTrue(readsPicture(SAFETY, Ecc.Medium, 0.0, 0.0, 0.0, 0.0, 40), "noisy")?;
+    return Check.isTrue(readsPicture(SAFETY, Ecc.Medium, -0.4, -0.0005, 0.0005, 0.3, 25), "all of them");
+}
+
+@test
+fn aPictureWithNoCodeReadsNothing() -> Result<void, TestFailure> {
+    var image = Vector<u8>.create();
+    for (i in 0usize..200 * 150) {
+        image.push(truncate<u8>((i * 37 + i / 200 * 11) % 256))!;
+    }
+    return Check.isTrue(QrReader.read(image.view(), 200, 150, 200) == null, "no code");
+}
