@@ -1,0 +1,114 @@
+// STUN against RFC 5769's test vectors, and messages built and read back.
+
+
+fn hexOf(text: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    var high: i32 = -1;
+    for (c in text.bytes()) {
+        let v: i32 = if (c >= '0' && c <= '9') (c - '0') as i32 else if (c >= 'a' && c <= 'f') (c - 'a') as i32 + 10
+            else -1;
+        if (v < 0) {
+            continue;
+        }
+        if (high < 0) {
+            high = v;
+        } else {
+            out.push(truncate<u8>(high * 16 + v))!;
+            high = -1;
+        }
+    }
+    return out;
+}
+
+const REQUEST: StringView = "000100582112a442b7e7a701bc34d686fa87dfae 802200105354554e20746573742063 6c69656e74 002400046e0001ff 80290008932ff9b151263b36 000600096576746a3a68367659202020 000800149aeaa70cbfd8cb56781ef2b5b2d3f249c1b571a2 80280004e57a3bcf";
+const RESPONSE: StringView = "0101003c2112a442b7e7a701bc34d686fa87dfae 8022000b7465737420766563746f7220 002000080001a147e112a643 000800142b91f599fd9e90c38c7489f92af9ba53f06be7d7 80280004c07d4c96";
+const PASSWORD: StringView = "VOkJxbRl1RmTxUk/WvJxBt";
+
+@test
+fn rfc5769SampleRequest() -> Result<void, TestFailure> {
+    let bytes = hexOf(REQUEST);
+    Check.equalU64(108, bytes.length as u64)?;
+    Check.isTrue(isStun(bytes.view()), "is STUN")?;
+    Check.isTrue(checkIntegrity(bytes.view(), PASSWORD.bytes()), "its integrity, under the password")?;
+    Check.isTrue(!checkIntegrity(bytes.view(), "wrong".bytes()), "not under another")?;
+    Check.isTrue(checkFingerprint(bytes.view()), "its fingerprint")?;
+    let m = StunMessage.decode(bytes.view())!;
+    Check.equalU64(BINDING as u64, m.method as u64)?;
+    Check.isTrue(m.messageClass is StunClass.Request, "a request")?;
+    Check.isTrue(m.get(USERNAME)! == "evtj:h6vY".bytes(), "USERNAME")?;
+    Check.equalU64(0x6e0001ff, m.getU32(PRIORITY)! as u64)?;
+    Check.isTrue(m.get(SOFTWARE)! == "STUN test client".bytes(), "SOFTWARE")?;
+    // Built again from what was read: the vector pads with spaces (RFC 5769 §2.1, to try a reader's padding), this
+    // encoder with zeros, so not its bytes; but a message that verifies and reads the same.
+    let again = m.encode(PASSWORD.bytes(), true);
+    Check.equalU64(bytes.length as u64, again.length as u64)?;
+    Check.isTrue(checkIntegrity(again.view(), PASSWORD.bytes()) && checkFingerprint(again.view()), "it verifies")?;
+    let back = StunMessage.decode(again.view())!;
+    return Check.isTrue(back.get(USERNAME)! == "evtj:h6vY".bytes(), "and reads the same");
+}
+
+@test
+fn rfc5769IPv4Response() -> Result<void, TestFailure> {
+    let bytes = hexOf(RESPONSE);
+    Check.isTrue(checkIntegrity(bytes.view(), PASSWORD.bytes()), "its integrity")?;
+    Check.isTrue(checkFingerprint(bytes.view()), "its fingerprint")?;
+    let m = StunMessage.decode(bytes.view())!;
+    Check.isTrue(m.messageClass is StunClass.Success, "a success response")?;
+    let a = m.address(XOR_MAPPED_ADDRESS)!;
+    Check.isTrue(a.same(StunAddress.v4(192, 0, 2, 1, 32853)), "XOR-MAPPED-ADDRESS 192.0.2.1:32853")?;
+    let again = m.encode(PASSWORD.bytes(), true);
+    Check.isTrue(checkIntegrity(again.view(), PASSWORD.bytes()), "encoded again, it verifies")?;
+    let back = StunMessage.decode(again.view())!;
+    return Check.isTrue(back.address(XOR_MAPPED_ADDRESS)!.same(a), "and reads the same address");
+}
+
+@test
+fn aMessageBuiltIsReadBack() -> Result<void, TestFailure> {
+    var transaction = [0u8; 12];
+    for (k in 0usize..12) {
+        transaction[k] = truncate<u8>(k * 17 + 3);
+    }
+    var m = StunMessage.create(BINDING, StunClass.Request, transaction);
+    Check.isTrue(m.add(USERNAME, "remote:local".bytes()), "USERNAME")?;
+    Check.isTrue(m.addU32(PRIORITY, 0x7E0000FF), "PRIORITY")?;
+    Check.isTrue(m.addU64(ICE_CONTROLLING, 0x0102030405060708), "ICE-CONTROLLING")?;
+    Check.isTrue(m.add(USE_CANDIDATE, Vector<u8>.create().view()), "USE-CANDIDATE")?;
+    var v6 = [0u8; 16];
+    v6[0] = 0x20;
+    v6[1] = 0x01;
+    v6[15] = 0x09;
+    Check.isTrue(m.addAddress(XOR_PEER_ADDRESS, StunAddress { ip: v6, v6: true, port: 3478 }), "an IPv6 address")?;
+    let bytes = m.encode("secret".bytes(), true);
+    Check.isTrue(checkIntegrity(bytes.view(), "secret".bytes()), "integrity")?;
+    Check.isTrue(checkFingerprint(bytes.view()), "fingerprint")?;
+    var spoiled = Vector<u8>.create();
+    for (b in bytes.view()) {
+        spoiled.push(b)!;
+    }
+    spoiled[25] = spoiled[25] ^ 1;
+    Check.isTrue(!checkIntegrity(spoiled.view(), "secret".bytes()), "a changed byte fails the integrity")?;
+    let back = StunMessage.decode(bytes.view())!;
+    Check.isTrue(back.get(USERNAME)! == "remote:local".bytes(), "USERNAME back")?;
+    Check.equalU64(0x7E0000FF, back.getU32(PRIORITY)! as u64)?;
+    Check.isTrue(back.has(USE_CANDIDATE), "USE-CANDIDATE back")?;
+    let peer = back.address(XOR_PEER_ADDRESS)!;
+    return Check.isTrue(peer.v6 && peer.port == 3478 && peer.ip[0] == 0x20 && peer.ip[15] == 0x09, "the IPv6 address back");
+}
+
+@test
+fn hmacAndKeysAndChannels() -> Result<void, TestFailure> {
+    // RFC 2202's first HMAC-SHA1 case.
+    var key = [0u8; 20];
+    for (k in 0usize..20) {
+        key[k] = 0x0b;
+    }
+    let mac = hmacSha1(key[..], "Hi There".bytes());
+    Check.isTrue(mac[..] == hexOf("b617318655057264e28bc0b6fb378c8ef146be00").view(), "RFC 2202 case 1")?;
+    let lt = longTermKey("alice", "example.org", "secret");
+    Check.isTrue(lt[..] == hexOf("543e1aec5d3614f03141652d6ada51b2").view(), "MD5(user:realm:pass)")?;
+    let frame = channelData(0x4001, "hello".bytes());
+    Check.equalU64(12, frame.length as u64)?;
+    let read = readChannelData(frame.view())!;
+    Check.isTrue(read.channel == 0x4001 && read.start == 4 && read.length == 5, "ChannelData read back")?;
+    return Check.isTrue(readChannelData(hexOf(REQUEST).view()) == null, "a STUN message is no ChannelData");
+}

@@ -1,0 +1,441 @@
+// STUN (RFC 8489) and the parts of TURN (RFC 8656) and ICE (RFC 8445) that ride on it: messages built and read,
+// XOR addresses, MESSAGE-INTEGRITY (HMAC-SHA1, short-term and long-term keys), FINGERPRINT, and TURN's ChannelData.
+// No I/O: a caller sends and receives the bytes.
+
+/// The magic cookie every STUN message carries after its length.
+public const MAGIC: u32 = 0x2112A442;
+
+// Methods.
+public const BINDING: u16 = 0x001;
+public const ALLOCATE: u16 = 0x003;
+public const REFRESH: u16 = 0x004;
+public const SEND: u16 = 0x006;
+public const DATA: u16 = 0x007;
+public const CREATE_PERMISSION: u16 = 0x008;
+public const CHANNEL_BIND: u16 = 0x009;
+
+// Attributes (RFC 8489, 8656, 8445).
+public const MAPPED_ADDRESS: u16 = 0x0001;
+public const USERNAME: u16 = 0x0006;
+public const MESSAGE_INTEGRITY: u16 = 0x0008;
+public const ERROR_CODE: u16 = 0x0009;
+public const UNKNOWN_ATTRIBUTES: u16 = 0x000A;
+public const CHANNEL_NUMBER: u16 = 0x000C;
+public const LIFETIME: u16 = 0x000D;
+public const XOR_PEER_ADDRESS: u16 = 0x0012;
+public const DATA_ATTRIBUTE: u16 = 0x0013;
+public const REALM: u16 = 0x0014;
+public const NONCE: u16 = 0x0015;
+public const XOR_RELAYED_ADDRESS: u16 = 0x0016;
+public const REQUESTED_TRANSPORT: u16 = 0x0019;
+public const XOR_MAPPED_ADDRESS: u16 = 0x0020;
+public const PRIORITY: u16 = 0x0024;
+public const USE_CANDIDATE: u16 = 0x0025;
+public const SOFTWARE: u16 = 0x8022;
+public const FINGERPRINT: u16 = 0x8028;
+public const ICE_CONTROLLED: u16 = 0x8029;
+public const ICE_CONTROLLING: u16 = 0x802A;
+
+/// A message's class.
+public enum StunClass {
+    Request,
+    Indication,
+    Success,
+    Error,
+}
+
+/// An IP address and port: IPv4 in the first four bytes of `ip`, or IPv6 in all sixteen.
+public struct StunAddress {
+    public ip: [u8; 16];
+    public v6: bool;
+    public port: u16;
+
+    public fn v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> StunAddress {
+        var ip = [0u8; 16];
+        ip[0] = a;
+        ip[1] = b;
+        ip[2] = c;
+        ip[3] = d;
+        return StunAddress { ip: ip, v6: false, port: port };
+    }
+
+    /// The same address and port (IPv4's other twelve bytes ignored).
+    public fn same(borrow this, other: StunAddress) -> bool {
+        if (this.v6 != other.v6 || this.port != other.port) {
+            return false;
+        }
+        let n: usize = if (this.v6) 16 else 4;
+        for (k in 0usize..n) {
+            if (this.ip[k] != other.ip[k]) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+/// One attribute: its type and its value (without padding).
+public struct StunAttribute {
+    public kind: u16;
+    public value: Vector<u8>;
+}
+
+/// A STUN message.
+public struct StunMessage {
+    public method: u16;
+    public messageClass: StunClass;
+    public transaction: [u8; 12];
+    public attributes: Vector<StunAttribute>;
+
+    public fn create(method: u16, messageClass: StunClass, transaction: [u8; 12]) -> StunMessage => StunMessage {
+        method: method,
+        messageClass: messageClass,
+        transaction: transaction,
+        attributes: Vector<StunAttribute>.create(),
+    };
+
+    /// Adds an attribute; false when memory runs out.
+    public fn add(borrow mut this, kind: u16, value: Slice<u8>) -> bool {
+        var v = Vector<u8>.create();
+        for (b in value) {
+            if (v.push(b) is Err(_)) {
+                return false;
+            }
+        }
+        return this.attributes.push(StunAttribute { kind: kind, value: v }).isOk();
+    }
+
+    public fn addU32(borrow mut this, kind: u16, value: u32) -> bool {
+        let b = [truncate<u8>(value >> 24), truncate<u8>(value >> 16), truncate<u8>(value >> 8), truncate<u8>(value)];
+        return this.add(kind, b[..]);
+    }
+
+    public fn addU64(borrow mut this, kind: u16, value: u64) -> bool {
+        var b = [0u8; 8];
+        for (k in 0usize..8) {
+            b[k] = truncate<u8>(value >> truncate<u64>(56 - 8 * k));
+        }
+        return this.add(kind, b[..]);
+    }
+
+    /// An address attribute: XORed with the cookie (and the transaction for IPv6) for the XOR kinds.
+    public fn addAddress(borrow mut this, kind: u16, address: StunAddress) -> bool {
+        let xor = kind == XOR_MAPPED_ADDRESS || kind == XOR_PEER_ADDRESS || kind == XOR_RELAYED_ADDRESS;
+        let n: usize = if (address.v6) 16 else 4;
+        var v = [0u8; 20];
+        v[1] = if (address.v6) 2u8 else 1u8;
+        let port = if (xor) address.port ^ 0x2112 else address.port;
+        v[2] = truncate<u8>(port >> 8);
+        v[3] = truncate<u8>(port);
+        let mask = this.mask();
+        for (k in 0usize..n) {
+            v[4 + k] = if (xor) address.ip[k] ^ mask[k] else address.ip[k];
+        }
+        return this.add(kind, v[0..4 + n]);
+    }
+
+    /// The first attribute of `kind`.
+    public fn get(borrow this, kind: u16) -> Slice<u8>? {
+        for (a in this.attributes.view()) {
+            if (a.kind == kind) {
+                return Some(a.value.view());
+            }
+        }
+        return null;
+    }
+
+    public fn has(borrow this, kind: u16) -> bool => this.get(kind) != null;
+
+    public fn getU32(borrow this, kind: u16) -> u32? {
+        let v = this.get(kind)?;
+        if (v.length < 4) {
+            return null;
+        }
+        return Some(((v[0] as u32) << 24) | ((v[1] as u32) << 16) | ((v[2] as u32) << 8) | (v[3] as u32));
+    }
+
+    /// An address attribute, un-XORed for the XOR kinds.
+    public fn address(borrow this, kind: u16) -> StunAddress? {
+        let v = this.get(kind)?;
+        if (v.length < 8) {
+            return null;
+        }
+        let v6 = v[1] == 2;
+        let n: usize = if (v6) 16 else 4;
+        if (v.length < 4 + n) {
+            return null;
+        }
+        let xor = kind == XOR_MAPPED_ADDRESS || kind == XOR_PEER_ADDRESS || kind == XOR_RELAYED_ADDRESS;
+        let raw = ((v[2] as u16) << 8) | (v[3] as u16);
+        var ip = [0u8; 16];
+        let mask = this.mask();
+        for (k in 0usize..n) {
+            ip[k] = if (xor) v[4 + k] ^ mask[k] else v[4 + k];
+        }
+        return Some(StunAddress { ip: ip, v6: v6, port: if (xor) raw ^ 0x2112 else raw });
+    }
+
+    /// ERROR-CODE's number (class × 100 + number), if there is one.
+    public fn errorCode(borrow this) -> u16? {
+        let v = this.get(ERROR_CODE)?;
+        if (v.length < 4) {
+            return null;
+        }
+        return Some(((v[2] & 7) as u16) * 100 + (v[3] as u16));
+    }
+
+    /// The cookie then the transaction: what an XOR address is XORed with.
+    fn mask(borrow this) -> [u8; 16] {
+        var m = [0u8; 16];
+        m[0] = 0x21;
+        m[1] = 0x12;
+        m[2] = 0xA4;
+        m[3] = 0x42;
+        for (k in 0usize..12) {
+            m[4 + k] = this.transaction[k];
+        }
+        return m;
+    }
+
+    /// The message's bytes, with MESSAGE-INTEGRITY over them under `key` when given (empty: none) and FINGERPRINT
+    /// last when asked. Attributes of those two kinds already in the message are left out.
+    public fn encode(borrow this, key: Slice<u8>, fingerprint: bool) -> Vector<u8> {
+        var out = Vector<u8>.create();
+        let c: u16 = match (this.messageClass) {
+            StunClass.Request => 0,
+            StunClass.Indication => 1,
+            StunClass.Success => 2,
+            StunClass.Error => 3,
+        };
+        let m = this.method;
+        let kind = (m & 0x000F) | ((m & 0x0070) << 1) | ((m & 0x0F80) << 2) | ((c & 1) << 4) | ((c & 2) << 7);
+        put16(mut out, kind);
+        put16(mut out, 0);
+        put32(mut out, MAGIC);
+        for (b in this.transaction) {
+            let _ = out.push(b);
+        }
+        for (a in this.attributes.view()) {
+            if (a.kind == MESSAGE_INTEGRITY || a.kind == FINGERPRINT) {
+                continue;
+            }
+            put16(mut out, a.kind);
+            put16(mut out, truncate<u16>(a.value.length));
+            for (b in a.value.view()) {
+                let _ = out.push(b);
+            }
+            while (out.length % 4 != 0) {
+                let _ = out.push(0);
+            }
+        }
+        if (key.length > 0) {
+            setLength(mut out, out.length - 20 + 24);
+            let mac = hmacSha1(key, out.view());
+            put16(mut out, MESSAGE_INTEGRITY);
+            put16(mut out, 20);
+            for (b in mac) {
+                let _ = out.push(b);
+            }
+        }
+        if (fingerprint) {
+            setLength(mut out, out.length - 20 + 8);
+            let crc = Crc32.of(out.view()) ^ 0x5354554E;
+            put16(mut out, FINGERPRINT);
+            put16(mut out, 4);
+            put32(mut out, crc);
+        }
+        setLength(mut out, out.length - 20);
+        return out;
+    }
+
+    /// A message read from `bytes`; null when they are not one.
+    public fn decode(bytes: Slice<u8>) -> StunMessage? {
+        if (!isStun(bytes)) {
+            return null;
+        }
+        let kind = read16(bytes, 0);
+        let length = read16(bytes, 2) as usize;
+        if (20 + length > bytes.length || length % 4 != 0) {
+            return null;
+        }
+        let method = (kind & 0x000F) | ((kind >> 1) & 0x0070) | ((kind >> 2) & 0x0F80);
+        let c = ((kind >> 4) & 1) | ((kind >> 7) & 2);
+        var transaction = [0u8; 12];
+        for (k in 0usize..12) {
+            transaction[k] = bytes[8 + k];
+        }
+        var message = StunMessage.create(method, match (c) {
+            0 => StunClass.Request,
+            1 => StunClass.Indication,
+            2 => StunClass.Success,
+            _ => StunClass.Error,
+        }, transaction);
+        var at: usize = 20;
+        while (at + 4 <= 20 + length) {
+            let t = read16(bytes, at);
+            let n = read16(bytes, at + 2) as usize;
+            if (at + 4 + n > 20 + length) {
+                return null;
+            }
+            if (!message.add(t, bytes[at + 4..at + 4 + n])) {
+                return null;
+            }
+            at += 4 + (n + 3) / 4 * 4;
+        }
+        return Some(message);
+    }
+}
+
+/// Whether `bytes` start as a STUN message: the top two bits clear and the magic cookie in place (RFC 7983 tells it
+/// from DTLS, RTP and TURN's ChannelData on one port by the first byte: 0 to 3 is STUN).
+public fn isStun(bytes: Slice<u8>) -> bool =>
+    bytes.length >= 20 && (bytes[0] & 0xC0) == 0 && read32(bytes, 4) == MAGIC;
+
+/// Whether `bytes` carry a MESSAGE-INTEGRITY that `key` made: the HMAC-SHA1 over the message up to it, its length
+/// field as if the message ended after it.
+public fn checkIntegrity(bytes: Slice<u8>, key: Slice<u8>) -> bool {
+    let at = attributeAt(bytes, MESSAGE_INTEGRITY) ?? { return false; };
+    if (at + 24 > bytes.length) {
+        return false;
+    }
+    var head = Vector<u8>.create();
+    for (b in bytes[0..at]) {
+        let _ = head.push(b);
+    }
+    setLength(mut head, at - 20 + 24);
+    let mac = hmacSha1(key, head.view());
+    var same: u8 = 0;
+    for (k in 0usize..20) {
+        same = same | (mac[k] ^ bytes[at + 4 + k]);
+    }
+    return same == 0;
+}
+
+/// Whether `bytes` end with a FINGERPRINT that matches them.
+public fn checkFingerprint(bytes: Slice<u8>) -> bool {
+    let at = attributeAt(bytes, FINGERPRINT) ?? { return false; };
+    if (at + 8 > bytes.length) {
+        return false;
+    }
+    var head = Vector<u8>.create();
+    for (b in bytes[0..at]) {
+        let _ = head.push(b);
+    }
+    setLength(mut head, at - 20 + 8);
+    return (Crc32.of(head.view()) ^ 0x5354554E) == read32(bytes, at + 4);
+}
+
+/// TURN's long-term key: MD5 of "username:realm:password".
+public fn longTermKey(username: StringView, realm: StringView, password: StringView) -> [u8; 16] {
+    var md5 = Md5.create();
+    md5.update(username.bytes());
+    md5.update(":".bytes());
+    md5.update(realm.bytes());
+    md5.update(":".bytes());
+    md5.update(password.bytes());
+    return md5.finish();
+}
+
+/// HMAC-SHA1 (RFC 2104).
+public fn hmacSha1(key: Slice<u8>, data: Slice<u8>) -> [u8; 20] {
+    var block = [0u8; 64];
+    if (key.length > 64) {
+        let short = Sha1.of(key);
+        for (k in 0usize..20) {
+            block[k] = short[k];
+        }
+    } else {
+        for (k in 0usize..key.length) {
+            block[k] = key[k];
+        }
+    }
+    var inner = Sha1.create();
+    var pad = [0u8; 64];
+    for (k in 0usize..64) {
+        pad[k] = block[k] ^ 0x36;
+    }
+    inner.update(pad[..]);
+    inner.update(data);
+    let first = inner.finish();
+    var outer = Sha1.create();
+    for (k in 0usize..64) {
+        pad[k] = block[k] ^ 0x5C;
+    }
+    outer.update(pad[..]);
+    outer.update(first[..]);
+    return outer.finish();
+}
+
+/// TURN's ChannelData message (RFC 8656 §12.4): the channel, the length, the data, padded to four bytes.
+public fn channelData(channel: u16, data: Slice<u8>) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    put16(mut out, channel);
+    put16(mut out, truncate<u16>(data.length));
+    for (b in data) {
+        let _ = out.push(b);
+    }
+    while (out.length % 4 != 0) {
+        let _ = out.push(0);
+    }
+    return out;
+}
+
+/// A ChannelData message's channel and where its data is in `bytes`; null when it is not one (channels are 0x4000 to
+/// 0x4FFF).
+public fn readChannelData(bytes: Slice<u8>) -> ChannelData? {
+    if (bytes.length < 4) {
+        return null;
+    }
+    let channel = read16(bytes, 0);
+    let n = read16(bytes, 2) as usize;
+    if (channel < 0x4000 || channel > 0x4FFF || 4 + n > bytes.length) {
+        return null;
+    }
+    return Some(ChannelData { channel: channel, start: 4, length: n });
+}
+
+/// Where a ChannelData message's data is.
+public struct ChannelData {
+    public channel: u16;
+    public start: usize;
+    public length: usize;
+}
+
+/// The offset of the first attribute of `kind` in a message's bytes.
+fn attributeAt(bytes: Slice<u8>, kind: u16) -> usize? {
+    if (!isStun(bytes)) {
+        return null;
+    }
+    let end = 20 + (read16(bytes, 2) as usize);
+    if (end > bytes.length) {
+        return null;
+    }
+    var at: usize = 20;
+    while (at + 4 <= end) {
+        if (read16(bytes, at) == kind) {
+            return Some(at);
+        }
+        at += 4 + (read16(bytes, at + 2) as usize + 3) / 4 * 4;
+    }
+    return null;
+}
+
+fn read16(b: Slice<u8>, at: usize) -> u16 => ((b[at] as u16) << 8) | (b[at + 1] as u16);
+
+fn read32(b: Slice<u8>, at: usize) -> u32 =>
+    ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | (b[at + 3] as u32);
+
+fn put16(out: borrow mut Vector<u8>, v: u16) {
+    let _ = out.push(truncate<u8>(v >> 8));
+    let _ = out.push(truncate<u8>(v));
+}
+
+fn put32(out: borrow mut Vector<u8>, v: u32) {
+    put16(mut out, truncate<u16>(v >> 16));
+    put16(mut out, truncate<u16>(v));
+}
+
+fn setLength(out: borrow mut Vector<u8>, n: usize) {
+    out[2] = truncate<u8>(n >> 8);
+    out[3] = truncate<u8>(n);
+}
