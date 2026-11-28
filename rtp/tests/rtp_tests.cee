@@ -1,0 +1,75 @@
+// RTP packets built and read, RTCP reports built and walked, and reception statistics.
+
+@test
+fn aPacketIsBuiltAndRead() -> Result<void, TestFailure> {
+    var b = RtpBuilder.create(111, 0xCAFEBABE);
+    b.sequence = 65535;
+    b.timestamp = 960;
+    b.marker = true;
+    b.addExtension(3, [1u8, 2, 3][..]);
+    let p = b.build("opus".bytes());
+    Check.equalU64(0, b.sequence as u64)?;
+    Check.isTrue(!isRtcp(p.view()), "RTP, not RTCP")?;
+    let h = RtpHeader.read(p.view())!;
+    Check.isTrue(h.marker && h.payloadType == 111 && h.sequence == 65535 && h.timestamp == 960 && h.ssrc == 0xCAFEBABE, "fields")?;
+    Check.isTrue(p.view()[h.payloadStart..h.payloadEnd] == "opus".bytes(), "payload")?;
+    Check.isTrue(h.extension(p.view(), 3)! == [1u8, 2, 3][..], "extension 3")?;
+    Check.isTrue(h.extension(p.view(), 4) == null, "no extension 4")?;
+    let plain = b.build("x".bytes());
+    let ph = RtpHeader.read(plain.view())!;
+    Check.isTrue(ph.payloadStart == 12 && ph.extensionEnd == 0, "no extension the second time")?;
+    // Padding (P bit, last byte the count) is left out of the payload.
+    var padded = Vector<u8>.create();
+    padded.extend([0xA0u8, 111, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 9, 9, 0, 0, 3][..])!;
+    let pad = RtpHeader.read(padded.view())!;
+    return Check.isTrue(pad.payloadEnd - pad.payloadStart == 2, "padding left out");
+}
+
+@test
+fn reportsAreBuiltAndWalked() -> Result<void, TestFailure> {
+    let block = ReportBlock {
+        ssrc: 7,
+        fractionLost: 25,
+        cumulativeLost: 3,
+        highestSequence: 70000,
+        jitter: 12,
+        lastSenderReport: 0x11223344,
+        delaySinceLast: 65536,
+    };
+    var compound = senderReport(SenderInfo { ssrc: 9, ntp: ntpOf(1700000000500), rtpTimestamp: 4800, packets: 10, octets: 1000 }, [block][..]);
+    compound.extend(sourceDescription(9, "ceesafe").view())!;
+    compound.extend(goodbye(9).view())!;
+    Check.isTrue(isRtcp(compound.view()), "RTCP")?;
+    let parts = rtcpParts(compound.view());
+    Check.equalU64(3, parts.length as u64)?;
+    Check.isTrue(parts[0].packetType == SENDER_REPORT && parts[1].packetType == SOURCE_DESCRIPTION && parts[2].packetType == GOODBYE, "types")?;
+    Check.equalU64(compound.length as u64, (parts[2].start + parts[2].length) as u64)?;
+    let info = readSenderInfo(compound.view(), parts[0])!;
+    Check.isTrue(info.ssrc == 9 && info.rtpTimestamp == 4800 && info.packets == 10 && info.octets == 1000, "sender info")?;
+    Check.equalU64(3908988800, info.ntp >> 32)?;
+    Check.equalU64(0x80000000, info.ntp & 0xFFFFFFFF)?;
+    let blocks = readBlocks(compound.view(), parts[0]);
+    Check.isTrue(blocks.length == 1 && blocks[0].fractionLost == 25 && blocks[0].cumulativeLost == 3, "block")?;
+    let rr = receiverReport(5, [block][..]);
+    let rp = rtcpParts(rr.view());
+    return Check.isTrue(readBlocks(rr.view(), rp[0])[0].highestSequence == 70000, "receiver report block");
+}
+
+@test
+fn receptionStatsCountLossAndWraps() -> Result<void, TestFailure> {
+    var s = ReceptionStats.create(1, 48000);
+    var seq: u16 = 65530;
+    var ts: u32 = 0;
+    for (k in 0u64..20) {
+        if (k != 7 && k != 8) {
+            s.arrived(seq, ts, 1000 + k * 20);
+        }
+        seq = truncate<u16>(seq as u32 + 1);
+        ts += 960;
+    }
+    let b = s.block(1500);
+    Check.equalU64(65536 + 13, b.highestSequence as u64)?;
+    Check.equalU64(2, b.cumulativeLost as u64)?;
+    Check.equalU64(25, b.fractionLost as u64)?;
+    return Check.equalU64(0, b.jitter as u64);
+}

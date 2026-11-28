@@ -1,0 +1,421 @@
+// RTP and RTCP (RFC 3550) for WebRTC: packets read and built (with RFC 8285's one-byte header extensions), RTP told
+// from RTCP on one port (RFC 5761), RTCP's compound packets walked, sender and receiver reports built and read, and
+// the reception statistics a report block carries (loss, the highest sequence number, jitter).
+
+/// An RTP packet's header, as read: where its payload is in the bytes it was read from.
+public struct RtpHeader {
+    public marker: bool;
+    public payloadType: u8;
+    public sequence: u16;
+    public timestamp: u32;
+    public ssrc: u32;
+    /// The payload: `bytes[payloadStart..payloadEnd]` (padding left out).
+    public payloadStart: usize;
+    public payloadEnd: usize;
+    /// Where the header extension's elements are (0 and 0 when there is none), and its profile (0xBEDE: one-byte).
+    public extensionStart: usize;
+    public extensionEnd: usize;
+    public extensionProfile: u16;
+
+    /// The header of an RTP packet; null when `bytes` are not one (version 2, lengths that fit).
+    public fn read(bytes: Slice<u8>) -> RtpHeader? {
+        if (bytes.length < 12 || (bytes[0] >> 6) != 2) {
+            return null;
+        }
+        var at: usize = 12 + 4 * ((bytes[0] & 0x0F) as usize);
+        var header = RtpHeader {
+            marker: (bytes[1] & 0x80) != 0,
+            payloadType: bytes[1] & 0x7F,
+            sequence: read16(bytes, 2),
+            timestamp: read32(bytes, 4),
+            ssrc: read32(bytes, 8),
+            payloadStart: 0,
+            payloadEnd: bytes.length,
+            extensionStart: 0,
+            extensionEnd: 0,
+            extensionProfile: 0,
+        };
+        if ((bytes[0] & 0x10) != 0) {
+            if (at + 4 > bytes.length) {
+                return null;
+            }
+            header.extensionProfile = read16(bytes, at);
+            let words = read16(bytes, at + 2) as usize;
+            header.extensionStart = at + 4;
+            header.extensionEnd = at + 4 + 4 * words;
+            at = header.extensionEnd;
+        }
+        if (at > bytes.length) {
+            return null;
+        }
+        header.payloadStart = at;
+        if ((bytes[0] & 0x20) != 0) {
+            let pad = bytes[bytes.length - 1] as usize;
+            if (pad == 0 || at + pad > bytes.length) {
+                return null;
+            }
+            header.payloadEnd = bytes.length - pad;
+        }
+        return Some(header);
+    }
+
+    /// A one-byte header extension element's value (RFC 8285 §4.2), if the packet has element `id`.
+    public fn extension<region r>(borrow this, bytes: Slice<r, u8>, id: u8) -> Slice<r, u8>? {
+        if (this.extensionProfile != 0xBEDE) {
+            return null;
+        }
+        var at = this.extensionStart;
+        while (at < this.extensionEnd) {
+            let b = bytes[at];
+            if (b == 0) {
+                at += 1;
+                continue;
+            }
+            let element = b >> 4;
+            let length = ((b & 0x0F) as usize) + 1;
+            if (element == 15 || at + 1 + length > this.extensionEnd) {
+                return null;
+            }
+            if (element == id) {
+                return Some(bytes[at + 1..at + 1 + length]);
+            }
+            at += 1 + length;
+        }
+        return null;
+    }
+}
+
+/// Builds an RTP packet.
+public struct RtpBuilder {
+    public payloadType: u8;
+    public ssrc: u32;
+    public sequence: u16;
+    public timestamp: u32;
+    public marker: bool;
+    /// One-byte extension elements, each `[id, value...]` (values of 1 to 16 bytes).
+    elements: Vector<u8>;
+
+    public fn create(payloadType: u8, ssrc: u32) -> RtpBuilder => RtpBuilder {
+        payloadType: payloadType,
+        ssrc: ssrc,
+        sequence: 0,
+        timestamp: 0,
+        marker: false,
+        elements: Vector<u8>.create(),
+    };
+
+    /// Adds a one-byte extension element to the next packet.
+    public fn addExtension(borrow mut this, id: u8, value: Slice<u8>) {
+        if (id == 0 || id > 14 || value.length == 0 || value.length > 16) {
+            return;
+        }
+        let _ = this.elements.push((id << 4) | truncate<u8>(value.length - 1));
+        let _ = this.elements.extend(value);
+    }
+
+    /// The next packet with `payload`; the sequence number then moves on by one. The extensions are used up.
+    public fn build(borrow mut this, payload: Slice<u8>) -> Vector<u8> {
+        var out = Vector<u8>.create();
+        let x: u8 = if (this.elements.length > 0) 0x10 else 0;
+        let _ = out.push(0x80 | x);
+        let _ = out.push((if (this.marker) 0x80u8 else 0u8) | (this.payloadType & 0x7F));
+        put16(mut out, this.sequence);
+        put32(mut out, this.timestamp);
+        put32(mut out, this.ssrc);
+        if (this.elements.length > 0) {
+            let words = (this.elements.length + 3) / 4;
+            put16(mut out, 0xBEDE);
+            put16(mut out, truncate<u16>(words));
+            let _ = out.extend(this.elements.view());
+            while ((out.length - 16) < words * 4) {
+                let _ = out.push(0);
+            }
+            this.elements.clear();
+        }
+        let _ = out.extend(payload);
+        this.sequence = truncate<u16>(this.sequence as u32 + 1);
+        return out;
+    }
+}
+
+/// Whether a datagram on a muxed port is RTCP rather than RTP (RFC 5761 §4: packet types 192 to 223).
+public fn isRtcp(bytes: Slice<u8>) -> bool => bytes.length >= 8 && (bytes[0] >> 6) == 2 && bytes[1] >= 192 && bytes[1] <= 223;
+
+// RTCP packet types.
+public const SENDER_REPORT: u8 = 200;
+public const RECEIVER_REPORT: u8 = 201;
+public const SOURCE_DESCRIPTION: u8 = 202;
+public const GOODBYE: u8 = 203;
+public const TRANSPORT_FEEDBACK: u8 = 205;
+public const PAYLOAD_FEEDBACK: u8 = 206;
+
+/// One packet of an RTCP compound packet.
+public struct RtcpPart {
+    public packetType: u8;
+    /// The five bits after the version and padding: the report count, or a feedback message's type.
+    public count: u8;
+    public start: usize;
+    public length: usize;
+}
+
+/// The packets of an RTCP compound packet, in order; empty when the first is malformed (a later malformed one ends it).
+public fn rtcpParts(bytes: Slice<u8>) -> Vector<RtcpPart> {
+    var parts = Vector<RtcpPart>.create();
+    var at: usize = 0;
+    while (at + 4 <= bytes.length && (bytes[at] >> 6) == 2) {
+        let length = 4 * ((read16(bytes, at + 2) as usize) + 1);
+        if (at + length > bytes.length) {
+            break;
+        }
+        let _ = parts.push(RtcpPart { packetType: bytes[at + 1], count: bytes[at] & 0x1F, start: at, length: length });
+        at += length;
+    }
+    return parts;
+}
+
+/// A report block (RFC 3550 §6.4.1).
+public struct ReportBlock {
+    public ssrc: u32;
+    public fractionLost: u8;
+    public cumulativeLost: u32;
+    public highestSequence: u32;
+    public jitter: u32;
+    public lastSenderReport: u32;
+    public delaySinceLast: u32;
+}
+
+/// A sender report's sender information.
+public struct SenderInfo {
+    public ssrc: u32;
+    public ntp: u64;
+    public rtpTimestamp: u32;
+    public packets: u32;
+    public octets: u32;
+}
+
+/// A sender report: the sender's information and `blocks`.
+public fn senderReport(info: SenderInfo, blocks: Slice<ReportBlock>) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    let _ = out.push(0x80 | truncate<u8>(blocks.length & 0x1F));
+    let _ = out.push(SENDER_REPORT);
+    put16(mut out, truncate<u16>(6 + 6 * blocks.length));
+    put32(mut out, info.ssrc);
+    put32(mut out, truncate<u32>(info.ntp >> 32));
+    put32(mut out, truncate<u32>(info.ntp));
+    put32(mut out, info.rtpTimestamp);
+    put32(mut out, info.packets);
+    put32(mut out, info.octets);
+    for (b in blocks) {
+        putBlock(mut out, b);
+    }
+    return out;
+}
+
+/// A receiver report from `ssrc` with `blocks`.
+public fn receiverReport(ssrc: u32, blocks: Slice<ReportBlock>) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    let _ = out.push(0x80 | truncate<u8>(blocks.length & 0x1F));
+    let _ = out.push(RECEIVER_REPORT);
+    put16(mut out, truncate<u16>(1 + 6 * blocks.length));
+    put32(mut out, ssrc);
+    for (b in blocks) {
+        putBlock(mut out, b);
+    }
+    return out;
+}
+
+/// A source description with one CNAME chunk (RFC 3550 §6.5), which a compound packet should carry.
+public fn sourceDescription(ssrc: u32, cname: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    let _ = out.push(0x81);
+    let _ = out.push(SOURCE_DESCRIPTION);
+    put16(mut out, 0);
+    put32(mut out, ssrc);
+    let _ = out.push(1);
+    let n = if (cname.length > 255) 255usize else cname.length;
+    let _ = out.push(truncate<u8>(n));
+    let _ = out.extend(cname.bytes()[0..n]);
+    let _ = out.push(0);
+    while (out.length % 4 != 0) {
+        let _ = out.push(0);
+    }
+    let words = out.length / 4 - 1;
+    out[2] = truncate<u8>(words >> 8);
+    out[3] = truncate<u8>(words);
+    return out;
+}
+
+/// A goodbye from `ssrc`.
+public fn goodbye(ssrc: u32) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    let _ = out.push(0x81);
+    let _ = out.push(GOODBYE);
+    put16(mut out, 1);
+    put32(mut out, ssrc);
+    return out;
+}
+
+/// A sender report's information, from its part.
+public fn readSenderInfo(bytes: Slice<u8>, part: RtcpPart) -> SenderInfo? {
+    if (part.packetType != SENDER_REPORT || part.length < 28) {
+        return null;
+    }
+    let at = part.start;
+    return Some(SenderInfo {
+        ssrc: read32(bytes, at + 4),
+        ntp: ((read32(bytes, at + 8) as u64) << 32) | (read32(bytes, at + 12) as u64),
+        rtpTimestamp: read32(bytes, at + 16),
+        packets: read32(bytes, at + 20),
+        octets: read32(bytes, at + 24),
+    });
+}
+
+/// A sender or receiver report's blocks.
+public fn readBlocks(bytes: Slice<u8>, part: RtcpPart) -> Vector<ReportBlock> {
+    var blocks = Vector<ReportBlock>.create();
+    let first: usize = if (part.packetType == SENDER_REPORT) 28 else if (part.packetType == RECEIVER_REPORT) 8 else {
+        return blocks;
+    };
+    for (k in 0usize..(part.count as usize)) {
+        let at = part.start + first + 24 * k;
+        if (at + 24 > part.start + part.length) {
+            break;
+        }
+        let _ = blocks.push(ReportBlock {
+            ssrc: read32(bytes, at),
+            fractionLost: bytes[at + 4],
+            cumulativeLost: read32(bytes, at + 4) & 0xFFFFFF,
+            highestSequence: read32(bytes, at + 8),
+            jitter: read32(bytes, at + 12),
+            lastSenderReport: read32(bytes, at + 16),
+            delaySinceLast: read32(bytes, at + 20),
+        });
+    }
+    return blocks;
+}
+
+/// What a receiver keeps about one source, for its report blocks (RFC 3550 Appendix A.1, A.3 and A.8).
+public struct ReceptionStats {
+    public ssrc: u32;
+    clockRate: u32;
+    started: bool;
+    baseSequence: u32;
+    maxSequence: u16;
+    cycles: u32;
+    received: u32;
+    expectedPrior: u32;
+    receivedPrior: u32;
+    transit: i64;
+    /// The jitter times 16 (RFC 3550 A.8's integer form).
+    jitter: u64;
+    lastSenderReport: u32;
+    lastSenderReportAt: u64;
+
+    public fn create(ssrc: u32, clockRate: u32) -> ReceptionStats => ReceptionStats {
+        ssrc: ssrc,
+        clockRate: clockRate,
+        started: false,
+        baseSequence: 0,
+        maxSequence: 0,
+        cycles: 0,
+        received: 0,
+        expectedPrior: 0,
+        receivedPrior: 0,
+        transit: 0,
+        jitter: 0,
+        lastSenderReport: 0,
+        lastSenderReportAt: 0,
+    };
+
+    /// A packet that arrived at `nowMillis` with `sequence` and `timestamp`.
+    public fn arrived(borrow mut this, sequence: u16, timestamp: u32, nowMillis: u64) {
+        if (!this.started) {
+            this.started = true;
+            this.baseSequence = sequence as u32;
+            this.maxSequence = sequence;
+        } else {
+            let delta = truncate<u16>(sequence as u32 + 65536 - this.maxSequence as u32);
+            if (delta < 0x8000) {
+                if (sequence < this.maxSequence) {
+                    this.cycles += 65536;
+                }
+                this.maxSequence = sequence;
+            }
+        }
+        this.received += 1;
+        // Interarrival jitter, in timestamp units.
+        let arrival = truncate<i64>((nowMillis * (this.clockRate as u64)) / 1000);
+        let transit = arrival - (timestamp as i64);
+        if (this.received > 1) {
+            var d = transit - this.transit;
+            if (d < 0) {
+                d = -d;
+            }
+            let step = truncate<u64>(d);
+            this.jitter = this.jitter + step - ((this.jitter + 8) >> 4);
+        }
+        this.transit = transit;
+    }
+
+    /// A sender report from the source, at `nowMillis`: its middle 32 NTP bits go back in the block, with the delay.
+    public fn senderReport(borrow mut this, ntp: u64, nowMillis: u64) {
+        this.lastSenderReport = truncate<u32>(ntp >> 16);
+        this.lastSenderReportAt = nowMillis;
+    }
+
+    /// The report block for now, and the interval's counts reset.
+    public fn block(borrow mut this, nowMillis: u64) -> ReportBlock {
+        let extended = this.cycles + (this.maxSequence as u32);
+        let expected = extended - this.baseSequence + 1;
+        let lost = if (expected > this.received) expected - this.received else 0;
+        let expectedInterval = expected - this.expectedPrior;
+        let receivedInterval = this.received - this.receivedPrior;
+        this.expectedPrior = expected;
+        this.receivedPrior = this.received;
+        let lostInterval = if (expectedInterval > receivedInterval) expectedInterval - receivedInterval else 0;
+        let fraction: u8 = if (expectedInterval == 0 || lostInterval == 0) 0
+            else truncate<u8>((lostInterval << 8) / expectedInterval);
+        let delay: u32 = if (this.lastSenderReportAt == 0) 0
+            else truncate<u32>(((nowMillis - this.lastSenderReportAt) * 65536) / 1000);
+        return ReportBlock {
+            ssrc: this.ssrc,
+            fractionLost: fraction,
+            cumulativeLost: if (lost > 0x7FFFFF) 0x7FFFFF else lost,
+            highestSequence: extended,
+            jitter: truncate<u32>(this.jitter >> 4),
+            lastSenderReport: this.lastSenderReport,
+            delaySinceLast: delay,
+        };
+    }
+}
+
+/// An NTP timestamp (RFC 5905: seconds since 1900, and a 32-bit fraction) for Unix milliseconds.
+public fn ntpOf(unixMillis: u64) -> u64 {
+    let seconds = unixMillis / 1000 + 2208988800;
+    let fraction = ((unixMillis % 1000) << 32) / 1000;
+    return (seconds << 32) | fraction;
+}
+
+fn putBlock(out: borrow mut Vector<u8>, b: ReportBlock) {
+    put32(mut out, b.ssrc);
+    put32(mut out, ((b.fractionLost as u32) << 24) | (b.cumulativeLost & 0xFFFFFF));
+    put32(mut out, b.highestSequence);
+    put32(mut out, b.jitter);
+    put32(mut out, b.lastSenderReport);
+    put32(mut out, b.delaySinceLast);
+}
+
+fn read16(b: Slice<u8>, at: usize) -> u16 => ((b[at] as u16) << 8) | (b[at + 1] as u16);
+
+fn read32(b: Slice<u8>, at: usize) -> u32 =>
+    ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | (b[at + 3] as u32);
+
+fn put16(out: borrow mut Vector<u8>, v: u16) {
+    let _ = out.push(truncate<u8>(v >> 8));
+    let _ = out.push(truncate<u8>(v));
+}
+
+fn put32(out: borrow mut Vector<u8>, v: u32) {
+    put16(mut out, truncate<u16>(v >> 16));
+    put16(mut out, truncate<u16>(v));
+}
