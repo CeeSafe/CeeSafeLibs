@@ -1,0 +1,18 @@
+[package]
+name = "srtp"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+# AES-128 in counter mode is OpenSSL's (the processor's AES instructions where it has them); the rest is CeeSafe.
+links = ["crypto"]
+
+[target.macos]
+lib-dirs = ["/opt/homebrew/opt/openssl@3/lib"]
+
+[target.android]
+lib-dirs = ["$OPENSSL_ANDROID_DIR/lib"]
+
+[target.ios]
+lib-dirs = ["$OPENSSL_IOS_DIR/lib"]
+
+[dependencies]

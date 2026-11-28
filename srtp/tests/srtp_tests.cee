@@ -1,0 +1,98 @@
+// SRTP and SRTCP against RFC 3711's vectors and libsrtp's reference packets (checked with OpenSSL's command line and
+// Python's hmac), then round trips, the rollover counter, replays and tampering.
+
+fn hexOf(text: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    var high: i32 = -1;
+    for (c in text.bytes()) {
+        let v: i32 = if (c >= '0' && c <= '9') (c - '0') as i32 else if (c >= 'a' && c <= 'f') (c - 'a') as i32 + 10
+            else -1;
+        if (v < 0) {
+            continue;
+        }
+        if (high < 0) {
+            high = v;
+        } else {
+            out.push(truncate<u8>(high * 16 + v))!;
+            high = -1;
+        }
+    }
+    return out;
+}
+
+const KEY: StringView = "e1f97a0d3e018be0d64fa32c06de4139";
+const SALT: StringView = "0ec675ad498afeebb6960b3aabe6";
+
+fn context() -> SrtpContext => SrtpContext.create(hexOf(KEY).view(), hexOf(SALT).view())!;
+
+@test
+fn rfc3711KeyDerivation() -> Result<void, TestFailure> {
+    var key = [0u8; 16];
+    var salt = [0u8; 14];
+    let k = hexOf(KEY);
+    let s = hexOf(SALT);
+    for (i in 0usize..16) {
+        key[i] = k[i];
+    }
+    for (i in 0usize..14) {
+        salt[i] = s[i];
+    }
+    Check.isTrue(derive(key, salt, 0)[0..16] == hexOf("c61e7a93744f39ee10734afe3ff7a087").view(), "B.3 cipher key")?;
+    Check.isTrue(derive(key, salt, 2)[0..14] == hexOf("30cbbc08863d8c85d49db34a9ae1").view(), "B.3 cipher salt")?;
+    return Check.isTrue(derive(key, salt, 1)[0..20] == hexOf("cebe321f6ff7716b6fd4ab49af256a156d38baa4").view(), "B.3 auth key");
+}
+
+@test
+fn libsrtpReferencePackets() -> Result<void, TestFailure> {
+    var send = context();
+    var packet = hexOf("800f1234decafbadcafebabeabababababababababababababababab");
+    Check.isTrue(send.protect(mut packet), "protected")?;
+    Check.isTrue(packet.view() == hexOf("800f1234decafbadcafebabe4e55dc4ce79978d88ca4d215949d2402b78d6acc99ea179b8dbb").view(), "the reference SRTP packet")?;
+    var receive = context();
+    Check.isTrue(receive.unprotect(mut packet), "unprotected")?;
+    Check.isTrue(packet.view() == hexOf("800f1234decafbadcafebabeabababababababababababababababab").view(), "the plaintext back")?;
+    var rtcp = hexOf("81c8000bcafebabeabababababababababababababababab");
+    Check.isTrue(send.protectRtcp(mut rtcp), "RTCP protected")?;
+    Check.isTrue(rtcp.view() == hexOf("81c8000bcafebabe7128035be487b9bdbef89041f977a5a880000001993e08cd54d6c1230798").view(), "the reference SRTCP packet")?;
+    Check.isTrue(receive.unprotectRtcp(mut rtcp), "RTCP unprotected")?;
+    Check.isTrue(rtcp.view() == hexOf("81c8000bcafebabeabababababababababababababababab").view(), "RTCP back")?;
+    var again = hexOf("81c8000bcafebabe7128035be487b9bdbef89041f977a5a880000001993e08cd54d6c1230798");
+    return Check.isTrue(!receive.unprotectRtcp(mut again), "an SRTCP replay is refused");
+}
+
+fn rtp(seq: u16, ssrc: u32, payload: u8) -> Vector<u8> {
+    var p = Vector<u8>.create();
+    p.extend([0x80u8, 111, truncate<u8>(seq >> 8), truncate<u8>(seq), 0, 0, 0, 1, truncate<u8>(ssrc >> 24),
+        truncate<u8>(ssrc >> 16), truncate<u8>(ssrc >> 8), truncate<u8>(ssrc), payload, payload, payload][..])!;
+    return p;
+}
+
+@test
+fn theRolloverCounterFollowsAWrap() -> Result<void, TestFailure> {
+    var send = context();
+    var receive = context();
+    var seq: u16 = 65530;
+    for (k in 0..12) {
+        var p = rtp(seq, 7, truncate<u8>(k));
+        Check.isTrue(send.protect(mut p), "protected")?;
+        Check.isTrue(receive.unprotect(mut p), "unprotected across the wrap")?;
+        Check.isTrue(p[12] == truncate<u8>(k), "the payload back")?;
+        seq = truncate<u16>(seq as u32 + 1);
+    }
+    // Late (within the window) is fine once; again it is a replay; far behind is refused.
+    var a = rtp(seq, 7, 1);
+    var b = rtp(truncate<u16>(seq as u32 + 1), 7, 2);
+    Check.isTrue(send.protect(mut a) && send.protect(mut b), "two more")?;
+    var copy = Vector<u8>.create();
+    copy.extend(a.view())!;
+    Check.isTrue(receive.unprotect(mut b), "the later first")?;
+    Check.isTrue(receive.unprotect(mut a), "the earlier, late")?;
+    Check.isTrue(!receive.unprotect(mut copy), "the earlier again: a replay")?;
+    // A changed byte fails the tag, and the packet is left as it came.
+    var c = rtp(truncate<u16>(seq as u32 + 2), 7, 3);
+    Check.isTrue(send.protect(mut c), "protected")?;
+    c[13] = c[13] ^ 1;
+    let length = c.length;
+    Check.isTrue(!receive.unprotect(mut c), "tampered: refused")?;
+    return Check.equalU64(length as u64, c.length as u64);
+}

@@ -1,0 +1,370 @@
+// SRTP and SRTCP (RFC 3711) with the AES_CM_128_HMAC_SHA1_80 profile, the one WebRTC's DTLS-SRTP agrees
+// (RFC 5764): session keys derived from the master key and salt, AES-128 in counter mode (OpenSSL's), HMAC-SHA1
+// tags of 80 bits, the rollover counter kept and estimated per SSRC, and a replay window of 64 packets.
+
+extern "C" {
+    @effects(alloc)
+    fn EVP_CIPHER_CTX_new() -> *mut void;
+    @effects()
+    fn EVP_CIPHER_CTX_free(ctx: *mut void);
+    @effects()
+    fn EVP_aes_128_ctr() -> *void;
+    @effects(alloc)
+    fn EVP_EncryptInit_ex(ctx: *mut void, cipher: *void, engine: *mut void, key: *u8, iv: *u8) -> i32;
+    @effects()
+    fn EVP_EncryptUpdate(ctx: *mut void, out: *mut u8, outLength: *mut i32, input: *u8, inputLength: i32) -> i32;
+}
+
+const TAG: usize = 10;
+const WINDOW: u64 = 64;
+
+/// HMAC-SHA1 with its key's pads already hashed.
+struct Mac {
+    inner: Sha1;
+    outer: Sha1;
+}
+
+fn macOf(key: Slice<u8>) -> Mac {
+    var block = [0u8; 64];
+    for (k in 0usize..key.length) {
+        block[k] = key[k];
+    }
+    var inner = Sha1.create();
+    var outer = Sha1.create();
+    var pad = [0u8; 64];
+    for (k in 0usize..64) {
+        pad[k] = block[k] ^ 0x36;
+    }
+    inner.update(pad[..]);
+    for (k in 0usize..64) {
+        pad[k] = block[k] ^ 0x5C;
+    }
+    outer.update(pad[..]);
+    return Mac { inner: inner, outer: outer };
+}
+
+fn tagOf(mac: borrow Mac, data: Slice<u8>, tail: Slice<u8>) -> [u8; 20] {
+    var h = mac.inner;
+    h.update(data);
+    h.update(tail);
+    let first = h.finish();
+    var o = mac.outer;
+    o.update(first[..]);
+    return o.finish();
+}
+
+/// A receiving stream's state: the rollover counter, the highest sequence number, and the replay window.
+struct Stream {
+    ssrc: u32;
+    roc: u32;
+    highest: u16;
+    window: u64;
+    sentAny: bool;
+}
+
+/// One direction's SRTP and SRTCP: a context to protect what this side sends, another to unprotect what it
+/// receives.
+@noncopy
+public struct SrtpContext {
+    private rtpCipher: usize;
+    private rtcpCipher: usize;
+    private rtpSalt: [u8; 14];
+    private rtcpSalt: [u8; 14];
+    private rtpMac: Mac;
+    private rtcpMac: Mac;
+    private streams: Vector<Stream>;
+    private rtcpIndex: u32;
+    private rtcpWindow: u64;
+    private rtcpHighest: u32;
+    private rtcpAny: bool;
+
+    /// Safety: both cipher contexts are owned by this value.
+    drop {
+        unsafe {
+            EVP_CIPHER_CTX_free(this.rtpCipher as *mut void);
+            EVP_CIPHER_CTX_free(this.rtcpCipher as *mut void);
+        }
+    }
+
+    /// A context from a 16-byte master key and a 14-byte master salt; null for other lengths, or without memory.
+    /// Safety: the contexts are checked, and freed if the second cannot be made.
+    public fn create(masterKey: Slice<u8>, masterSalt: Slice<u8>) -> SrtpContext? {
+        if (masterKey.length != 16 || masterSalt.length != 14) {
+            return null;
+        }
+        var key = [0u8; 16];
+        var salt = [0u8; 14];
+        for (k in 0usize..16) {
+            key[k] = masterKey[k];
+        }
+        for (k in 0usize..14) {
+            salt[k] = masterSalt[k];
+        }
+        let rtpKey = derive(key, salt, 0);
+        let rtpAuth = derive(key, salt, 1);
+        let rtpSalt = derive(key, salt, 2);
+        let rtcpKey = derive(key, salt, 3);
+        let rtcpAuth = derive(key, salt, 4);
+        let rtcpSalt = derive(key, salt, 5);
+        let rtp = unsafe { cipherOf(rtpKey[0..16]) };
+        if (rtp == 0) {
+            return null;
+        }
+        let rtcp = unsafe { cipherOf(rtcpKey[0..16]) };
+        if (rtcp == 0) {
+            unsafe { EVP_CIPHER_CTX_free(rtp as *mut void); }
+            return null;
+        }
+        var a = [0u8; 14];
+        var b = [0u8; 14];
+        for (k in 0usize..14) {
+            a[k] = rtpSalt[k];
+            b[k] = rtcpSalt[k];
+        }
+        return Some(SrtpContext {
+            rtpCipher: rtp,
+            rtcpCipher: rtcp,
+            rtpSalt: a,
+            rtcpSalt: b,
+            rtpMac: macOf(rtpAuth[0..20]),
+            rtcpMac: macOf(rtcpAuth[0..20]),
+            streams: Vector<Stream>.create(),
+            rtcpIndex: 0,
+            rtcpWindow: 0,
+            rtcpHighest: 0,
+            rtcpAny: false,
+        });
+    }
+
+    /// Encrypts an RTP packet's payload in place and appends its tag; false if it is not RTP, or without memory.
+    public fn protect(borrow mut this, packet: borrow mut Vector<u8>) -> bool {
+        let header = headerLength(packet.view()) ?? { return false; };
+        let seq = read16(packet.view(), 2);
+        let ssrc = read32(packet.view(), 8);
+        let s = this.streamOf(ssrc, seq);
+        // Sending: the counter rolls over when the sequence number wraps.
+        if (this.streams[s].sentAny && seq < this.streams[s].highest && this.streams[s].highest - seq > 0x8000) {
+            this.streams[s].roc = this.streams[s].roc + 1;
+        }
+        if (!this.streams[s].sentAny || seq > this.streams[s].highest || this.streams[s].highest - seq > 0x8000) {
+            this.streams[s].highest = seq;
+        }
+        this.streams[s].sentAny = true;
+        let roc = this.streams[s].roc;
+        let iv = ivOf(this.rtpSalt, ssrc, ((roc as u64) << 16) | (seq as u64));
+        cryptFrom(this.rtpCipher, iv, mut packet, header);
+        let rocBytes = be32(roc);
+        let tag = tagOf(borrow this.rtpMac, packet.view(), rocBytes[..]);
+        return packet.extend(tag[0..TAG]).isOk();
+    }
+
+    /// Checks an SRTP packet's tag and replay, decrypts it in place and takes the tag off; false (and the packet as
+    /// it was) when it fails.
+    public fn unprotect(borrow mut this, packet: borrow mut Vector<u8>) -> bool {
+        if (packet.length < 12 + TAG) {
+            return false;
+        }
+        let length = packet.length - TAG;
+        let header = headerLength(packet.view()[0..length]) ?? { return false; };
+        let seq = read16(packet.view(), 2);
+        let ssrc = read32(packet.view(), 8);
+        let s = this.streamOf(ssrc, seq);
+        let stream = this.streams[s];
+        // The rollover counter this packet was sent with (RFC 3711 Appendix A).
+        var v = stream.roc;
+        if (stream.sentAny) {
+            if (stream.highest < 0x8000) {
+                if (seq > stream.highest && seq - stream.highest > 0x8000 && v > 0) {
+                    v = v - 1;
+                }
+            } else if (seq < stream.highest - 0x8000) {
+                v = v + 1;
+            }
+        }
+        let index = ((v as u64) << 16) | (seq as u64);
+        let highestIndex = ((stream.roc as u64) << 16) | (stream.highest as u64);
+        if (stream.sentAny && index <= highestIndex) {
+            let behind = highestIndex - index;
+            if (behind >= WINDOW || (stream.window >> behind) & 1 == 1) {
+                return false;
+            }
+        }
+        let rocBytes = be32(v);
+        let tag = tagOf(borrow this.rtpMac, packet.view()[0..length], rocBytes[..]);
+        if (!ConstantTime.equal(tag[0..TAG], packet.view()[length..])) {
+            return false;
+        }
+        packet.truncate(length);
+        let iv = ivOf(this.rtpSalt, ssrc, index);
+        cryptFrom(this.rtpCipher, iv, mut packet, header);
+        // The window and the highest index move only for a packet that passed.
+        if (!stream.sentAny || index > highestIndex) {
+            let ahead = if (stream.sentAny) index - highestIndex else 0;
+            this.streams[s].window = if (ahead >= WINDOW) 1 else (stream.window << ahead) | 1;
+            this.streams[s].roc = v;
+            this.streams[s].highest = seq;
+            this.streams[s].sentAny = true;
+        } else {
+            this.streams[s].window = stream.window | (1u64 << (highestIndex - index));
+        }
+        return true;
+    }
+
+    /// Encrypts an RTCP packet (all after the sender's SSRC) in place, then appends the E flag and index and the tag.
+    public fn protectRtcp(borrow mut this, packet: borrow mut Vector<u8>) -> bool {
+        if (packet.length < 8) {
+            return false;
+        }
+        this.rtcpIndex = (this.rtcpIndex + 1) & 0x7FFFFFFF;
+        let index = this.rtcpIndex;
+        let ssrc = read32(packet.view(), 4);
+        let iv = ivOf(this.rtcpSalt, ssrc, index as u64);
+        cryptFrom(this.rtcpCipher, iv, mut packet, 8);
+        let e = be32(0x80000000 | index);
+        if (packet.extend(e[..]) is Err(_)) {
+            return false;
+        }
+        let tag = tagOf(borrow this.rtcpMac, packet.view(), Vector<u8>.create().view());
+        return packet.extend(tag[0..TAG]).isOk();
+    }
+
+    /// Checks an SRTCP packet's tag and replay, decrypts it in place and takes off the index and tag.
+    public fn unprotectRtcp(borrow mut this, packet: borrow mut Vector<u8>) -> bool {
+        if (packet.length < 8 + 4 + TAG) {
+            return false;
+        }
+        let signed = packet.length - TAG;
+        let tag = tagOf(borrow this.rtcpMac, packet.view()[0..signed], Vector<u8>.create().view());
+        if (!ConstantTime.equal(tag[0..TAG], packet.view()[signed..])) {
+            return false;
+        }
+        let word = read32(packet.view(), signed - 4);
+        let index = word & 0x7FFFFFFF;
+        if (this.rtcpAny && index <= this.rtcpHighest) {
+            let behind = (this.rtcpHighest - index) as u64;
+            if (behind >= WINDOW || (this.rtcpWindow >> behind) & 1 == 1) {
+                return false;
+            }
+            this.rtcpWindow = this.rtcpWindow | (1u64 << behind);
+        } else {
+            let ahead: u64 = if (this.rtcpAny) (index - this.rtcpHighest) as u64 else 0;
+            this.rtcpWindow = if (ahead >= WINDOW) 1 else (this.rtcpWindow << ahead) | 1;
+            this.rtcpHighest = index;
+            this.rtcpAny = true;
+        }
+        packet.truncate(signed - 4);
+        if (word & 0x80000000 != 0) {
+            let ssrc = read32(packet.view(), 4);
+            let iv = ivOf(this.rtcpSalt, ssrc, index as u64);
+            cryptFrom(this.rtcpCipher, iv, mut packet, 8);
+        }
+        return true;
+    }
+
+    fn streamOf(borrow mut this, ssrc: u32, seq: u16) -> usize {
+        for (k in 0usize..this.streams.length) {
+            if (this.streams[k].ssrc == ssrc) {
+                return k;
+            }
+        }
+        let _ = this.streams.push(Stream { ssrc: ssrc, roc: 0, highest: seq, window: 0, sentAny: false });
+        return this.streams.length - 1;
+    }
+}
+
+/// An RTP header's length (fixed part, CSRCs, extension); null when it is not an RTP version 2 packet that holds it.
+public fn headerLength(packet: Slice<u8>) -> usize? {
+    if (packet.length < 12 || (packet[0] >> 6) != 2) {
+        return null;
+    }
+    var n: usize = 12 + 4 * ((packet[0] & 0x0F) as usize);
+    if (packet[0] & 0x10 != 0) {
+        if (packet.length < n + 4) {
+            return null;
+        }
+        n += 4 + 4 * (read16(packet, n + 2) as usize);
+    }
+    if (n > packet.length) {
+        return null;
+    }
+    return Some(n);
+}
+
+/// A session key, salt or authentication key (RFC 3711 §4.3.1, key derivation rate 0): AES-CM under the master key
+/// with the master salt and `label`.
+/// Safety: the context made here is freed here; `cryptFrom` stays within the vector.
+fn derive(key: [u8; 16], salt: [u8; 14], label: u8) -> [u8; 32] {
+    var iv = [0u8; 16];
+    for (k in 0usize..14) {
+        iv[k] = salt[k];
+    }
+    iv[7] = iv[7] ^ label;
+    var stream = Vector<u8>.create();
+    var out = [0u8; 32];
+    if (stream.resize(32, 0) is Err(_)) {
+        return out;
+    }
+    let cipher = unsafe { cipherOf(key[..]) };
+    if (cipher != 0) {
+        cryptFrom(cipher, iv, mut stream, 0);
+        unsafe { EVP_CIPHER_CTX_free(cipher as *mut void); }
+    }
+    for (k in 0usize..32) {
+        out[k] = stream[k];
+    }
+    return out;
+}
+
+/// The counter's first block for a packet: the session salt, the SSRC and the 48-bit index, XORed (§4.1.1).
+fn ivOf(salt: [u8; 14], ssrc: u32, index: u64) -> [u8; 16] {
+    var iv = [0u8; 16];
+    for (k in 0usize..14) {
+        iv[k] = salt[k];
+    }
+    let s = be32(ssrc);
+    for (k in 0usize..4) {
+        iv[4 + k] = iv[4 + k] ^ s[k];
+    }
+    for (k in 0usize..6) {
+        iv[8 + k] = iv[8 + k] ^ truncate<u8>(index >> truncate<u64>(40 - 8 * k));
+    }
+    return iv;
+}
+
+/// An AES-128-CTR context under `key`; 0 without memory.
+/// Safety: `key` holds 16 bytes; the context is the caller's to free.
+unsafe fn cipherOf(key: Slice<u8>) -> usize {
+    let ctx = EVP_CIPHER_CTX_new();
+    if (ctx.isNull()) {
+        return 0;
+    }
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), 0 as *mut void, key.ptr, 0 as *u8) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return 0;
+    }
+    return ctx as usize;
+}
+
+/// XORs `data[from..]` with the key stream from `iv` (encrypting and decrypting alike).
+/// Safety: `cipher` is a live AES-128-CTR context (every caller passes one this package made and still owns);
+/// OpenSSL writes exactly `data.length - from` bytes, over the same bytes it reads, inside the vector.
+fn cryptFrom(cipher: usize, iv: [u8; 16], data: borrow mut Vector<u8>, from: usize) {
+    if (from >= data.length) {
+        return;
+    }
+    let n = data.length - from;
+    unsafe {
+        let start = data.viewMut().ptr.add(from);
+        let ctx = cipher as *mut void;
+        EVP_EncryptInit_ex(ctx, 0 as *void, 0 as *mut void, 0 as *u8, iv[..].ptr);
+        var written: i32 = 0;
+        EVP_EncryptUpdate(ctx, start, borrow mut written as *mut i32, start as *u8, truncate<i32>(n));
+    }
+}
+
+fn be32(v: u32) -> [u8; 4] => [truncate<u8>(v >> 24), truncate<u8>(v >> 16), truncate<u8>(v >> 8), truncate<u8>(v)];
+
+fn read16(b: Slice<u8>, at: usize) -> u16 => ((b[at] as u16) << 8) | (b[at + 1] as u16);
+
+fn read32(b: Slice<u8>, at: usize) -> u32 =>
+    ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | (b[at + 3] as u32);
