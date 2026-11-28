@@ -1,0 +1,390 @@
+// DTLS 1.2 for WebRTC (RFC 8827, 8842, 5764) through OpenSSL 3, without I/O: a self-signed ECDSA P-256 certificate
+// and its SHA-256 fingerprint; an endpoint, client or server, that takes the datagrams which came and gives those to
+// send (each at most `MTU` bytes, whole records); TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 on P-256 only, the
+// cookie exchange on the server side, and the SRTP keys (SRTP_AES128_CM_HMAC_SHA1_80) exported once it is done.
+
+import tls.OPENSSL_init_ssl;
+import tls.SSL_CTX_new;
+import tls.SSL_CTX_free;
+import tls.SSL_CTX_ctrl;
+import tls.SSL_CTX_set_options;
+import tls.SSL_CTX_set_verify;
+import tls.SSL_CTX_use_certificate;
+import tls.SSL_CTX_use_PrivateKey;
+import tls.SSL_new;
+import tls.SSL_free;
+import tls.SSL_set_bio;
+import tls.SSL_set_accept_state;
+import tls.SSL_set_connect_state;
+import tls.SSL_ctrl;
+import tls.SSL_do_handshake;
+import tls.SSL_get_error;
+import tls.SSL_read_ex;
+import tls.SSL_write_ex;
+import tls.SSL_shutdown;
+import tls.SSL_get0_peer_certificate;
+import tls.BIO_new;
+import tls.BIO_s_mem;
+import tls.BIO_ctrl;
+import tls.BIO_ctrl_pending;
+import tls.BIO_write;
+import tls.BIO_read;
+import tls.X509_free;
+import tls.ERR_clear_error;
+import tls.ERR_get_error;
+import pkey.EVP_PKEY_free;
+import pkey.EVP_PKEY_Q_keygen;
+import pkey.EVP_sha256;
+
+/// The largest datagram an endpoint gives: under IPv6's minimum MTU with room for TURN's framing.
+public const MTU: usize = 1200;
+
+public enum DtlsError {
+    OutOfMemory,
+    /// OpenSSL refused the configuration (the code is OpenSSL's error).
+    Config(u64),
+    /// The handshake failed (OpenSSL's error code; the alert telling the peer why may be in the output).
+    Handshake(u64),
+    /// The peer closed the session, or it failed before.
+    Closed,
+}
+
+/// A self-signed ECDSA P-256 certificate and its key, made for one call (RFC 8827 §6.5).
+@noncopy
+public struct DtlsCertificate {
+    private key: usize;
+    private x509: usize;
+
+    /// Safety: `key` and `x509` are owned by this value.
+    drop {
+        unsafe {
+            X509_free(this.x509 as *mut void);
+            EVP_PKEY_free(this.key as *mut void);
+        }
+    }
+
+    /// A new key and certificate (CN "ceesafe", valid from a day ago for 30 days, a random serial).
+    /// Safety: each pointer is checked before use and freed on every path that does not keep it.
+    public fn generate() -> Result<DtlsCertificate, DtlsError> {
+        unsafe {
+            OPENSSL_init_ssl(0, 0 as *void);
+            let key = EVP_PKEY_Q_keygen(0 as *mut void, 0 as *CChar, "EC\0".ptr as *CChar, "P-256\0".ptr as *CChar);
+            if (key.isNull()) {
+                return Err(DtlsError.Config(ERR_get_error()));
+            }
+            let x = X509_new();
+            if (x.isNull()) {
+                EVP_PKEY_free(key);
+                return Err(DtlsError.OutOfMemory);
+            }
+            var serial = [0u8; 4];
+            let _ = Random.fill(mut serial[..]);
+            let number = ((((serial[0] & 0x7F) as u32) << 24) | ((serial[1] as u32) << 16) | ((serial[2] as u32) << 8)
+                | (serial[3] as u32) | 1) as i64;
+            let name = X509_get_subject_name(x);
+            let ok = X509_set_version(x, 2) == 1
+                && ASN1_INTEGER_set(X509_get_serialNumber(x), number) == 1
+                && !X509_gmtime_adj(X509_getm_notBefore(x), -86400).isNull()
+                && !X509_gmtime_adj(X509_getm_notAfter(x), 30 * 86400).isNull()
+                && X509_set_pubkey(x, key) == 1
+                && X509_NAME_add_entry_by_txt(name, "CN\0".ptr as *CChar, MBSTRING_ASC, "ceesafe".ptr, 7, -1, 0) == 1
+                && X509_set_issuer_name(x, name) == 1
+                && X509_sign(x, key, EVP_sha256()) > 0;
+            if (!ok) {
+                let code = ERR_get_error();
+                X509_free(x);
+                EVP_PKEY_free(key);
+                return Err(DtlsError.Config(code));
+            }
+            return Ok(DtlsCertificate { key: key as usize, x509: x as usize });
+        }
+    }
+
+    /// The SHA-256 fingerprint for SDP's `a=fingerprint:sha-256`: upper-case hex, colon-separated.
+    /// Safety: `x509` is live while `this` is.
+    public fn fingerprint(borrow this) -> String => unsafe { fingerprintOf(this.x509 as *mut void) };
+}
+
+/// The local and remote SRTP master keys and salts (RFC 5764 §4.2), from the endpoint's point of view.
+public struct SrtpKeys {
+    public localKey: [u8; 16];
+    public localSalt: [u8; 14];
+    public remoteKey: [u8; 16];
+    public remoteSalt: [u8; 14];
+}
+
+/// One side of a DTLS session, without I/O.
+///
+/// ```ceesafe
+/// var endpoint = DtlsEndpoint.create(borrow certificate, client)?;
+/// endpoint.advance()?;                              // a client's ClientHello
+/// while (endpoint.takeDatagram() is Some(d)) { send(d); }
+/// // for each datagram that comes: endpoint.feed(d)?; then send what takeDatagram gives
+/// // every 50 ms or so: endpoint.tick(), for retransmissions; then send what takeDatagram gives
+/// if (endpoint.connected) { check endpoint.peerFingerprint() against the SDP's; keys = endpoint.srtpKeys(); }
+/// ```
+@noncopy
+public struct DtlsEndpoint {
+    private ctx: usize;
+    private ssl: usize;
+    private output: usize;
+    private outgoing: Vector<u8>;
+    public client: bool;
+    public connected: bool;
+    public closed: bool;
+
+    /// Safety: `ssl` and `ctx` are owned by this value; the SSL owns its two BIOs.
+    drop {
+        unsafe {
+            SSL_free(this.ssl as *mut void);
+            SSL_CTX_free(this.ctx as *mut void);
+        }
+    }
+
+    /// An endpoint presenting `certificate`: the DTLS client (`setup:active`) or the server.
+    /// Safety: every pointer is checked; on failure what was made is freed.
+    public fn create(certificate: borrow DtlsCertificate, client: bool) -> Result<DtlsEndpoint, DtlsError> {
+        unsafe {
+            OPENSSL_init_ssl(0, 0 as *void);
+            ERR_clear_error();
+            let ctx = SSL_CTX_new(DTLS_method());
+            if (ctx.isNull()) {
+                return Err(DtlsError.OutOfMemory);
+            }
+            var options = SSL_OP_NO_QUERY_MTU;
+            if (!client) {
+                options = options | SSL_OP_COOKIE_EXCHANGE;
+            }
+            SSL_CTX_set_options(ctx, options);
+            let ok = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, DTLS1_2_VERSION, 0 as *mut void) == 1
+                && SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, DTLS1_2_VERSION, 0 as *mut void) == 1
+                && SSL_CTX_set_cipher_list(ctx, "ECDHE-ECDSA-AES128-GCM-SHA256\0".ptr as *CChar) == 1
+                && SSL_CTX_ctrl(ctx, SSL_CTRL_SET_GROUPS_LIST, 0, "P-256\0".ptr as *mut void) == 1
+                && SSL_CTX_set_tlsext_use_srtp(ctx, "SRTP_AES128_CM_SHA1_80\0".ptr as *CChar) == 0
+                && SSL_CTX_use_certificate(ctx, certificate.x509 as *mut void) == 1
+                && SSL_CTX_use_PrivateKey(ctx, certificate.key as *mut void) == 1;
+            if (!ok) {
+                let code = ERR_get_error();
+                SSL_CTX_free(ctx);
+                return Err(DtlsError.Config(code));
+            }
+            SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER_REQUIRED, 0 as *void);
+            SSL_CTX_set_cert_verify_callback(ctx, acceptAny, 0 as *mut void);
+            if (!client) {
+                SSL_CTX_set_cookie_generate_cb(ctx, cookieMake);
+                SSL_CTX_set_cookie_verify_cb(ctx, cookieCheck);
+            }
+            let ssl = SSL_new(ctx);
+            if (ssl.isNull()) {
+                SSL_CTX_free(ctx);
+                return Err(DtlsError.OutOfMemory);
+            }
+            let input = BIO_new(BIO_s_mem());
+            let output = BIO_new(BIO_s_mem());
+            if (input.isNull() || output.isNull()) {
+                SSL_free(ssl);
+                SSL_CTX_free(ctx);
+                return Err(DtlsError.OutOfMemory);
+            }
+            BIO_ctrl(input, BIO_C_SET_BUF_MEM_EOF_RETURN, -1, 0 as *mut void);
+            BIO_ctrl(output, BIO_C_SET_BUF_MEM_EOF_RETURN, -1, 0 as *mut void);
+            SSL_set_bio(ssl, input, output);
+            SSL_ctrl(ssl, SSL_CTRL_SET_MTU, truncate<i64>(MTU), 0 as *mut void);
+            if (client) {
+                SSL_set_connect_state(ssl);
+            } else {
+                SSL_set_accept_state(ssl);
+            }
+            return Ok(DtlsEndpoint {
+                ctx: ctx as usize,
+                ssl: ssl as usize,
+                output: output as usize,
+                outgoing: Vector<u8>.create(),
+                client: client,
+                connected: false,
+                closed: false,
+            });
+        }
+    }
+
+    /// A datagram from the peer, then the session advanced (`advance`).
+    /// Safety: `ssl`'s input BIO is live; BIO_write copies exactly `datagram.length` bytes.
+    public fn feed(borrow mut this, datagram: Slice<u8>) -> Result<bool, DtlsError> {
+        if (datagram.length > 0) {
+            let input = unsafe { inputOf(this.ssl as *mut void) };
+            let n = unsafe { BIO_write(input, datagram.ptr as *void, truncate<i32>(datagram.length)) };
+            if (n < 0) {
+                return Err(DtlsError.OutOfMemory);
+            }
+        }
+        return this.advance();
+    }
+
+    /// Moves the handshake on (a client's first call makes its ClientHello): true once it is complete. After it, the
+    /// session reads and drops what the peer sends (WebRTC's media is SRTP, beside DTLS), noting a close.
+    /// Safety: `ssl` is live.
+    public fn advance(borrow mut this) -> Result<bool, DtlsError> {
+        if (this.closed) {
+            return Err(DtlsError.Closed);
+        }
+        let ssl = this.ssl as *mut void;
+        unsafe { ERR_clear_error(); }
+        if (!this.connected) {
+            let r = unsafe { SSL_do_handshake(ssl) };
+            if (r == 1) {
+                this.connected = true;
+            } else {
+                let e = unsafe { SSL_get_error(ssl, r) };
+                if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+                    return Ok(false);
+                }
+                this.closed = true;
+                return Err(DtlsError.Handshake(unsafe { ERR_get_error() }));
+            }
+        }
+        var scratch = [0u8; 256];
+        loop {
+            var n: usize = 0;
+            let r = unsafe { SSL_read_ex(ssl, scratch[..].ptr as *mut void, 256, borrow mut n as *mut usize) };
+            if (r == 1) {
+                continue;
+            }
+            let e = unsafe { SSL_get_error(ssl, r) };
+            if (e == SSL_ERROR_ZERO_RETURN) {
+                this.closed = true;
+            }
+            break;
+        }
+        return Ok(true);
+    }
+
+    /// Retransmits a flight whose answer is late (RFC 6347 §4.2.4); call it every 50 ms or so until connected.
+    /// Safety: `ssl` is live.
+    public fn tick(borrow mut this) {
+        if (!this.connected && !this.closed) {
+            unsafe { SSL_ctrl(this.ssl as *mut void, DTLS_CTRL_HANDLE_TIMEOUT, 0, 0 as *mut void); }
+        }
+    }
+
+    /// Sends close_notify (in the output).
+    /// Safety: `ssl` is live.
+    public fn close(borrow mut this) {
+        if (this.connected && !this.closed) {
+            unsafe { SSL_shutdown(this.ssl as *mut void); }
+        }
+        this.closed = true;
+    }
+
+    /// The next datagram to send: whole records, as many as fit in `MTU` bytes (at least one).
+    /// Safety: the output BIO is live; BIO_read writes at most the room it is given.
+    public fn takeDatagram(borrow mut this) -> Vector<u8>? {
+        let output = this.output as *mut void;
+        let pending = unsafe { BIO_ctrl_pending(output) };
+        if (pending > 0) {
+            let start = this.outgoing.length;
+            if (this.outgoing.resize(start + pending, 0) is Err(_)) {
+                return null;
+            }
+            let room = this.outgoing.viewMut()[start..];
+            let n = unsafe { BIO_read(output, room.ptr as *mut void, truncate<i32>(pending)) };
+            this.outgoing.truncate(start + (if (n > 0) truncate<usize>(n) else 0));
+        }
+        if (this.outgoing.length == 0) {
+            return null;
+        }
+        // Whole records (13-byte header, length in bytes 11 and 12) up to MTU.
+        var cut: usize = 0;
+        while (cut + 13 <= this.outgoing.length) {
+            let size = 13 + (((this.outgoing[cut + 11] as usize) << 8) | (this.outgoing[cut + 12] as usize));
+            if (cut > 0 && cut + size > MTU) {
+                break;
+            }
+            cut += size;
+        }
+        if (cut == 0 || cut > this.outgoing.length) {
+            cut = this.outgoing.length;
+        }
+        var datagram = Vector<u8>.create();
+        if (datagram.extend(this.outgoing.view()[0..cut]) is Err(_)) {
+            return null;
+        }
+        var rest = Vector<u8>.create();
+        let _ = rest.extend(this.outgoing.view()[cut..]);
+        this.outgoing = rest;
+        return Some(datagram);
+    }
+
+    /// The peer's certificate's SHA-256 fingerprint, as `DtlsCertificate.fingerprint` writes one.
+    /// Safety: `ssl` is live; the certificate is borrowed from it for the call.
+    public fn peerFingerprint(borrow this) -> String? {
+        let cert = unsafe { SSL_get0_peer_certificate(this.ssl as *mut void) };
+        if (cert.isNull()) {
+            return null;
+        }
+        return Some(unsafe { fingerprintOf(cert) });
+    }
+
+    /// The SRTP keys, once connected with the SRTP profile agreed.
+    /// Safety: `ssl` is live; the export writes exactly 60 bytes.
+    public fn srtpKeys(borrow this) -> SrtpKeys? {
+        if (!this.connected) {
+            return null;
+        }
+        let ssl = this.ssl as *mut void;
+        if (unsafe { SSL_get_selected_srtp_profile(ssl) }.isNull()) {
+            return null;
+        }
+        var material = [0u8; 60];
+        let label = "EXTRACTOR-dtls_srtp";
+        let room = borrow mut material[0] as *mut u8;
+        if (unsafe { SSL_export_keying_material(ssl, room, 60, label.ptr as *CChar, label.length,
+            0 as *u8, 0, 0) } != 1) {
+            return null;
+        }
+        // client key | server key | client salt | server salt
+        var keys = SrtpKeys { localKey: [0u8; 16], localSalt: [0u8; 14], remoteKey: [0u8; 16], remoteSalt: [0u8; 14] };
+        let localKeyAt: usize = if (this.client) 0 else 16;
+        let remoteKeyAt: usize = if (this.client) 16 else 0;
+        let localSaltAt: usize = if (this.client) 32 else 46;
+        let remoteSaltAt: usize = if (this.client) 46 else 32;
+        for (k in 0usize..16) {
+            keys.localKey[k] = material[localKeyAt + k];
+            keys.remoteKey[k] = material[remoteKeyAt + k];
+        }
+        for (k in 0usize..14) {
+            keys.localSalt[k] = material[localSaltAt + k];
+            keys.remoteSalt[k] = material[remoteSaltAt + k];
+        }
+        return Some(keys);
+    }
+}
+
+/// Whether two `a=fingerprint` values are the same, letters in either case.
+public fn sameFingerprint(a: StringView, b: StringView) -> bool => a.trim().equalsIgnoreAsciiCase(b.trim());
+
+/// Safety: `x509` is a live certificate.
+unsafe fn fingerprintOf(x509: *mut void) -> String {
+    var digest = [0u8; 32];
+    var length: u32 = 0;
+    var out = String.create();
+    let room = borrow mut digest[0] as *mut u8;
+    if (X509_digest(x509, EVP_sha256(), room, borrow mut length as *mut u32) != 1) {
+        return out;
+    }
+    for (k in 0usize..32) {
+        if (k > 0) {
+            let _ = out.append(":");
+        }
+        let _ = out.appendHex(digest[k] as u64, 2, true);
+    }
+    return out;
+}
+
+/// The SSL's read BIO.
+/// Safety: `ssl` is live.
+unsafe fn inputOf(ssl: *mut void) -> *mut void => SSL_get_rbio(ssl);
+
+extern "C" {
+    @effects()
+    fn SSL_get_rbio(ssl: *mut void) -> *mut void;
+}

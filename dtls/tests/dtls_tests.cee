@@ -1,0 +1,75 @@
+// Two endpoints, a client and a server, completing a handshake in memory.
+
+fn shuttle(from: borrow mut DtlsEndpoint, to: borrow mut DtlsEndpoint, sizes: borrow mut Vector<usize>) -> Result<void, DtlsError> {
+    loop {
+        match (from.takeDatagram()) {
+            Some(d) => {
+                let _ = sizes.push(d.length);
+                to.feed(d.view())?;
+            },
+            null => {
+                break;
+            },
+        }
+    }
+    return Ok();
+}
+
+@test
+fn aClientAndAServerAgreeOnKeys() -> Result<void, TestFailure> {
+    let a = DtlsCertificate.generate()!;
+    let b = DtlsCertificate.generate()!;
+    Check.equalU64(95, a.fingerprint().length as u64)?;
+    Check.isTrue(!sameFingerprint(a.fingerprint().view(), b.fingerprint().view()), "two certificates")?;
+    var client = DtlsEndpoint.create(borrow a, true)!;
+    var server = DtlsEndpoint.create(borrow b, false)!;
+    var sizes = Vector<usize>.create();
+    let _ = client.advance()!;
+    // ClientHello, HelloVerifyRequest (the cookie), ClientHello again, the server's flight, and so on.
+    for (round in 0..10) {
+        shuttle(mut client, mut server, mut sizes)!;
+        shuttle(mut server, mut client, mut sizes)!;
+        if (client.connected && server.connected) {
+            break;
+        }
+    }
+    Check.isTrue(client.connected && server.connected, "both connected")?;
+    for (s in sizes.view()) {
+        Check.isTrue(s <= MTU, "each datagram within the MTU")?;
+    }
+    Check.isTrue(sameFingerprint(client.peerFingerprint()!.view(), b.fingerprint().view()), "the client saw b")?;
+    Check.isTrue(sameFingerprint(server.peerFingerprint()!.view(), a.fingerprint().view()), "the server saw a")?;
+    let ck = client.srtpKeys()!;
+    let sk = server.srtpKeys()!;
+    Check.isTrue(ck.localKey[..] == sk.remoteKey[..] && ck.remoteKey[..] == sk.localKey[..], "mirrored keys")?;
+    Check.isTrue(ck.localSalt[..] == sk.remoteSalt[..] && ck.remoteSalt[..] == sk.localSalt[..], "mirrored salts")?;
+    Check.isTrue(ck.localKey[..] != ck.remoteKey[..], "two directions")?;
+    client.close();
+    shuttle(mut client, mut server, mut sizes)!;
+    return Check.isTrue(server.closed, "close_notify reached the server");
+}
+
+@test
+fn aLostFlightIsSentAgain() -> Result<void, TestFailure> {
+    let a = DtlsCertificate.generate()!;
+    var client = DtlsEndpoint.create(borrow a, true)!;
+    let _ = client.advance()!;
+    let hello = client.takeDatagram()!;
+    Check.isTrue(client.takeDatagram() == null, "one ClientHello")?;
+    // Nothing comes back; after the timer (a second at first), the flight goes again.
+    var again: Vector<u8>? = null;
+    var waited: u64 = 0;
+    while (again == null && waited < 3000) {
+        await_ms(50);
+        waited += 50;
+        client.tick();
+        again = client.takeDatagram();
+    }
+    return Check.isTrue(again != null && again!.length == hello.length, "retransmitted");
+}
+
+/// Waits `ms` milliseconds (a busy wait: tests have no reactor).
+fn await_ms(ms: u64) {
+    let until = Clock.monotonicNanos() + ms * 1000000;
+    while (Clock.monotonicNanos() < until) {}
+}

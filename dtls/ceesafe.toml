@@ -1,0 +1,23 @@
+[package]
+name = "dtls"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+links = ["ssl", "crypto"]
+
+# Homebrew's OpenSSL 3 (Apple Silicon). On Linux the distribution's libssl is on the default paths. No header is
+# needed: src/ffi.cee declares what it calls.
+[target.macos]
+lib-dirs = ["/opt/homebrew/opt/openssl@3/lib"]
+
+# A phone ships no OpenSSL an app may link: the static archives CeeSafe.Web's tools/openssl-mobile.sh builds, in the
+# directory a packer (CeeUI's) names for the ABI being built (CeeSafe ADR 0171).
+[target.android]
+lib-dirs = ["$OPENSSL_ANDROID_DIR/lib"]
+
+[target.ios]
+lib-dirs = ["$OPENSSL_IOS_DIR/lib"]
+
+[dependencies]
+tls = { path = "../tls" }
+pkey = { path = "../pkey" }

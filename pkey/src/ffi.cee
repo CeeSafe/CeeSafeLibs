@@ -35,14 +35,14 @@ extern "C" {
     @effects()
     public fn EVP_PKEY_free(key: *mut void);
     @effects()
-    fn EVP_PKEY_Q_keygen(library: *mut void, properties: *CChar, kind: *CChar, ...) -> *mut void;
+    public fn EVP_PKEY_Q_keygen(library: *mut void, properties: *CChar, kind: *CChar, ...) -> *mut void;
 
     @effects()
     fn EVP_MD_CTX_new() -> *mut void;
     @effects()
     fn EVP_MD_CTX_free(ctx: *mut void);
     @effects()
-    fn EVP_sha256() -> *void;
+    public fn EVP_sha256() -> *void;
     @effects()
     fn EVP_sha384() -> *void;
     @effects()

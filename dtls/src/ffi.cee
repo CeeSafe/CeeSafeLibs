@@ -1,0 +1,123 @@
+// What this package calls in OpenSSL 3, beyond the declarations it shares with `tls` and `pkey` (C names are
+// global: each is declared once). As there, no header: opaque types are `void *`, C's `long` is 64-bit (LP64), and
+// OpenSSL's macros are written out as the calls they expand to, with OpenSSL 3's command numbers.
+
+extern "C" {
+    @effects()
+    fn DTLS_method() -> *void;
+    @effects(alloc)
+    fn SSL_CTX_set_cipher_list(ctx: *mut void, list: *CChar) -> i32;
+    /// Returns 0 on success (OpenSSL's inverted convention for this one).
+    @effects(alloc)
+    fn SSL_CTX_set_tlsext_use_srtp(ctx: *mut void, profiles: *CChar) -> i32;
+    @effects()
+    fn SSL_get_selected_srtp_profile(ssl: *mut void) -> *mut void;
+    @effects(alloc)
+    fn SSL_export_keying_material(
+        ssl: *mut void,
+        out: *mut u8,
+        length: usize,
+        label: *CChar,
+        labelLength: usize,
+        context: *u8,
+        contextLength: usize,
+        useContext: i32,
+    ) -> i32;
+    @effects()
+    fn SSL_CTX_set_cookie_generate_cb(ctx: *mut void, callback: extern "C" fn(*mut void, *mut u8, *mut u32) -> i32);
+    @effects()
+    fn SSL_CTX_set_cookie_verify_cb(ctx: *mut void, callback: extern "C" fn(*mut void, *u8, u32) -> i32);
+    @effects()
+    fn SSL_CTX_set_cert_verify_callback(
+        ctx: *mut void,
+        callback: extern "C" fn(*mut void, *mut void) -> i32,
+        arg: *mut void,
+    );
+    @effects()
+    fn SSL_set_options(ssl: *mut void, options: u64) -> u64;
+
+    @effects(alloc)
+    fn X509_new() -> *mut void;
+    @effects()
+    fn X509_set_version(x509: *mut void, version: i64) -> i32;
+    @effects()
+    fn X509_get_serialNumber(x509: *mut void) -> *mut void;
+    @effects()
+    fn ASN1_INTEGER_set(integer: *mut void, value: i64) -> i32;
+    @effects()
+    fn X509_getm_notBefore(x509: *mut void) -> *mut void;
+    @effects()
+    fn X509_getm_notAfter(x509: *mut void) -> *mut void;
+    @effects(alloc)
+    fn X509_gmtime_adj(time: *mut void, seconds: i64) -> *mut void;
+    @effects(alloc)
+    fn X509_set_pubkey(x509: *mut void, key: *mut void) -> i32;
+    @effects()
+    fn X509_get_subject_name(x509: *mut void) -> *mut void;
+    @effects(alloc)
+    fn X509_NAME_add_entry_by_txt(
+        name: *mut void,
+        field: *CChar,
+        kind: i32,
+        bytes: *u8,
+        length: i32,
+        location: i32,
+        set: i32,
+    ) -> i32;
+    @effects(alloc)
+    fn X509_set_issuer_name(x509: *mut void, name: *mut void) -> i32;
+    @effects(alloc)
+    fn X509_sign(x509: *mut void, key: *mut void, digest: *void) -> i32;
+    @effects()
+    fn X509_digest(x509: *mut void, digest: *void, out: *mut u8, length: *mut u32) -> i32;
+}
+
+/// SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT: WebRTC's peers both present a certificate.
+const SSL_VERIFY_PEER_REQUIRED: i32 = 3;
+const SSL_OP_NO_QUERY_MTU: u64 = 0x1000;
+const SSL_OP_COOKIE_EXCHANGE: u64 = 0x2000;
+const SSL_CTRL_SET_MTU: i32 = 17;
+const SSL_CTRL_SET_GROUPS_LIST: i32 = 92;
+const SSL_CTRL_SET_MIN_PROTO_VERSION: i32 = 123;
+const SSL_CTRL_SET_MAX_PROTO_VERSION: i32 = 124;
+const DTLS_CTRL_HANDLE_TIMEOUT: i32 = 74;
+const DTLS1_2_VERSION: i64 = 0xFEFD;
+const BIO_C_SET_BUF_MEM_EOF_RETURN: i32 = 130;
+const MBSTRING_ASC: i32 = 0x1001;
+const SSL_ERROR_WANT_READ: i32 = 2;
+const SSL_ERROR_WANT_WRITE: i32 = 3;
+const SSL_ERROR_ZERO_RETURN: i32 = 6;
+
+/// The cookie a server sends in its HelloVerifyRequest. ICE has already proved the peer's address, so it needs no
+/// secret (RFC 8842 leaves it to DTLS; the MAUI app's client insists on the exchange, so the server makes it).
+const COOKIE: [u8; 16] = [0x63, 0x65, 0x65, 0x73, 0x61, 0x66, 0x65, 0x2D, 0x64, 0x74, 0x6C, 0x73, 0x2D, 0x76, 0x31, 0x00];
+
+/// Safety: OpenSSL calls it with room for a cookie of 255 bytes at `cookie`, and `length` writable.
+@callback
+unsafe fn cookieMake(ssl: *mut void, cookie: *mut u8, length: *mut u32) -> i32 {
+    for (k in 0usize..16) {
+        cookie.add(k).write(COOKIE[k]);
+    }
+    length.write(16);
+    return 1;
+}
+
+/// Safety: OpenSSL calls it with `length` readable bytes at `cookie`.
+@callback
+unsafe fn cookieCheck(ssl: *mut void, cookie: *u8, length: u32) -> i32 {
+    if (length != 16) {
+        return 0;
+    }
+    for (k in 0usize..16) {
+        if (cookie.add(k).read() != COOKIE[k]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/// Every certificate passes OpenSSL's check: WebRTC's peers sign their own, and the caller compares the peer's
+/// fingerprint with the one its SDP gave (`DtlsEndpoint.peerFingerprint`).
+/// Safety: it touches neither pointer.
+@callback
+unsafe fn acceptAny(store: *mut void, arg: *mut void) -> i32 => 1;
