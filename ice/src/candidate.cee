@@ -40,16 +40,16 @@ public struct IceCandidate {
     public kind: CandidateKind;
     public related: StunAddress?;
 
-    /// A `candidate:` line (with or without `a=`); null for TCP, a host name (mDNS `.local`) or bad text.
+    /// A `candidate:` line (with or without `a=`, or `candidate:` itself); null for TCP, a host name (mDNS `.local`) or bad text.
     public fn parse(line: StringView) -> IceCandidate? {
         var text = line.trim();
         if (text.startsWith("a=")) {
             text = text[2..];
         }
-        if (!text.startsWith("candidate:")) {
-            return null;
+        // Browsers write `candidate:` first; SIPSorcery (the MAUI app) trickles the line without it.
+        if (text.startsWith("candidate:")) {
+            text = text[10..];
         }
-        text = text[10..];
         var fields = Vector<StringView>.create();
         for (f in text.split(" ")) {
             if (f.length > 0) {

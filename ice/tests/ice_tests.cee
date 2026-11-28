@@ -15,6 +15,9 @@ fn aCandidateLineIsReadAndWritten() -> Result<void, TestFailure> {
     let v6 = IceCandidate.parse("candidate:1 1 UDP 2122262783 2001:db8::9 50000 typ host")!;
     Check.isTrue(v6.address.v6 && v6.address.ip[15] == 9 && v6.address.port == 50000, "IPv6")?;
     Check.isTrue(v6.format().view() == "candidate:1 1 udp 2122262783 2001:db8:0:0:0:0:0:9 50000 typ host", "IPv6 written")?;
+    // As SIPSorcery trickles it: no `candidate:`, and a `generation` after.
+    let bare = IceCandidate.parse("2372358148 1 udp 2113937663 172.20.10.3 50088 typ host generation 0")!;
+    Check.isTrue(bare.address.same(StunAddress.v4(172, 20, 10, 3, 50088)) && bare.kind is CandidateKind.Host, "bare")?;
     Check.isTrue(IceCandidate.parse("candidate:1 1 tcp 1518280447 192.168.1.2 9 typ host tcptype active") == null, "TCP: none")?;
     Check.isTrue(IceCandidate.parse("candidate:1 1 udp 2122262783 abcd.local 50000 typ host") == null, "mDNS: none")?;
     return Check.equalU64(2130706431, candidatePriority(CandidateKind.Host, 65535, 1) as u64);
