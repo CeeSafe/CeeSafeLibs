@@ -1,8 +1,8 @@
-// An ICE agent (RFC 8445) for one component (WebRTC's BUNDLE and rtcp-mux): host and server-reflexive candidates,
-// trickled; connectivity checks paced and retransmitted; triggered checks; peer-reflexive remotes; role conflicts;
-// nomination (the controlling agent nominates every check, the controlled one takes the first pair that works until a
-// pair is nominated); and keep-alive checks on the pair in use (consent, RFC 7675). No I/O: the caller hands it each
-// datagram that arrives and sends what `poll` gives, on the socket it names.
+// An ICE agent (RFC 8445) for one component (WebRTC's BUNDLE and rtcp-mux): host, server-reflexive and relayed (TURN,
+// RFC 8656) candidates, trickled; connectivity checks paced and retransmitted; triggered checks; peer-reflexive
+// remotes; role conflicts; nomination (the controlling agent nominates every check, the controlled one takes the first
+// pair that works until a pair is nominated); and keep-alive checks on the pair in use (consent, RFC 7675). No I/O:
+// the caller hands it each datagram that arrives and sends what `poll` and `send` give, on the socket each names.
 
 import stun;
 
@@ -20,6 +20,16 @@ public struct Transmit {
     public bytes: Vector<u8>;
 }
 
+/// What a datagram given to `receive` was.
+public enum Received {
+    /// The agent's own (STUN, TURN): nothing for the application.
+    Ice,
+    /// The application's (DTLS, RTP, RTCP), from the address it came from, as given.
+    Application,
+    /// The application's, relayed by a TURN server: the peer's datagram, and the peer.
+    Relayed(Relayed),
+}
+
 enum PairState {
     Waiting,
     InProgress,
@@ -32,6 +42,8 @@ struct Local {
     socket: usize;
     kind: CandidateKind;
     priority: u32;
+    /// A relayed candidate's TURN client (an index into `turns`).
+    relay: usize?;
 }
 
 struct Remote {
@@ -77,6 +89,7 @@ public struct IceAgent {
     remotes: Vector<Remote>;
     pairs: Vector<Pair>;
     gatherings: Vector<Gathering>;
+    turns: Vector<TurnClient>;
     pending: Vector<Transmit>;
     trickle: Vector<IceCandidate>;
     selected: usize?;
@@ -86,6 +99,8 @@ public struct IceAgent {
     lastHeard: u64;
     public state: IceState;
     keepalive: [u8; 12];
+    /// Only relayed candidates are paired and announced (a test of the relay, or a policy of privacy).
+    public relayOnly: bool;
 
     /// An agent with fresh credentials and tie-breaker; `now` in milliseconds starts its clock.
     public fn create(controlling: bool, now: u64) -> IceAgent {
@@ -106,6 +121,7 @@ public struct IceAgent {
             remotes: Vector<Remote>.create(),
             pairs: Vector<Pair>.create(),
             gatherings: Vector<Gathering>.create(),
+            turns: Vector<TurnClient>.create(),
             pending: Vector<Transmit>.create(),
             trickle: Vector<IceCandidate>.create(),
             selected: null,
@@ -115,6 +131,7 @@ public struct IceAgent {
             lastHeard: now,
             state: IceState.Checking,
             keepalive: [0u8; 12],
+            relayOnly: false,
         };
     }
 
@@ -130,8 +147,16 @@ public struct IceAgent {
     public fn addHost(borrow mut this, socket: usize, address: StunAddress) {
         let preference = 65535 - truncate<u32>(this.locals.length);
         let priority = candidatePriority(CandidateKind.Host, preference, 1);
-        let _ = this.locals.push(Local { address: address, socket: socket, kind: CandidateKind.Host, priority: priority });
-        this.announce(CandidateKind.Host, address, priority, null);
+        let _ = this.locals.push(Local {
+            address: address,
+            socket: socket,
+            kind: CandidateKind.Host,
+            priority: priority,
+            relay: null,
+        });
+        if (!this.relayOnly) {
+            this.announce(CandidateKind.Host, address, priority, null);
+        }
         let index = this.locals.length - 1;
         for (r in 0usize..this.remotes.length) {
             this.pairWith(index, r);
@@ -150,6 +175,11 @@ public struct IceAgent {
         });
     }
 
+    /// Asks the TURN server `server`, from socket `socket` with these credentials, for a relayed candidate.
+    public fn addTurn(borrow mut this, socket: usize, server: StunAddress, username: StringView, password: StringView) {
+        let _ = this.turns.push(TurnClient.create(socket, server, username, password));
+    }
+
     /// A remote candidate, from the SDP or trickled.
     public fn addRemote(borrow mut this, candidate: borrow IceCandidate) {
         for (r in this.remotes.view()) {
@@ -159,6 +189,9 @@ public struct IceAgent {
         }
         let _ = this.remotes.push(Remote { address: candidate.address, priority: candidate.priority });
         let index = this.remotes.length - 1;
+        for (t in 0usize..this.turns.length) {
+            this.turns[t].permit(candidate.address, this.lastCheck);
+        }
         for (l in 0usize..this.locals.length) {
             this.pairWith(l, index);
         }
@@ -172,12 +205,13 @@ public struct IceAgent {
         return Some(this.trickle.remove(0));
     }
 
-    /// Whether the pair in use goes to `from` on `socket`.
+    /// Whether the pair in use goes to `from` on `socket` directly (not through a relay).
     public fn isSelected(borrow this, socket: usize, from: StunAddress) -> bool {
         match (this.selected) {
             Some(p) => {
                 let pair = this.pairs[p];
-                return this.locals[pair.local].socket == socket && this.remotes[pair.remote].address.same(from);
+                let local = this.locals[pair.local];
+                return local.relay == null && local.socket == socket && this.remotes[pair.remote].address.same(from);
             },
             null => {
                 return false;
@@ -185,55 +219,58 @@ public struct IceAgent {
         }
     }
 
-    /// Where the pair in use sends: the socket and the remote address.
-    public fn route(borrow this) -> Transmit? {
+    /// Whether the pair in use is relayed.
+    public fn relaying(borrow this) -> bool {
+        let p = this.selected ?? { return false; };
+        return this.locals[this.pairs[p].local].relay != null;
+    }
+
+    /// `bytes` to the other side on the pair in use (through its relay, if relayed); null while there is none.
+    public fn send(borrow this, bytes: Slice<u8>) -> Transmit? {
         let p = this.selected?;
         let pair = this.pairs[p];
-        return Some(Transmit {
-            socket: this.locals[pair.local].socket,
-            to: this.remotes[pair.remote].address,
-            bytes: Vector<u8>.create(),
-        });
+        return this.deliver(pair.local, this.remotes[pair.remote].address, bytes);
     }
 
-    /// `bytes` to the other side on the pair in use; null while there is none.
-    public fn send(borrow this, bytes: Slice<u8>) -> Transmit? {
-        var t = this.route()?;
-        if (t.bytes.extend(bytes) is Err(_)) {
-            return null;
+    /// A datagram that came to socket `socket` from `from`: the agent's, or the application's (as it came, or relayed).
+    public fn receive(borrow mut this, socket: usize, from: StunAddress, bytes: Slice<u8>, now: u64) -> Received {
+        // From a TURN server: its answers, and what it relays.
+        for (t in 0usize..this.turns.length) {
+            if (this.turns[t].socket == socket && this.turns[t].server.same(from)) {
+                let was = this.turns[t].state;
+                let relayed = this.turns[t].receive(bytes, now);
+                this.afterTurn(t, was);
+                let r = relayed ?? { return Received.Ice; };
+                let local = this.relayLocal(t) ?? { return Received.Ice; };
+                if (isStun(r.data.view())) {
+                    this.stun(local, r.peer, r.data.view(), now);
+                    return Received.Ice;
+                }
+                this.heard(local, r.peer, now);
+                return Received.Relayed(r);
+            }
         }
-        return Some(t);
-    }
-
-    /// A datagram that came to socket `socket` from `from`: true when it was STUN and the agent took it, false when
-    /// it is the application's (DTLS, RTP or RTCP).
-    public fn receive(borrow mut this, socket: usize, from: StunAddress, bytes: Slice<u8>, now: u64) -> bool {
         if (!isStun(bytes)) {
             if (this.isSelected(socket, from)) {
                 this.lastHeard = now;
             }
-            return false;
+            return Received.Application;
         }
-        let message = StunMessage.decode(bytes) ?? { return true; };
-        if (message.method != BINDING) {
-            return true;
+        var local: usize? = null;
+        for (l in 0usize..this.locals.length) {
+            if (this.locals[l].socket == socket && this.locals[l].kind is CandidateKind.Host) {
+                local = Some(l);
+            }
         }
-        if (message.has(FINGERPRINT) && !checkFingerprint(bytes)) {
-            return true;
-        }
-        match (message.messageClass) {
-            StunClass.Request => {
-                this.request(socket, from, borrow message, bytes, now);
+        match (local) {
+            Some(l) => {
+                this.stun(l, from, bytes, now);
             },
-            StunClass.Success => {
-                this.answer(from, borrow message, bytes, true, now);
+            null => {
+                let _ = this.gathered(from, bytes);
             },
-            StunClass.Error => {
-                this.answer(from, borrow message, bytes, false, now);
-            },
-            StunClass.Indication => {},
         }
-        return true;
+        return Received.Ice;
     }
 
     /// The next datagram the agent wants sent, if any; call it every few milliseconds (`PACE`, 20 ms), and until it
@@ -241,6 +278,14 @@ public struct IceAgent {
     public fn poll(borrow mut this, now: u64) -> Transmit? {
         if (this.pending.length > 0) {
             return Some(this.pending.remove(0));
+        }
+        for (t in 0usize..this.turns.length) {
+            let was = this.turns[t].state;
+            let out = this.turns[t].poll(now);
+            this.afterTurn(t, was);
+            if (out is Some(bytes)) {
+                return Some(Transmit { socket: this.turns[t].socket, to: this.turns[t].server, bytes: bytes });
+            }
         }
         for (g in 0usize..this.gatherings.length) {
             let gathering = this.gatherings[g];
@@ -292,13 +337,13 @@ public struct IceAgent {
                     this.pairs[p].state = PairState.Failed;
                     continue;
                 }
-                return Some(this.check(p, now));
+                return this.check(p, now);
             }
         }
         var best: usize? = null;
         var bestPriority: u64 = 0;
         for (p in 0usize..this.pairs.length) {
-            if (this.pairs[p].state is PairState.Waiting) {
+            if (this.pairs[p].state is PairState.Waiting && this.ready(p)) {
                 let priority = this.priorityOf(p);
                 if (best == null || priority > bestPriority) {
                     best = Some(p);
@@ -309,16 +354,84 @@ public struct IceAgent {
         if (best is Some(p)) {
             this.pairs[p].tries = 0;
             this.pairs[p].transaction = newTransaction();
-            return Some(this.check(p, now));
+            return this.check(p, now);
         }
         // The pair in use: a keep-alive check every KEEPALIVE.
         if (this.selected is Some(p) && now >= this.keepaliveAt + KEEPALIVE) {
             this.keepaliveAt = now;
             this.keepalive = newTransaction();
             this.lastCheck = now;
-            return Some(this.requestOn(p, this.keepalive));
+            return this.requestOn(p, this.keepalive);
         }
         return null;
+    }
+
+    /// Whether pair `p` can be checked now: a relayed one once its allocation holds.
+    fn ready(borrow this, p: usize) -> bool {
+        let local = this.locals[this.pairs[p].local];
+        return match (local.relay) {
+            Some(t) => this.turns[t].state is TurnState.Allocated,
+            null => true,
+        };
+    }
+
+    /// After TURN client `t` moved: a relayed candidate once allocated, paired and announced.
+    fn afterTurn(borrow mut this, t: usize, was: TurnState) {
+        if (was is TurnState.Allocated || !(this.turns[t].state is TurnState.Allocated)) {
+            return;
+        }
+        let relayed = this.turns[t].relayed ?? { return; };
+        if (this.relayLocal(t) != null) {
+            return;
+        }
+        let priority = candidatePriority(CandidateKind.Relayed, 65535 - truncate<u32>(t), 1);
+        let _ = this.locals.push(Local {
+            address: relayed,
+            socket: this.turns[t].socket,
+            kind: CandidateKind.Relayed,
+            priority: priority,
+            relay: Some(t),
+        });
+        this.announce(CandidateKind.Relayed, relayed, priority, this.turns[t].mapped);
+        let index = this.locals.length - 1;
+        for (r in 0usize..this.remotes.length) {
+            this.pairWith(index, r);
+        }
+    }
+
+    fn relayLocal(borrow this, t: usize) -> usize? {
+        for (l in 0usize..this.locals.length) {
+            if (this.locals[l].relay == Some(t)) {
+                return Some(l);
+            }
+        }
+        return null;
+    }
+
+    /// `bytes` from local `l` to `to`: as they are, or wrapped for its relay.
+    fn deliver(borrow this, l: usize, to: StunAddress, bytes: Slice<u8>) -> Transmit? {
+        let local = this.locals[l];
+        match (local.relay) {
+            Some(t) => {
+                let wrapped = this.turns[t].wrap(to, bytes)?;
+                return Some(Transmit { socket: local.socket, to: this.turns[t].server, bytes: wrapped });
+            },
+            null => {
+                var copy = Vector<u8>.create();
+                if (copy.extend(bytes) is Err(_)) {
+                    return null;
+                }
+                return Some(Transmit { socket: local.socket, to: to, bytes: copy });
+            },
+        }
+    }
+
+    fn heard(borrow mut this, l: usize, from: StunAddress, now: u64) {
+        if (this.selected is Some(p)) {
+            if (this.pairs[p].local == l && this.remotes[this.pairs[p].remote].address.same(from)) {
+                this.lastHeard = now;
+            }
+        }
     }
 
     fn priorityOf(borrow this, p: usize) -> u64 {
@@ -328,7 +441,7 @@ public struct IceAgent {
         return if (this.controlling) pairPriority(l, r) else pairPriority(r, l);
     }
 
-    fn check(borrow mut this, p: usize, now: u64) -> Transmit {
+    fn check(borrow mut this, p: usize, now: u64) -> Transmit? {
         this.pairs[p].state = PairState.InProgress;
         this.pairs[p].sentAt = now;
         this.pairs[p].tries = this.pairs[p].tries + 1;
@@ -337,7 +450,7 @@ public struct IceAgent {
     }
 
     /// A Binding request on pair `p` with `transaction`.
-    fn requestOn(borrow this, p: usize, transaction: [u8; 12]) -> Transmit {
+    fn requestOn(borrow this, p: usize, transaction: [u8; 12]) -> Transmit? {
         let pair = this.pairs[p];
         let local = this.locals[pair.local];
         var m = StunMessage.create(BINDING, StunClass.Request, transaction);
@@ -353,15 +466,39 @@ public struct IceAgent {
         } else {
             let _ = m.addU64(ICE_CONTROLLED, this.tieBreaker);
         }
-        return Transmit {
-            socket: local.socket,
-            to: this.remotes[pair.remote].address,
-            bytes: m.encode(this.remotePassword.view().bytes(), true),
-        };
+        let bytes = m.encode(this.remotePassword.view().bytes(), true);
+        return this.deliver(pair.local, this.remotes[pair.remote].address, bytes.view());
     }
 
-    /// A Binding request from the other side: answered, and its pair checked (a triggered check).
-    fn request(borrow mut this, socket: usize, from: StunAddress, message: borrow StunMessage, bytes: Slice<u8>, now: u64) {
+    /// A STUN message that came to local `l` from `from`.
+    fn stun(borrow mut this, l: usize, from: StunAddress, bytes: Slice<u8>, now: u64) {
+        let message = StunMessage.decode(bytes) ?? { return; };
+        if (message.method != BINDING) {
+            return;
+        }
+        if (message.has(FINGERPRINT) && !checkFingerprint(bytes)) {
+            return;
+        }
+        match (message.messageClass) {
+            StunClass.Request => {
+                this.request(l, from, borrow message, bytes, now);
+            },
+            StunClass.Success => {
+                if (!this.gathered(from, bytes)) {
+                    this.answer(from, borrow message, bytes, true, now);
+                }
+            },
+            StunClass.Error => {
+                if (!this.gathered(from, bytes)) {
+                    this.answer(from, borrow message, bytes, false, now);
+                }
+            },
+            StunClass.Indication => {},
+        }
+    }
+
+    /// A Binding request from the other side to local `l`: answered, and its pair checked (a triggered check).
+    fn request(borrow mut this, l: usize, from: StunAddress, message: borrow StunMessage, bytes: Slice<u8>, now: u64) {
         if (!checkIntegrity(bytes, this.localPassword.view().bytes())) {
             return;
         }
@@ -377,22 +514,20 @@ public struct IceAgent {
             if (keep) {
                 var refusal = StunMessage.create(BINDING, StunClass.Error, message.transaction);
                 let _ = refusal.add(ERROR_CODE, [0u8, 0, 4, 87][..]);
-                let _ = this.pending.push(Transmit {
-                    socket: socket,
-                    to: from,
-                    bytes: refusal.encode(this.localPassword.view().bytes(), true),
-                });
+                let out = refusal.encode(this.localPassword.view().bytes(), true);
+                if (this.deliver(l, from, out.view()) is Some(tx)) {
+                    let _ = this.pending.push(tx);
+                }
                 return;
             }
             this.controlling = !this.controlling;
         }
         var reply = StunMessage.create(BINDING, StunClass.Success, message.transaction);
         let _ = reply.addAddress(XOR_MAPPED_ADDRESS, from);
-        let _ = this.pending.push(Transmit {
-            socket: socket,
-            to: from,
-            bytes: reply.encode(this.localPassword.view().bytes(), true),
-        });
+        let out = reply.encode(this.localPassword.view().bytes(), true);
+        if (this.deliver(l, from, out.view()) is Some(tx)) {
+            let _ = this.pending.push(tx);
+        }
         // The remote, peer-reflexive when it is new, and the pair.
         var remote: usize? = null;
         for (r in 0usize..this.remotes.length) {
@@ -403,19 +538,13 @@ public struct IceAgent {
         if (remote == null) {
             let _ = this.remotes.push(Remote { address: from, priority: message.getU32(PRIORITY) ?? 0 });
             remote = Some(this.remotes.length - 1);
-        }
-        var local: usize? = null;
-        for (l in 0usize..this.locals.length) {
-            if (this.locals[l].socket == socket && this.locals[l].kind is CandidateKind.Host) {
-                local = Some(l);
+            for (t in 0usize..this.turns.length) {
+                this.turns[t].permit(from, now);
             }
         }
         let r = remote!;
-        let l = local ?? { return; };
         let p = this.pairWith(l, r) ?? { return; };
-        if (this.isSelected(socket, from)) {
-            this.lastHeard = now;
-        }
+        this.heard(l, from, now);
         if (this.pairs[p].state is PairState.Failed) {
             this.pairs[p].state = PairState.Waiting;
         }
@@ -427,36 +556,47 @@ public struct IceAgent {
         }
     }
 
-    /// A response to a check, a keep-alive or a gathering request.
-    fn answer(borrow mut this, from: StunAddress, message: borrow StunMessage, bytes: Slice<u8>, success: bool, now: u64) {
+    /// A gathering request's answer from its STUN server: a server-reflexive candidate. Whether it was one.
+    fn gathered(borrow mut this, from: StunAddress, bytes: Slice<u8>) -> bool {
+        let message = StunMessage.decode(bytes) ?? { return false; };
         for (g in 0usize..this.gatherings.length) {
-            if (this.gatherings[g].transaction == message.transaction && !this.gatherings[g].done) {
-                this.gatherings[g].done = true;
-                if (success && message.address(XOR_MAPPED_ADDRESS) is Some(mapped)) {
-                    let socket = this.gatherings[g].socket;
-                    var base: StunAddress? = null;
-                    for (l in this.locals.view()) {
-                        if (l.socket == socket && l.kind is CandidateKind.Host) {
-                            base = Some(l.address);
-                        }
+            if (this.gatherings[g].transaction != message.transaction || this.gatherings[g].done
+                || !this.gatherings[g].server.same(from)) {
+                continue;
+            }
+            this.gatherings[g].done = true;
+            if (message.messageClass is StunClass.Success && message.address(XOR_MAPPED_ADDRESS) is Some(mapped)) {
+                let socket = this.gatherings[g].socket;
+                var base: StunAddress? = null;
+                for (l in this.locals.view()) {
+                    if (l.socket == socket && l.kind is CandidateKind.Host) {
+                        base = Some(l.address);
                     }
-                    for (l in this.locals.view()) {
-                        if (l.address.same(mapped)) {
-                            return;
-                        }
+                }
+                for (l in this.locals.view()) {
+                    if (l.address.same(mapped)) {
+                        return true;
                     }
-                    let priority = candidatePriority(CandidateKind.ServerReflexive, 65535, 1);
-                    let _ = this.locals.push(Local {
-                        address: mapped,
-                        socket: socket,
-                        kind: CandidateKind.ServerReflexive,
-                        priority: priority,
-                    });
+                }
+                let priority = candidatePriority(CandidateKind.ServerReflexive, 65535, 1);
+                let _ = this.locals.push(Local {
+                    address: mapped,
+                    socket: socket,
+                    kind: CandidateKind.ServerReflexive,
+                    priority: priority,
+                    relay: null,
+                });
+                if (!this.relayOnly) {
                     this.announce(CandidateKind.ServerReflexive, mapped, priority, base);
                 }
-                return;
             }
+            return true;
         }
+        return false;
+    }
+
+    /// A response to a check or a keep-alive.
+    fn answer(borrow mut this, from: StunAddress, message: borrow StunMessage, bytes: Slice<u8>, success: bool, now: u64) {
         if (!checkIntegrity(bytes, this.remotePassword.view().bytes())) {
             return;
         }
@@ -501,11 +641,14 @@ public struct IceAgent {
         this.keepaliveAt = now;
     }
 
-    /// The pair of local `l` and remote `r` (made when new; not for server-reflexive locals, whose base is paired, nor
-    /// across address families).
+    /// The pair of local `l` and remote `r` (made when new; not for server-reflexive locals, whose base is paired,
+    /// nor across address families, nor for direct locals when only relays are wanted).
     fn pairWith(borrow mut this, l: usize, r: usize) -> usize? {
         let local = this.locals[l];
         if (local.kind is CandidateKind.ServerReflexive || local.address.v6 != this.remotes[r].address.v6) {
+            return null;
+        }
+        if (this.relayOnly && local.relay == null) {
             return null;
         }
         for (p in 0usize..this.pairs.length) {

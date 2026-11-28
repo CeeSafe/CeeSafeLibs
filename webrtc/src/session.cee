@@ -127,9 +127,26 @@ public struct PeerSession {
         return Some(c.format());
     }
 
-    /// A datagram that came to `socket` from `from` (RFC 7983's demultiplexing by its first byte).
+    /// A datagram that came to `socket` from `from` (RFC 7983's demultiplexing by its first byte); what a TURN relay
+    /// brings is unwrapped by the agent first.
     public fn receive(borrow mut this, socket: usize, from: StunAddress, bytes: Slice<u8>, now: u64) {
-        if (bytes.length == 0 || this.agent.receive(socket, from, bytes, now)) {
+        if (bytes.length == 0) {
+            return;
+        }
+        match (this.agent.receive(socket, from, bytes, now)) {
+            Received.Ice => {},
+            Received.Application => {
+                this.media(bytes);
+            },
+            Received.Relayed(r) => {
+                this.media(r.data.view());
+            },
+        }
+    }
+
+    /// DTLS, RTP or RTCP from the other side.
+    fn media(borrow mut this, bytes: Slice<u8>) {
+        if (bytes.length == 0) {
             return;
         }
         let first = bytes[0];

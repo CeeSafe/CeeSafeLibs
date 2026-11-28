@@ -69,7 +69,7 @@ fn twoAgentsConnect() -> Result<void, TestFailure> {
     Check.isTrue(a.isSelected(0, bAt) && b.isSelected(0, aAt), "on the one pair")?;
     let t = a.send("dtls".bytes())!;
     Check.isTrue(t.to.same(bAt) && t.bytes.view() == "dtls".bytes(), "data goes on it")?;
-    Check.isTrue(!b.receive(0, aAt, t.bytes.view(), now), "and is the application's")?;
+    Check.isTrue(b.receive(0, aAt, t.bytes.view(), now) is Received.Application, "and is the application's")?;
     // Keep-alives hold it; silence fails it.
     var later = now;
     while (later < now + 40000) {
@@ -120,8 +120,180 @@ fn aServerReflexiveCandidateIsGathered() -> Result<void, TestFailure> {
     let request = StunMessage.decode(t.bytes.view())!;
     var reply = StunMessage.create(BINDING, StunClass.Success, request.transaction);
     Check.isTrue(reply.addAddress(XOR_MAPPED_ADDRESS, StunAddress.v4(203, 0, 113, 9, 40000)), "mapped")?;
-    Check.isTrue(a.receive(0, server, reply.encode(Vector<u8>.create().view(), true).view(), 10), "STUN")?;
+    Check.isTrue(a.receive(0, server, reply.encode(Vector<u8>.create().view(), true).view(), 10) is Received.Ice, "STUN")?;
     let c = a.takeCandidate()!;
     Check.isTrue(c.kind is CandidateKind.ServerReflexive && c.address.port == 40000, "srflx")?;
     return Check.isTrue(c.related!.same(host), "its base");
+}
+
+/// A TURN server in memory: one allocation, its long-term key checked, Send indications relayed out and peers'
+/// datagrams back in Data indications.
+struct FakeTurn {
+    at: StunAddress;
+    relay: StunAddress;
+    key: [u8; 16];
+    client: StunAddress?;
+    allocated: bool;
+    permitted: Vector<StunAddress>;
+    /// Datagrams it sends: to the client, or (from the relay) to a peer.
+    out: Vector<Transmit>;
+}
+
+fn turnServe(s: borrow mut FakeTurn, from: StunAddress, bytes: Slice<u8>) {
+    let m = StunMessage.decode(bytes) ?? { return; };
+    if (m.messageClass is StunClass.Indication && m.method == SEND) {
+        let peer = m.address(XOR_PEER_ADDRESS) ?? { return; };
+        var ok = false;
+        for (p in s.permitted.view()) {
+            ok = ok || (p.ip[0] == peer.ip[0] && p.ip[3] == peer.ip[3]);
+        }
+        if (!ok) {
+            return;
+        }
+        var data = Vector<u8>.create();
+        let _ = data.extend(m.get(DATA_ATTRIBUTE) ?? { return; });
+        let _ = s.out.push(Transmit { socket: 1, to: peer, bytes: data });
+        return;
+    }
+    if (!(m.messageClass is StunClass.Request)) {
+        return;
+    }
+    if (!m.has(MESSAGE_INTEGRITY)) {
+        var challenge = StunMessage.create(m.method, StunClass.Error, m.transaction);
+        let _ = challenge.add(ERROR_CODE, [0u8, 0, 4, 1][..]);
+        let _ = challenge.add(REALM, "example.org".bytes());
+        let _ = challenge.add(NONCE, "abcdef".bytes());
+        let _ = s.out.push(Transmit { socket: 0, to: from, bytes: challenge.encode(Vector<u8>.create().view(), false) });
+        return;
+    }
+    if (!checkIntegrity(bytes, s.key[..])) {
+        return;
+    }
+    var reply = StunMessage.create(m.method, StunClass.Success, m.transaction);
+    if (m.method == ALLOCATE) {
+        s.allocated = true;
+        s.client = Some(from);
+        let _ = reply.addAddress(XOR_RELAYED_ADDRESS, s.relay);
+        let _ = reply.addAddress(XOR_MAPPED_ADDRESS, from);
+        let _ = reply.addU32(LIFETIME, 600);
+    } else if (m.method == CREATE_PERMISSION) {
+        let _ = s.permitted.push(m.address(XOR_PEER_ADDRESS) ?? { return; });
+    }
+    let _ = s.out.push(Transmit { socket: 0, to: from, bytes: reply.encode(s.key[..], true) });
+}
+
+/// A peer's datagram to the relay: to the client in a Data indication, if the peer is permitted.
+fn turnRelay(s: borrow mut FakeTurn, from: StunAddress, bytes: Slice<u8>) {
+    var ok = false;
+    for (p in s.permitted.view()) {
+        ok = ok || (p.ip[0] == from.ip[0] && p.ip[3] == from.ip[3]);
+    }
+    let client = s.client ?? { return; };
+    if (!ok) {
+        return;
+    }
+    var t = [0u8; 12];
+    t[0] = 7;
+    var m = StunMessage.create(DATA, StunClass.Indication, t);
+    let _ = m.addAddress(XOR_PEER_ADDRESS, from);
+    let _ = m.add(DATA_ATTRIBUTE, bytes);
+    let _ = s.out.push(Transmit { socket: 0, to: client, bytes: m.encode(Vector<u8>.create().view(), false) });
+}
+
+@test
+fn aRelayedPairConnects() -> Result<void, TestFailure> {
+    let aAt = StunAddress.v4(10, 0, 0, 1, 5000);
+    let bAt = StunAddress.v4(10, 0, 0, 2, 6000);
+    var server = FakeTurn {
+        at: StunAddress.v4(198, 51, 100, 1, 3478),
+        relay: StunAddress.v4(198, 51, 100, 1, 49152),
+        key: longTermKey("alice", "example.org", "secret"),
+        client: null,
+        allocated: false,
+        permitted: Vector<StunAddress>.create(),
+        out: Vector<Transmit>.create(),
+    };
+    var a = IceAgent.create(true, 0);
+    a.relayOnly = true;
+    var b = IceAgent.create(false, 0);
+    a.setRemoteCredentials(b.localUfrag.view(), b.localPassword.view());
+    b.setRemoteCredentials(a.localUfrag.view(), a.localPassword.view());
+    a.addHost(0, aAt);
+    a.addTurn(0, server.at, "alice", "secret");
+    b.addHost(0, bAt);
+    var relayed: IceCandidate? = null;
+    var now: u64 = 0;
+    var gotData = false;
+    while (now < 4000 && !(a.state is IceState.Connected && b.state is IceState.Connected && gotData)) {
+        // Trickle both ways (a's only candidate is the relay's).
+        loop {
+            match (a.takeCandidate()) {
+                Some(c) => {
+                    if (c.kind is CandidateKind.Relayed) {
+                        b.addRemote(borrow c);
+                        relayed = Some(c);
+                    }
+                },
+                null => {
+                    break;
+                },
+            }
+        }
+        loop {
+            match (b.takeCandidate()) {
+                Some(c) => {
+                    a.addRemote(borrow c);
+                },
+                null => {
+                    break;
+                },
+            }
+        }
+        for (step in 0..8) {
+            match (a.poll(now)) {
+                Some(t) => {
+                    if (t.to.same(server.at)) {
+                        turnServe(mut server, aAt, t.bytes.view());
+                    }
+                },
+                null => {},
+            }
+            match (b.poll(now)) {
+                Some(t) => {
+                    if (t.to.same(server.relay)) {
+                        turnRelay(mut server, bAt, t.bytes.view());
+                    }
+                },
+                null => {},
+            }
+            while (server.out.length > 0) {
+                let t = server.out.remove(0);
+                if (t.socket == 0) {
+                    let r = a.receive(0, server.at, t.bytes.view(), now);
+                    if (r is Received.Relayed(x)) {
+                        gotData = gotData || x.data.view() == "media".bytes();
+                    }
+                } else {
+                    let _ = b.receive(0, server.relay, t.bytes.view(), now);
+                }
+            }
+        }
+        if (b.state is IceState.Connected) {
+            match (b.send("media".bytes())) {
+                Some(t) => {
+                    turnRelay(mut server, bAt, t.bytes.view());
+                },
+                null => {},
+            }
+        }
+        now += 20;
+    }
+    Check.isTrue(server.allocated, "allocated, with the long-term key")?;
+    Check.isTrue(relayed != null && relayed!.address.same(server.relay), "a relayed candidate at the relay's address")?;
+    Check.isTrue(a.state is IceState.Connected && b.state is IceState.Connected, "both connected")?;
+    Check.isTrue(a.relaying(), "a's pair is relayed")?;
+    Check.isTrue(gotData, "b's datagram reached a through the relay")?;
+    // a's send goes to the server, wrapped.
+    let out = a.send("back".bytes())!;
+    return Check.isTrue(out.to.same(server.at) && isStun(out.bytes.view()), "a's media goes to the server in a Send indication");
 }

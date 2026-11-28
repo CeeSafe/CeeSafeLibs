@@ -1,0 +1,300 @@
+// A TURN client (RFC 8656) without I/O, over UDP, for the ICE agent's relayed candidates: an allocation with
+// long-term credentials (the 401 challenge's realm and nonce, a new nonce on 438), refreshed before it ends;
+// permissions for the peers, refreshed before they lapse; Send indications out and Data indications (or ChannelData)
+// in. The caller's socket `socket` talks to `server`.
+
+import stun;
+
+/// Where an allocation is.
+public enum TurnState {
+    Allocating,
+    Allocated,
+    Failed,
+}
+
+/// A datagram relayed from a peer: who sent it and what.
+public struct Relayed {
+    public peer: StunAddress;
+    public data: Vector<u8>;
+}
+
+struct TurnRequest {
+    method: u16;
+    transaction: [u8; 12];
+    peer: StunAddress?;
+    sentAt: u64;
+    tries: u32;
+    /// The request's bytes as last sent (built again with a new nonce after a 438).
+    bytes: Vector<u8>;
+}
+
+struct Permission {
+    peer: StunAddress;
+    /// When it was granted (or asked), for its refresh.
+    since: u64;
+    granted: bool;
+}
+
+const TURN_LIFETIME: u32 = 600;
+/// Permissions last 300 s (RFC 8656 §9); asked again after 240.
+const PERMISSION_REFRESH: u64 = 240000;
+const TURN_RTO: u64 = 500;
+const TURN_TRIES: u32 = 7;
+
+public struct TurnClient {
+    public socket: usize;
+    public server: StunAddress;
+    username: String;
+    password: String;
+    realm: String;
+    nonce: String;
+    key: [u8; 16];
+    authenticated: bool;
+    public state: TurnState;
+    public relayed: StunAddress?;
+    public mapped: StunAddress?;
+    lifetime: u32;
+    allocatedAt: u64;
+    pending: Vector<TurnRequest>;
+    permissions: Vector<Permission>;
+    outgoing: Vector<Vector<u8>>;
+    started: bool;
+
+    public fn create(socket: usize, server: StunAddress, username: StringView, password: StringView) -> TurnClient {
+        var u = String.create();
+        let _ = u.append(username);
+        var p = String.create();
+        let _ = p.append(password);
+        return TurnClient {
+            socket: socket,
+            server: server,
+            username: u,
+            password: p,
+            realm: String.create(),
+            nonce: String.create(),
+            key: [0u8; 16],
+            authenticated: false,
+            state: TurnState.Allocating,
+            relayed: null,
+            mapped: null,
+            lifetime: TURN_LIFETIME,
+            allocatedAt: 0,
+            pending: Vector<TurnRequest>.create(),
+            permissions: Vector<Permission>.create(),
+            outgoing: Vector<Vector<u8>>.create(),
+            started: false,
+        };
+    }
+
+    /// A permission for `peer`'s address (its port does not matter); asked once allocated, refreshed while in use.
+    public fn permit(borrow mut this, peer: StunAddress, now: u64) {
+        for (p in this.permissions.view()) {
+            if (sameIp(p.peer, peer)) {
+                return;
+            }
+        }
+        let _ = this.permissions.push(Permission { peer: peer, since: now, granted: false });
+        if (this.state is TurnState.Allocated) {
+            this.ask(CREATE_PERMISSION, Some(peer), now);
+        }
+    }
+
+    /// A Send indication carrying `data` to `peer`, for the server; null until allocated.
+    public fn wrap(borrow this, peer: StunAddress, data: Slice<u8>) -> Vector<u8>? {
+        if (!(this.state is TurnState.Allocated)) {
+            return null;
+        }
+        var m = StunMessage.create(SEND, StunClass.Indication, transactionOf());
+        let _ = m.addAddress(XOR_PEER_ADDRESS, peer);
+        let _ = m.add(DATA_ATTRIBUTE, data);
+        return Some(m.encode(Vector<u8>.create().view(), false));
+    }
+
+    /// A datagram from the server: its answer to a request (null), or a peer's datagram relayed.
+    public fn receive(borrow mut this, bytes: Slice<u8>, now: u64) -> Relayed? {
+        if (readChannelData(bytes) is Some(c)) {
+            // Only bound channels arrive this way; this client binds none, so it is no peer's of ours.
+            let _ = c;
+            return null;
+        }
+        let message = StunMessage.decode(bytes)?;
+        if (message.messageClass is StunClass.Indication) {
+            if (message.method != DATA) {
+                return null;
+            }
+            let peer = message.address(XOR_PEER_ADDRESS)?;
+            let data = message.get(DATA_ATTRIBUTE)?;
+            var copy = Vector<u8>.create();
+            let _ = copy.extend(data);
+            return Some(Relayed { peer: peer, data: copy });
+        }
+        var at: usize? = null;
+        for (k in 0usize..this.pending.length) {
+            if (this.pending[k].transaction == message.transaction) {
+                at = Some(k);
+            }
+        }
+        let k = at ?? { return null; };
+        let request = this.pending.remove(k);
+        let success = message.messageClass is StunClass.Success;
+        if (success && this.authenticated && !checkIntegrity(bytes, this.key[..])) {
+            let _ = this.pending.insert(k, request);
+            return null;
+        }
+        if (!success) {
+            let code = message.errorCode() ?? 0;
+            if ((code == 401 && !this.authenticated) || code == 438) {
+                // The challenge: the realm and the nonce, then the same request with credentials.
+                if (message.get(REALM) is Some(r)) {
+                    this.realm.clear();
+                    let _ = this.realm.appendUtf8(r);
+                }
+                if (message.get(NONCE) is Some(n)) {
+                    this.nonce.clear();
+                    let _ = this.nonce.appendUtf8(n);
+                }
+                this.key = longTermKey(this.username.view(), this.realm.view(), this.password.view());
+                this.authenticated = true;
+                this.ask(request.method, request.peer, now);
+                return null;
+            }
+            if (request.method == ALLOCATE) {
+                this.state = TurnState.Failed;
+            }
+            return null;
+        }
+        if (request.method == ALLOCATE) {
+            this.relayed = message.address(XOR_RELAYED_ADDRESS);
+            this.mapped = message.address(XOR_MAPPED_ADDRESS);
+            this.lifetime = message.getU32(LIFETIME) ?? TURN_LIFETIME;
+            this.allocatedAt = now;
+            this.state = if (this.relayed != null) TurnState.Allocated else TurnState.Failed;
+            // The permissions asked before the allocation.
+            for (p in 0usize..this.permissions.length) {
+                let peer = this.permissions[p].peer;
+                this.permissions[p].since = now;
+                this.ask(CREATE_PERMISSION, Some(peer), now);
+            }
+        } else if (request.method == REFRESH) {
+            this.lifetime = message.getU32(LIFETIME) ?? this.lifetime;
+            this.allocatedAt = now;
+        } else if (request.method == CREATE_PERMISSION) {
+            if (request.peer is Some(peer)) {
+                for (p in 0usize..this.permissions.length) {
+                    if (sameIp(this.permissions[p].peer, peer)) {
+                        this.permissions[p].granted = true;
+                        this.permissions[p].since = now;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /// The next datagram for the server, if any: the allocation, refreshes, permissions, retransmissions.
+    public fn poll(borrow mut this, now: u64) -> Vector<u8>? {
+        if (!this.started) {
+            this.started = true;
+            this.ask(ALLOCATE, null, now);
+        }
+        if (this.state is TurnState.Allocated) {
+            let refreshAt = this.allocatedAt + (if (this.lifetime > 120) (this.lifetime - 60) as u64 else (this.lifetime / 2) as u64) * 1000;
+            if (now >= refreshAt && !this.asking(REFRESH)) {
+                this.allocatedAt = now;
+                this.ask(REFRESH, null, now);
+            }
+            for (p in 0usize..this.permissions.length) {
+                if (this.permissions[p].granted && now >= this.permissions[p].since + PERMISSION_REFRESH) {
+                    let peer = this.permissions[p].peer;
+                    this.permissions[p].since = now;
+                    this.permissions[p].granted = false;
+                    this.ask(CREATE_PERMISSION, Some(peer), now);
+                }
+            }
+        }
+        if (this.outgoing.length > 0) {
+            return Some(this.outgoing.remove(0));
+        }
+        for (k in 0usize..this.pending.length) {
+            if (now >= this.pending[k].sentAt + (TURN_RTO << (if (this.pending[k].tries > 4) 4u64 else this.pending[k].tries as u64))) {
+                if (this.pending[k].tries >= TURN_TRIES) {
+                    let gone = this.pending.remove(k);
+                    if (gone.method == ALLOCATE) {
+                        this.state = TurnState.Failed;
+                    }
+                    return null;
+                }
+                this.pending[k].tries = this.pending[k].tries + 1;
+                this.pending[k].sentAt = now;
+                var copy = Vector<u8>.create();
+                let _ = copy.extend(this.pending[k].bytes.view());
+                return Some(copy);
+            }
+        }
+        return null;
+    }
+
+    fn asking(borrow this, method: u16) -> bool {
+        for (r in this.pending.view()) {
+            if (r.method == method) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// A request of `method` (for `peer`'s permission), queued to send now.
+    fn ask(borrow mut this, method: u16, peer: StunAddress?, now: u64) {
+        let transaction = transactionOf();
+        var m = StunMessage.create(method, StunClass.Request, transaction);
+        if (method == ALLOCATE) {
+            let _ = m.addU32(REQUESTED_TRANSPORT, 0x11000000);
+            let _ = m.addU32(LIFETIME, TURN_LIFETIME);
+        } else if (method == REFRESH) {
+            let _ = m.addU32(LIFETIME, TURN_LIFETIME);
+        } else if (method == CREATE_PERMISSION) {
+            if (peer is Some(p)) {
+                let _ = m.addAddress(XOR_PEER_ADDRESS, p);
+            }
+        }
+        var bytes = Vector<u8>.create();
+        if (this.authenticated) {
+            let _ = m.add(USERNAME, this.username.view().bytes());
+            let _ = m.add(REALM, this.realm.view().bytes());
+            let _ = m.add(NONCE, this.nonce.view().bytes());
+            bytes = m.encode(this.key[..], true);
+        } else {
+            bytes = m.encode(Vector<u8>.create().view(), true);
+        }
+        var copy = Vector<u8>.create();
+        let _ = copy.extend(bytes.view());
+        let _ = this.outgoing.push(copy);
+        let _ = this.pending.push(TurnRequest {
+            method: method,
+            transaction: transaction,
+            peer: peer,
+            sentAt: now,
+            tries: 1,
+            bytes: bytes,
+        });
+    }
+}
+
+fn sameIp(a: StunAddress, b: StunAddress) -> bool {
+    if (a.v6 != b.v6) {
+        return false;
+    }
+    let n: usize = if (a.v6) 16 else 4;
+    for (k in 0usize..n) {
+        if (a.ip[k] != b.ip[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn transactionOf() -> [u8; 12] {
+    var t = [0u8; 12];
+    let _ = Random.fill(mut t[..]);
+    return t;
+}
