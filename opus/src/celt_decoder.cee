@@ -2,6 +2,8 @@
 // off as Opus uses it; BSD).
 
 const DECODE_BUFFER_SIZE: usize = 2048;
+/// The decoder's band energies for quantAllBands, which only an encoder reads.
+const NO_BAND_ENERGY: [f32; 42] = [0.0f32; 42];
 const OVERLAP: usize = 120;
 const MAX_PERIOD: usize = 1024;
 const COMBFILTER_MINPERIOD: i32 = 15;
@@ -264,7 +266,7 @@ public struct CeltDecoder {
         let antiCollapseRsv: i32 = if (isTransient && lm >= 2 && bits >= celtShl(lmi + 2, 3)) 8 else 0;
         bits -= antiCollapseRsv;
         let alloc = computeAllocation(truncate<i32>(start), truncate<i32>(end), borrow offsets, borrow cap, allocTrim, bits,
-            truncate<i32>(c), lmi, mut ec);
+            truncate<i32>(c), lmi, mut ec, ALLOC_DECODE);
         unquantFineEnergy(start, end, mut this.oldBandE[..], borrow alloc.ebits, mut ec, c);
         // The history moves on by a frame.
         for (ch in 0usize..cc) {
@@ -274,10 +276,10 @@ public struct CeltDecoder {
             }
         }
         var masks = [0u8; 42];
-        let layout = BandLayout { y: n, norm: 2 * n, norm2: 2 * n + 8 * 100 };
+        let layout = BandLayout { y: n, norm: 2 * n, norm2: 2 * n + 8 * 100, scratch: 0, saves: 0 };
         this.rng = quantAllBands(start, end, mut this.bands[..], layout, c, mut masks[..], borrow alloc.pulses, shortBlocks,
             spread, alloc.dualStereo != 0, alloc.intensity, borrow tfRes, truncate<i32>(length) * 64 - antiCollapseRsv,
-            alloc.balance, mut ec, lm, alloc.codedBands, this.rng, this.disableInv);
+            alloc.balance, mut ec, lm, alloc.codedBands, this.rng, this.disableInv, false, borrow NO_BAND_ENERGY, 0);
         var antiCollapseOn = false;
         if (antiCollapseRsv > 0) {
             antiCollapseOn = ec.bits(1) != 0;

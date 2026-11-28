@@ -1,0 +1,1396 @@
+// CELT's encoder (libopus 1.5.2 celt/celt_encoder.c, float build with FLOAT_APPROX; BSD), at 48 kHz, for the Opus
+// layer's CELT-only frames: no custom modes, no upsampling, no surround masking, no LFE, and no tonality analysis
+// (the Opus layer runs that only from complexity 7). Every value is as libopus computes it, so the packets are
+// libopus's.
+
+const COMBFILTER_MAXPERIOD: usize = 1024;
+const INV_TABLE: [u8; 128] = [
+    255, 255, 156, 110, 86, 70, 59, 51, 45, 40, 37, 33, 31, 28, 26, 25,
+    23, 22, 21, 20, 19, 18, 17, 16, 16, 15, 15, 14, 13, 13, 12, 12,
+    12, 12, 11, 11, 11, 10, 10, 10, 9, 9, 9, 9, 9, 9, 8, 8,
+    8, 8, 8, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2,
+];
+const INTENSITY_THRESHOLDS: [f32; 21] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 16.0, 24.0, 36.0, 44.0, 50.0, 56.0, 62.0, 67.0,
+    72.0, 79.0, 88.0, 106.0, 134.0];
+const INTENSITY_HYSTERESIS: [f32; 21] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 4.0,
+    5.0, 6.0, 8.0, 8.0];
+
+/// libopus's OPUS_BITRATE_MAX.
+public const CELT_BITRATE_MAX: i32 = -1;
+
+public struct CeltEncoder {
+    channels: usize;
+    streamChannels: usize;
+    forceIntra: bool;
+    disablePf: bool;
+    complexity: i32;
+    start: usize;
+    end: usize;
+    bitrate: i32;
+    vbr: bool;
+    constrainedVbr: bool;
+    lossRate: i32;
+    lsbDepth: i32;
+    disableInv: bool;
+    rng: u32;
+    spreadDecision: i32;
+    delayedIntra: f32;
+    tonalAverage: i32;
+    lastCodedBands: i32;
+    hfAverage: i32;
+    tapsetDecision: i32;
+    prefilterPeriod: i32;
+    prefilterGain: f32;
+    prefilterTapset: i32;
+    consecTransient: i32;
+    preemphMemE: [f32; 2];
+    vbrReservoir: i32;
+    vbrDrift: i32;
+    vbrOffset: i32;
+    vbrCount: i32;
+    overlapMax: f32;
+    stereoSaving: f32;
+    intensity: i32;
+    specAvg: f32;
+    inMem: [f32; 240];
+    prefilterMem: Vector<f32>;
+    oldBandE: [f32; 42];
+    oldLogE: [f32; 42];
+    oldLogE2: [f32; 42];
+    energyError: [f32; 42];
+    // Scratch, made once.
+    input: Vector<f32>;
+    freq: Vector<f32>;
+    bands: Vector<f32>;
+    pre: Vector<f32>;
+    pitchBuf: Vector<f32>;
+    scratch: Vector<f32>;
+
+    /// A 48 kHz encoder for `channels` (1 or 2), as celt_encoder_init leaves it: complexity 5, CBR, no bitrate limit.
+    public fn create(channels: usize) -> CeltEncoder {
+        var e = CeltEncoder {
+            channels: channels,
+            streamChannels: channels,
+            forceIntra: false,
+            disablePf: false,
+            complexity: 5,
+            start: 0,
+            end: NB_EBANDS,
+            bitrate: CELT_BITRATE_MAX,
+            vbr: false,
+            constrainedVbr: true,
+            lossRate: 0,
+            lsbDepth: 24,
+            disableInv: channels == 1,
+            rng: 0,
+            spreadDecision: 2,
+            delayedIntra: 1.0,
+            tonalAverage: 256,
+            lastCodedBands: 0,
+            hfAverage: 0,
+            tapsetDecision: 0,
+            prefilterPeriod: 0,
+            prefilterGain: 0.0,
+            prefilterTapset: 0,
+            consecTransient: 0,
+            preemphMemE: [0.0f32; 2],
+            vbrReservoir: 0,
+            vbrDrift: 0,
+            vbrOffset: 0,
+            vbrCount: 0,
+            overlapMax: 0.0,
+            stereoSaving: 0.0,
+            intensity: 0,
+            specAvg: 0.0,
+            inMem: [0.0f32; 240],
+            prefilterMem: Vector<f32>.create(),
+            oldBandE: [0.0f32; 42],
+            oldLogE: [-28.0f32; 42],
+            oldLogE2: [-28.0f32; 42],
+            energyError: [0.0f32; 42],
+            input: Vector<f32>.create(),
+            freq: Vector<f32>.create(),
+            bands: Vector<f32>.create(),
+            pre: Vector<f32>.create(),
+            pitchBuf: Vector<f32>.create(),
+            scratch: Vector<f32>.create(),
+        };
+        let _ = e.prefilterMem.resize(channels * COMBFILTER_MAXPERIOD, 0.0);
+        let _ = e.input.resize(2 * (960 + OVERLAP), 0.0);
+        let _ = e.freq.resize(2 * 960, 0.0);
+        let _ = e.bands.resize(bandEncoderBufferLength(), 0.0);
+        let _ = e.pre.resize(2 * (960 + COMBFILTER_MAXPERIOD), 0.0);
+        let _ = e.pitchBuf.resize((COMBFILTER_MAXPERIOD + 960) >> 1, 0.0);
+        let _ = e.scratch.resize(4096, 0.0);
+        return e;
+    }
+
+    /// OPUS_RESET_STATE.
+    public fn reset(borrow mut this) {
+        this.rng = 0;
+        this.spreadDecision = 2;
+        this.delayedIntra = 1.0;
+        this.tonalAverage = 256;
+        this.lastCodedBands = 0;
+        this.hfAverage = 0;
+        this.tapsetDecision = 0;
+        this.prefilterPeriod = 0;
+        this.prefilterGain = 0.0;
+        this.prefilterTapset = 0;
+        this.consecTransient = 0;
+        this.preemphMemE = [0.0f32; 2];
+        this.vbrReservoir = 0;
+        this.vbrDrift = 0;
+        this.vbrOffset = 0;
+        this.vbrCount = 0;
+        this.overlapMax = 0.0;
+        this.stereoSaving = 0.0;
+        this.intensity = 0;
+        this.specAvg = 0.0;
+        this.inMem = [0.0f32; 240];
+        for (k in 0usize..this.prefilterMem.length) {
+            this.prefilterMem[k] = 0.0;
+        }
+        this.oldBandE = [0.0f32; 42];
+        this.oldLogE = [-28.0f32; 42];
+        this.oldLogE2 = [-28.0f32; 42];
+        this.energyError = [0.0f32; 42];
+    }
+
+    public fn setComplexity(borrow mut this, value: i32) {
+        this.complexity = value;
+    }
+
+    /// OPUS_SET_BITRATE: bits per second, or CELT_BITRATE_MAX.
+    public fn setBitrate(borrow mut this, value: i32) {
+        this.bitrate = if (value == CELT_BITRATE_MAX) value else celtImin(value, 260000 * truncate<i32>(this.channels));
+    }
+
+    public fn setVbr(borrow mut this, on: bool) {
+        this.vbr = on;
+    }
+
+    public fn setVbrConstraint(borrow mut this, on: bool) {
+        this.constrainedVbr = on;
+    }
+
+    /// CELT_SET_PREDICTION: 0 intra only and no prefilter, 1 no prefilter, 2 both.
+    public fn setPrediction(borrow mut this, value: i32) {
+        this.disablePf = value <= 1;
+        this.forceIntra = value == 0;
+    }
+
+    public fn setPacketLoss(borrow mut this, percent: i32) {
+        this.lossRate = percent;
+    }
+
+    public fn setLsbDepth(borrow mut this, depth: i32) {
+        this.lsbDepth = depth;
+    }
+
+    public fn setStartBand(borrow mut this, band: usize) {
+        this.start = band;
+    }
+
+    public fn setEndBand(borrow mut this, band: usize) {
+        this.end = band;
+    }
+
+    public fn setStreamChannels(borrow mut this, channels: usize) {
+        this.streamChannels = channels;
+    }
+
+    public fn finalRange(borrow this) -> u32 => this.rng;
+
+    /// celt_encode_with_ec: one frame of `pcm` (interleaved, ±1.0 full scale, `frameSize` samples per channel) into
+    /// the frame `enc` is writing, at most `nbCompressedBytes0` bytes of it. Gives the frame's length in bytes.
+    public fn encode<region r>(borrow mut this, pcm: Slice<f32>, frameSize: usize, nbCompressedBytes0: usize,
+        enc: borrow mut RangeDecoder<r>) -> Result<usize, CeltError> {
+        let cc = this.channels;
+        let c = this.streamChannels;
+        let ci = truncate<i32>(c);
+        let start = this.start;
+        let end = this.end;
+        let hybrid = start != 0;
+        var tfEstimate: f32 = 0.0;
+        if (nbCompressedBytes0 < 2) {
+            return Err(CeltError.BadArgument);
+        }
+        let lm = lmOf(frameSize) ?? { return Err(CeltError.BadArgument); };
+        let lmi = truncate<i32>(lm);
+        let m = 1usize << lm;
+        let n = m * 120;
+        let overlap = OVERLAP;
+        var tell = enc.tell();
+        let nbFilledBytes = celtShr(tell + 4, 3);
+        var nbCompressedBytes = celtImin(truncate<i32>(nbCompressedBytes0), 1275);
+        var nbAvailableBytes = nbCompressedBytes - nbFilledBytes;
+        var vbrRate: i32 = 0;
+        var effectiveBytes: i32 = 0;
+        if (this.vbr && this.bitrate != CELT_BITRATE_MAX) {
+            let den = celtShr(48000, 3);
+            vbrRate = (this.bitrate * truncate<i32>(frameSize) + celtShr(den, 1)) / den;
+            effectiveBytes = celtShr(vbrRate, 6);
+        } else {
+            var tmp = this.bitrate * truncate<i32>(frameSize);
+            if (tell > 1) {
+                tmp += tell * 48000;
+            }
+            if (this.bitrate != CELT_BITRATE_MAX) {
+                nbCompressedBytes = celtImax(2, celtImin(nbCompressedBytes, (tmp + 4 * 48000) / (8 * 48000)));
+                enc.encShrink(truncate<u32>(nbCompressedBytes));
+            }
+            effectiveBytes = nbCompressedBytes - nbFilledBytes;
+        }
+        var equivRate = celtShl(nbCompressedBytes * 8 * 50, 3 - lmi) - (40 * ci + 20) * (celtShr(400, lmi) - 50);
+        if (this.bitrate != CELT_BITRATE_MAX) {
+            equivRate = celtImin(equivRate, this.bitrate - (40 * ci + 20) * (celtShr(400, lmi) - 50));
+        }
+        if (vbrRate > 0 && this.constrainedVbr) {
+            let vbrBound = vbrRate;
+            let maxAllowed = celtImin(celtImax(if (tell == 1) 2 else 0, celtShr(vbrRate + vbrBound - this.vbrReservoir, 6)),
+                nbAvailableBytes);
+            if (maxAllowed < nbAvailableBytes) {
+                nbCompressedBytes = nbFilledBytes + maxAllowed;
+                nbAvailableBytes = maxAllowed;
+                enc.encShrink(truncate<u32>(nbCompressedBytes));
+            }
+        }
+        var totalBits = nbCompressedBytes * 8;
+        var effEnd = end;
+        if (effEnd > NB_EBANDS) {
+            effEnd = NB_EBANDS;
+        }
+        // Silence (celt_maxabs16 over the stream channels' samples, as libopus counts them).
+        var sampleMax = celtFmax(this.overlapMax, maxAbs(pcm, 0, c * (n - overlap)));
+        this.overlapMax = maxAbs(pcm, c * (n - overlap), c * overlap);
+        sampleMax = celtFmax(sampleMax, this.overlapMax);
+        var silence = sampleMax <= 1.0 / round<f32>(celtShl(1, this.lsbDepth));
+        if (tell == 1) {
+            enc.encBitLogp(silence, 15);
+        } else {
+            silence = false;
+        }
+        if (silence) {
+            if (vbrRate > 0) {
+                nbCompressedBytes = celtImin(nbCompressedBytes, nbFilledBytes + 2);
+                effectiveBytes = nbCompressedBytes;
+                totalBits = nbCompressedBytes * 8;
+                nbAvailableBytes = 2;
+                enc.encShrink(truncate<u32>(nbCompressedBytes));
+            }
+            tell = nbCompressedBytes * 8;
+            enc.totalBits += tell - enc.tell();
+        }
+        // Pre-emphasis into `input`, after each channel's overlap.
+        for (ch in 0usize..cc) {
+            let needClip = sampleMax > 65536.0;
+            let at = ch * (n + overlap) + overlap;
+            var mem = this.preemphMemE[ch];
+            for (i in 0usize..n) {
+                var x = pcm[ch + cc * i] * CELT_SIG_SCALE;
+                if (needClip) {
+                    x = celtFmax(-65536.0, celtFmin(65536.0, x));
+                }
+                this.input[at + i] = x - mem;
+                mem = PREEMPH * x;
+            }
+            this.preemphMemE[ch] = mem;
+        }
+        // The prefilter.
+        let enabled = nbAvailableBytes > 12 * ci && !hybrid && !silence && !this.disablePf && this.complexity >= 5;
+        let prefilterTapset = this.tapsetDecision;
+        var pitchIndex: i32 = COMBFILTER_MINPERIOD;
+        var gain1: f32 = 0.0;
+        var qg: i32 = 0;
+        let pfOn = this.runPrefilter(cc, n, prefilterTapset, mut pitchIndex, mut gain1, mut qg, enabled, nbAvailableBytes);
+        var pitchChange = false;
+        if ((gain1 > 0.4 || this.prefilterGain > 0.4)
+            && (round<f64>(pitchIndex) > 1.26 * round<f64>(this.prefilterPeriod)
+                || round<f64>(pitchIndex) < 0.79 * round<f64>(this.prefilterPeriod))) {
+            pitchChange = true;
+        }
+        if (!pfOn) {
+            if (!hybrid && tell + 16 <= totalBits) {
+                enc.encBitLogp(false, 1);
+            }
+        } else {
+            enc.encBitLogp(true, 1);
+            let pi = pitchIndex + 1;
+            let octave = truncate<i32>(ilog(truncate<u32>(pi))) - 5;
+            enc.encUint(truncate<u32>(octave), 6);
+            enc.encBits(truncate<u32>(pi - celtShl(16, octave)), truncate<u32>(4 + octave));
+            enc.encBits(truncate<u32>(qg), 3);
+            enc.encIcdf(truncate<u32>(prefilterTapset), TAPSET_ICDF[..], 2);
+        }
+        // Transients.
+        var isTransient = false;
+        var shortBlocks: usize = 0;
+        var tfChan: usize = 0;
+        if (this.complexity >= 1) {
+            isTransient = transientAnalysis(this.input[..], n + overlap, cc, mut tfEstimate, mut tfChan, mut this.scratch[..]);
+        }
+        var transientGotDisabled = false;
+        if (lm > 0 && enc.tell() + 3 <= totalBits) {
+            if (isTransient) {
+                shortBlocks = m;
+            }
+        } else {
+            isTransient = false;
+            transientGotDisabled = true;
+        }
+        var bandE = [0.0f32; 42];
+        var bandLogE = [0.0f32; 42];
+        var bandLogE2 = [0.0f32; 42];
+        let secondMdct = shortBlocks != 0 && this.complexity >= 8;
+        if (secondMdct) {
+            computeMdcts(this.input[..], mut this.freq[..], 0, c, cc, lm);
+            computeBandEnergies(this.freq[..], mut bandE, effEnd, c, lm);
+            amp2Log2(effEnd, end, borrow bandE, mut bandLogE2[..], c);
+            for (ch in 0usize..c) {
+                for (i in 0usize..end) {
+                    bandLogE2[NB_EBANDS * ch + i] += 0.5 * round<f32>(lmi);
+                }
+            }
+        }
+        computeMdcts(this.input[..], mut this.freq[..], shortBlocks, c, cc, lm);
+        if (cc == 2 && c == 1) {
+            tfChan = 0;
+        }
+        computeBandEnergies(this.freq[..], mut bandE, effEnd, c, lm);
+        amp2Log2(effEnd, end, borrow bandE, mut bandLogE[..], c);
+        // The temporal VBR's spectral average.
+        var follow: f32 = -10.0;
+        var frameAvg: f32 = 0.0;
+        let avgOffset: f32 = if (shortBlocks != 0) 0.5 * round<f32>(lmi) else 0.0;
+        for (i in start..end) {
+            follow = celtFmax(follow - 1.0, bandLogE[i] - avgOffset);
+            if (c == 2) {
+                follow = celtFmax(follow, bandLogE[i + NB_EBANDS] - avgOffset);
+            }
+            frameAvg += follow;
+        }
+        frameAvg /= round<f32>(truncate<i32>(end - start));
+        var temporalVbr = frameAvg - this.specAvg;
+        temporalVbr = celtFmin(3.0, celtFmax(-1.5, temporalVbr));
+        this.specAvg += 0.02 * temporalVbr;
+        if (!secondMdct) {
+            bandLogE2 = bandLogE;
+        }
+        if (lm > 0 && enc.tell() + 3 <= totalBits && !isTransient && this.complexity >= 5 && !hybrid) {
+            if (patchTransientDecision(borrow bandLogE, borrow this.oldBandE, start, end, c)) {
+                isTransient = true;
+                shortBlocks = m;
+                computeMdcts(this.input[..], mut this.freq[..], shortBlocks, c, cc, lm);
+                computeBandEnergies(this.freq[..], mut bandE, effEnd, c, lm);
+                amp2Log2(effEnd, end, borrow bandE, mut bandLogE[..], c);
+                for (ch in 0usize..c) {
+                    for (i in 0usize..end) {
+                        bandLogE2[NB_EBANDS * ch + i] += 0.5 * round<f32>(lmi);
+                    }
+                }
+                tfEstimate = 0.2;
+            }
+        }
+        if (lm > 0 && enc.tell() + 3 <= totalBits) {
+            enc.encBitLogp(isTransient, 3);
+        }
+        // The shapes: X at 0, Y at n, in `bands`.
+        normaliseBands(this.freq[..], mut this.bands[..], 0, n, borrow bandE, effEnd, c, m);
+        let enableTfAnalysis = effectiveBytes >= 15 * ci && !hybrid && this.complexity >= 2;
+        var offsets = [0i32; 21];
+        var importance = [0i32; 21];
+        var spreadWeight = [0i32; 21];
+        var totBoost: i32 = 0;
+        let maxDepth = dynallocAnalysis(borrow bandLogE, borrow bandLogE2, borrow this.oldBandE, start, end, c, mut offsets,
+            this.lsbDepth, isTransient, this.vbr, this.constrainedVbr, lmi, effectiveBytes, mut totBoost, mut importance,
+            mut spreadWeight);
+        var tfRes = [0i32; 21];
+        var tfSelect: i32 = 0;
+        if (enableTfAnalysis) {
+            let lambda = celtImax(80, 20480 / effectiveBytes + 2);
+            tfSelect = tfAnalysis(effEnd, isTransient, mut tfRes, lambda, this.bands[..], n, lm, tfEstimate, tfChan,
+                borrow importance);
+            for (i in effEnd..end) {
+                tfRes[i] = tfRes[effEnd - 1];
+            }
+        } else {
+            for (i in 0usize..end) {
+                tfRes[i] = if (isTransient) 1 else 0;
+            }
+        }
+        var error = [0.0f32; 42];
+        for (ch in 0usize..c) {
+            for (i in start..end) {
+                let at = i + ch * NB_EBANDS;
+                if ((bandLogE[at] - this.oldBandE[at]).abs() < 2.0) {
+                    bandLogE[at] -= this.energyError[at] * 0.25;
+                }
+            }
+        }
+        quantCoarseEnergy(start, end, effEnd, bandLogE[..], mut this.oldBandE[..], truncate<u32>(totalBits), mut error[..],
+            mut enc, c, lm, nbAvailableBytes, this.forceIntra, mut this.delayedIntra, this.complexity >= 4, this.lossRate,
+            false);
+        tfEncode(start, end, isTransient, mut tfRes, lm, tfSelect, mut enc);
+        if (enc.tell() + 4 <= totalBits) {
+            if (shortBlocks != 0 || this.complexity < 3 || nbAvailableBytes < 10 * ci) {
+                this.spreadDecision = if (this.complexity == 0) 0 else 2;
+            } else {
+                this.spreadDecision = spreadingDecision(this.bands[..], mut this.tonalAverage, this.spreadDecision,
+                    mut this.hfAverage, mut this.tapsetDecision, pfOn && shortBlocks == 0, effEnd, c, m, borrow spreadWeight);
+            }
+            enc.encIcdf(truncate<u32>(this.spreadDecision), SPREAD_ICDF[..], 5);
+        }
+        var cap = [0i32; 21];
+        for (i in 0usize..NB_EBANDS) {
+            let width = celtShl(EBAND5MS[i + 1] as i32 - EBAND5MS[i] as i32, lmi);
+            cap[i] = celtShr(((CACHE_CAPS50[NB_EBANDS * (2 * lm + c - 1) + i] as i32) + 64) * ci * width, 2);
+        }
+        // Dynamic allocation boosts.
+        var dynallocLogp: i32 = 6;
+        totalBits = celtShl(totalBits, 3);
+        var totalBoost: i32 = 0;
+        var tellFrac = truncate<i32>(enc.tellFrac());
+        for (i in start..end) {
+            let width = celtShl(ci * (EBAND5MS[i + 1] as i32 - EBAND5MS[i] as i32), lmi);
+            let quanta = celtImin(celtShl(width, 3), celtImax(48, width));
+            var loopLogp = dynallocLogp;
+            var boost: i32 = 0;
+            var j: i32 = 0;
+            while (tellFrac + celtShl(loopLogp, 3) < totalBits - totalBoost && boost < cap[i]) {
+                let flag = j < offsets[i];
+                enc.encBitLogp(flag, truncate<u32>(loopLogp));
+                tellFrac = truncate<i32>(enc.tellFrac());
+                if (!flag) {
+                    break;
+                }
+                boost += quanta;
+                totalBoost += quanta;
+                loopLogp = 1;
+                j += 1;
+            }
+            if (j != 0) {
+                dynallocLogp = celtImax(2, dynallocLogp - 1);
+            }
+            offsets[i] = boost;
+        }
+        var dualStereo: i32 = 0;
+        if (c == 2) {
+            if (lm != 0) {
+                dualStereo = if (stereoAnalysis(this.bands[..], lm, n)) 1 else 0;
+            }
+            let prev = truncate<usize>(this.intensity);
+            this.intensity = truncate<i32>(hysteresisDecision(round<f32>(equivRate / 1000), INTENSITY_THRESHOLDS[..],
+                INTENSITY_HYSTERESIS[..], 21, prev));
+            this.intensity = celtImin(truncate<i32>(end), celtImax(truncate<i32>(start), this.intensity));
+        }
+        var allocTrim: i32 = 5;
+        if (tellFrac + 48 <= totalBits - totalBoost) {
+            allocTrim = allocTrimAnalysis(this.bands[..], borrow bandLogE, end, lm, c, n, mut this.stereoSaving, tfEstimate,
+                this.intensity, equivRate);
+            enc.encIcdf(truncate<u32>(allocTrim), TRIM_ICDF[..], 7);
+            tellFrac = truncate<i32>(enc.tellFrac());
+        }
+        // VBR.
+        if (vbrRate > 0) {
+            let lmDiff = 3 - lmi;
+            nbCompressedBytes = celtImin(nbCompressedBytes, celtShr(1275, 3 - lmi));
+            var baseTarget = vbrRate - celtShl(40 * ci + 20, 3);
+            if (this.constrainedVbr) {
+                baseTarget += celtShr(this.vbrOffset, lmDiff);
+            }
+            var target = computeVbr(baseTarget, lmi, equivRate, this.lastCodedBands, ci, this.intensity, this.constrainedVbr,
+                this.stereoSaving, totBoost, tfEstimate, maxDepth, temporalVbr);
+            target = target + tellFrac;
+            let minAllowed = celtShr(tellFrac + totalBoost + 64 - 1, 6) + 2;
+            nbAvailableBytes = celtShr(target + 32, 6);
+            nbAvailableBytes = celtImax(minAllowed, nbAvailableBytes);
+            nbAvailableBytes = celtImin(nbCompressedBytes, nbAvailableBytes);
+            var delta = target - vbrRate;
+            target = celtShl(nbAvailableBytes, 6);
+            if (silence) {
+                nbAvailableBytes = 2;
+                target = 128;
+                delta = 0;
+            }
+            var alpha: f32 = 0.001;
+            if (this.vbrCount < 970) {
+                this.vbrCount += 1;
+                alpha = 1.0 / round<f32>(this.vbrCount + 20);
+            }
+            if (this.constrainedVbr) {
+                this.vbrReservoir += target - vbrRate;
+                this.vbrDrift += truncate<i32>(alpha * round<f32>(delta * celtShl(1, lmDiff) - this.vbrOffset - this.vbrDrift));
+                this.vbrOffset = -this.vbrDrift;
+            }
+            if (this.constrainedVbr && this.vbrReservoir < 0) {
+                let adjust = (-this.vbrReservoir) / 64;
+                nbAvailableBytes += if (silence) 0 else adjust;
+                this.vbrReservoir = 0;
+            }
+            nbCompressedBytes = celtImin(nbCompressedBytes, nbAvailableBytes);
+            enc.encShrink(truncate<u32>(nbCompressedBytes));
+        }
+        // The allocation, the fine energies and the shapes.
+        var bits = celtShl(nbCompressedBytes * 8, 3) - truncate<i32>(enc.tellFrac()) - 1;
+        let antiCollapseRsv: i32 = if (isTransient && lm >= 2 && bits >= celtShl(lmi + 2, 3)) 8 else 0;
+        bits -= antiCollapseRsv;
+        let signalBandwidth = truncate<i32>(end) - 1;
+        let alloc = computeAllocation(truncate<i32>(start), truncate<i32>(end), borrow offsets, borrow cap, allocTrim, bits, ci,
+            lmi, mut enc, AllocEncode {
+                encode: true,
+                prev: this.lastCodedBands,
+                signalBandwidth: signalBandwidth,
+                intensity: this.intensity,
+                dualStereo: dualStereo,
+            });
+        this.intensity = alloc.intensity;
+        dualStereo = alloc.dualStereo;
+        if (this.lastCodedBands != 0) {
+            this.lastCodedBands = celtImin(this.lastCodedBands + 1, celtImax(this.lastCodedBands - 1, alloc.codedBands));
+        } else {
+            this.lastCodedBands = alloc.codedBands;
+        }
+        quantFineEnergy(start, end, mut this.oldBandE[..], mut error[..], borrow alloc.ebits, mut enc, c);
+        var masks = [0u8; 42];
+        let base = bandBufferLength();
+        let layout = BandLayout { y: n, norm: 2 * n, norm2: 2 * n + 8 * 100, scratch: base, saves: base + MAX_BAND };
+        this.rng = quantAllBands(start, end, mut this.bands[..], layout, c, mut masks[..], borrow alloc.pulses,
+            shortBlocks != 0, this.spreadDecision, dualStereo != 0, this.intensity, borrow tfRes,
+            nbCompressedBytes * 64 - antiCollapseRsv, alloc.balance, mut enc, lm, alloc.codedBands, this.rng, this.disableInv,
+            true, borrow bandE, this.complexity);
+        if (antiCollapseRsv > 0) {
+            let on: u32 = if (this.consecTransient < 2) 1 else 0;
+            enc.encBits(on, 1);
+        }
+        quantEnergyFinalise(start, end, mut this.oldBandE[..], mut error[..], borrow alloc.ebits, borrow alloc.finePriority,
+            nbCompressedBytes * 8 - enc.tell(), mut enc, c);
+        this.energyError = [0.0f32; 42];
+        for (ch in 0usize..c) {
+            for (i in start..end) {
+                let at = i + ch * NB_EBANDS;
+                this.energyError[at] = celtFmax(-0.5, celtFmin(0.5, error[at]));
+            }
+        }
+        if (silence) {
+            for (i in 0usize..c * NB_EBANDS) {
+                this.oldBandE[i] = -28.0;
+            }
+        }
+        this.prefilterPeriod = pitchIndex;
+        this.prefilterGain = gain1;
+        this.prefilterTapset = prefilterTapset;
+        if (cc == 2 && c == 1) {
+            for (i in 0usize..NB_EBANDS) {
+                this.oldBandE[NB_EBANDS + i] = this.oldBandE[i];
+            }
+        }
+        if (!isTransient) {
+            for (i in 0usize..cc * NB_EBANDS) {
+                this.oldLogE2[i] = this.oldLogE[i];
+                this.oldLogE[i] = this.oldBandE[i];
+            }
+        } else {
+            for (i in 0usize..cc * NB_EBANDS) {
+                this.oldLogE[i] = celtFmin(this.oldLogE[i], this.oldBandE[i]);
+            }
+        }
+        for (ch in 0usize..cc) {
+            for (i in 0usize..start) {
+                this.oldBandE[ch * NB_EBANDS + i] = 0.0;
+                this.oldLogE[ch * NB_EBANDS + i] = -28.0;
+                this.oldLogE2[ch * NB_EBANDS + i] = -28.0;
+            }
+            for (i in end..NB_EBANDS) {
+                this.oldBandE[ch * NB_EBANDS + i] = 0.0;
+                this.oldLogE[ch * NB_EBANDS + i] = -28.0;
+                this.oldLogE2[ch * NB_EBANDS + i] = -28.0;
+            }
+        }
+        if (isTransient || transientGotDisabled) {
+            this.consecTransient += 1;
+        } else {
+            this.consecTransient = 0;
+        }
+        this.rng = enc.range;
+        enc.encDone();
+        if (enc.error) {
+            return Err(CeltError.InternalError);
+        }
+        let _ = pitchChange;
+        return Ok(truncate<usize>(nbCompressedBytes));
+    }
+
+    /// libopus's run_prefilter: the pitch found and the comb filter run over `input` (from `pre`, the frame with its
+    /// history); gives whether the prefilter is on.
+    fn runPrefilter(borrow mut this, cc: usize, n: usize, prefilterTapset: i32, pitch: borrow mut i32, gain: borrow mut f32,
+        qgain: borrow mut i32, enabled: bool, nbAvailableBytes: i32) -> bool {
+        let overlap = OVERLAP;
+        let preStride = n + COMBFILTER_MAXPERIOD;
+        for (ch in 0usize..cc) {
+            for (k in 0usize..COMBFILTER_MAXPERIOD) {
+                this.pre[ch * preStride + k] = this.prefilterMem[ch * COMBFILTER_MAXPERIOD + k];
+            }
+            for (k in 0usize..n) {
+                this.pre[ch * preStride + COMBFILTER_MAXPERIOD + k] = this.input[ch * (n + overlap) + overlap + k];
+            }
+        }
+        var pitchIndex: i32 = 0;
+        var gain1: f32 = 0.0;
+        if (enabled) {
+            celtPitchDownsample(this.pre[..], preStride, cc, mut this.pitchBuf[..], COMBFILTER_MAXPERIOD + n, mut this.scratch[..]);
+            pitchIndex = celtPitchSearch(this.pitchBuf[..], COMBFILTER_MAXPERIOD >> 1, 0, n,
+                COMBFILTER_MAXPERIOD - 3 * 15, mut this.scratch[..]);
+            pitchIndex = truncate<i32>(COMBFILTER_MAXPERIOD) - pitchIndex;
+            gain1 = celtRemoveDoubling(this.pitchBuf[..], truncate<i32>(COMBFILTER_MAXPERIOD), COMBFILTER_MINPERIOD,
+                truncate<i32>(n), mut pitchIndex, this.prefilterPeriod, this.prefilterGain, mut this.scratch[2048..]);
+            if (pitchIndex > truncate<i32>(COMBFILTER_MAXPERIOD) - 2) {
+                pitchIndex = truncate<i32>(COMBFILTER_MAXPERIOD) - 2;
+            }
+            gain1 = 0.7 * gain1;
+            if (this.lossRate > 2) {
+                gain1 = 0.5 * gain1;
+            }
+            if (this.lossRate > 4) {
+                gain1 = 0.5 * gain1;
+            }
+            if (this.lossRate > 8) {
+                gain1 = 0.0;
+            }
+        } else {
+            gain1 = 0.0;
+            pitchIndex = COMBFILTER_MINPERIOD;
+        }
+        var pfThreshold: f32 = 0.2;
+        let moved = if (pitchIndex > this.prefilterPeriod) pitchIndex - this.prefilterPeriod else this.prefilterPeriod - pitchIndex;
+        if (moved * 10 > pitchIndex) {
+            pfThreshold += 0.2;
+        }
+        if (nbAvailableBytes < 25) {
+            pfThreshold += 0.1;
+        }
+        if (nbAvailableBytes < 35) {
+            pfThreshold += 0.1;
+        }
+        if (this.prefilterGain > 0.4) {
+            pfThreshold -= 0.1;
+        }
+        if (this.prefilterGain > 0.55) {
+            pfThreshold -= 0.1;
+        }
+        pfThreshold = celtFmax(pfThreshold, 0.2);
+        var pfOn = false;
+        var qg: i32 = 0;
+        if (gain1 < pfThreshold) {
+            gain1 = 0.0;
+        } else {
+            if ((gain1 - this.prefilterGain).abs() < 0.1) {
+                gain1 = this.prefilterGain;
+            }
+            qg = truncate<i32>((0.5 + gain1 * 32.0 / 3.0).floor()) - 1;
+            qg = celtImax(0, celtImin(7, qg));
+            gain1 = 0.09375 * round<f32>(qg + 1);
+            pfOn = true;
+        }
+        for (ch in 0usize..cc) {
+            this.prefilterPeriod = celtImax(this.prefilterPeriod, COMBFILTER_MINPERIOD);
+            let at = ch * (n + overlap);
+            for (k in 0usize..overlap) {
+                this.input[at + k] = this.inMem[ch * overlap + k];
+            }
+            combFilterInto(mut this.input[..], at + overlap, this.pre[..], ch * preStride + COMBFILTER_MAXPERIOD,
+                this.prefilterPeriod, pitchIndex, n, -this.prefilterGain, -gain1, this.prefilterTapset, prefilterTapset,
+                overlap);
+            for (k in 0usize..overlap) {
+                this.inMem[ch * overlap + k] = this.input[at + n + k];
+            }
+            let pm = ch * COMBFILTER_MAXPERIOD;
+            if (n > COMBFILTER_MAXPERIOD) {
+                for (k in 0usize..COMBFILTER_MAXPERIOD) {
+                    this.prefilterMem[pm + k] = this.pre[ch * preStride + n + k];
+                }
+            } else {
+                for (k in 0usize..COMBFILTER_MAXPERIOD - n) {
+                    this.prefilterMem[pm + k] = this.prefilterMem[pm + n + k];
+                }
+                for (k in 0usize..n) {
+                    this.prefilterMem[pm + COMBFILTER_MAXPERIOD - n + k] = this.pre[ch * preStride + COMBFILTER_MAXPERIOD + k];
+                }
+            }
+        }
+        gain = gain1;
+        pitch = pitchIndex;
+        qgain = qg;
+        return pfOn;
+    }
+}
+
+/// libopus's comb_filter from `src` (from `x`, with its history before) into `out` (from `y`).
+fn combFilterInto(out: SliceMut<f32>, y: usize, src: Slice<f32>, x: usize, t00: i32, t10: i32, n: usize, g0: f32, g1: f32,
+    tap0: i32, tap1: i32, overlap0: usize) {
+    if (g0 == 0.0 && g1 == 0.0) {
+        for (i in 0usize..n) {
+            out[y + i] = src[x + i];
+        }
+        return;
+    }
+    let t0 = truncate<usize>(celtImax(t00, COMBFILTER_MINPERIOD));
+    let t1 = truncate<usize>(celtImax(t10, COMBFILTER_MINPERIOD));
+    let a0 = truncate<usize>(tap0) * 3;
+    let a1 = truncate<usize>(tap1) * 3;
+    let g00 = g0 * COMB_GAINS[a0];
+    let g01 = g0 * COMB_GAINS[a0 + 1];
+    let g02 = g0 * COMB_GAINS[a0 + 2];
+    let g10 = g1 * COMB_GAINS[a1];
+    let g11 = g1 * COMB_GAINS[a1 + 1];
+    let g12 = g1 * COMB_GAINS[a1 + 2];
+    var x1 = src[x + 1 - t1];
+    var x2 = src[x - t1];
+    var x3 = src[x - t1 - 1];
+    var x4 = src[x - t1 - 2];
+    var overlap = overlap0;
+    if (g0 == g1 && t0 == t1 && tap0 == tap1) {
+        overlap = 0;
+    }
+    var i: usize = 0;
+    while (i < overlap) {
+        let x0 = src[x + i + 2 - t1];
+        let f = WINDOW120[i] * WINDOW120[i];
+        let nf = 1.0 - f;
+        out[y + i] = src[x + i]
+            + (nf * g00) * src[x + i - t0]
+            + (nf * g01) * (src[x + i + 1 - t0] + src[x + i - t0 - 1])
+            + (nf * g02) * (src[x + i + 2 - t0] + src[x + i - t0 - 2])
+            + (f * g10) * x2
+            + (f * g11) * (x1 + x3)
+            + (f * g12) * (x0 + x4);
+        x4 = x3;
+        x3 = x2;
+        x2 = x1;
+        x1 = x0;
+        i += 1;
+    }
+    if (g1 == 0.0) {
+        for (k in overlap..n) {
+            out[y + k] = src[x + k];
+        }
+        return;
+    }
+    let ys = y + i;
+    let xs = x + i;
+    var c4 = src[xs - t1 - 2];
+    var c3 = src[xs - t1 - 1];
+    var c2 = src[xs - t1];
+    var c1 = src[xs + 1 - t1];
+    for (k in 0usize..n - i) {
+        let c0 = src[xs + k + 2 - t1];
+        out[ys + k] = src[xs + k] + g10 * c2 + g11 * (c1 + c3) + g12 * (c0 + c4);
+        c4 = c3;
+        c3 = c2;
+        c2 = c1;
+        c1 = c0;
+    }
+}
+
+/// celt_maxabs16 over x[from..from + n].
+fn maxAbs(x: Slice<f32>, from: usize, n: usize) -> f32 {
+    var maxval: f32 = 0.0;
+    var minval: f32 = 0.0;
+    for (i in from..from + n) {
+        maxval = celtFmax(maxval, x[i]);
+        minval = celtFmin(minval, x[i]);
+    }
+    return celtFmax(maxval, -minval);
+}
+
+/// libopus's transient_analysis (no weak transients): whether the frame holds a transient; sets the tf estimate and
+/// the channel that decided.
+fn transientAnalysis(input: Slice<f32>, len: usize, cc: usize, tfEstimate: borrow mut f32, tfChan: borrow mut usize,
+    tmp: SliceMut<f32>) -> bool {
+    let forwardDecay: f32 = 0.0625;
+    let len2 = len / 2;
+    var maskMetric: i32 = 0;
+    for (c in 0usize..cc) {
+        var mem0: f32 = 0.0;
+        var mem1: f32 = 0.0;
+        for (i in 0usize..len) {
+            let x = input[i + c * len];
+            let y = mem0 + x;
+            let mem00 = mem0;
+            mem0 = mem0 - x + 0.5 * mem1;
+            mem1 = x - mem00;
+            tmp[i] = y;
+        }
+        for (i in 0usize..12) {
+            tmp[i] = 0.0;
+        }
+        var mean: f32 = 0.0;
+        mem0 = 0.0;
+        for (i in 0usize..len2) {
+            let x2 = tmp[2 * i] * tmp[2 * i] + tmp[2 * i + 1] * tmp[2 * i + 1];
+            mean += x2;
+            mem0 = x2 + (1.0 - forwardDecay) * mem0;
+            tmp[i] = forwardDecay * mem0;
+        }
+        mem0 = 0.0;
+        var maxE: f32 = 0.0;
+        var i = len2;
+        while (i > 0) {
+            i -= 1;
+            mem0 = tmp[i] + 0.875 * mem0;
+            tmp[i] = 0.125 * mem0;
+            maxE = celtFmax(maxE, 0.125 * mem0);
+        }
+        let meanD = round<f64>(mean * maxE) * 0.5 * round<f64>(truncate<i32>(len2));
+        let meanF = round<f32>(meanD.sqrt());
+        let norm = round<f32>(truncate<i32>(len2)) / (1e-15 + meanF);
+        var unmask: i32 = 0;
+        var k: usize = 12;
+        while (k + 5 < len2) {
+            let v = (64.0 * norm * (tmp[k] + 1e-15)).floor();
+            let id = truncate<usize>(celtFmax(0.0, celtFmin(127.0, v)));
+            unmask += INV_TABLE[id] as i32;
+            k += 4;
+        }
+        unmask = 64 * unmask * 4 / (6 * (truncate<i32>(len2) - 17));
+        if (unmask > maskMetric) {
+            tfChan = c;
+            maskMetric = unmask;
+        }
+    }
+    let isTransient = maskMetric > 200;
+    let tfMax = celtFmax(0.0, round<f32>(round<f64>(27 * maskMetric).sqrt()) - 42.0);
+    let t = 0.0069f64 * round<f64>(celtFmin(163.0, tfMax)) - 0.139f64;
+    tfEstimate = round<f32>((if (t > 0.0) t else 0.0).sqrt());
+    return isTransient;
+}
+
+/// libopus's patch_transient_decision.
+fn patchTransientDecision(newE: borrow [f32; 42], oldE: borrow [f32; 42], start: usize, end: usize, c: usize) -> bool {
+    var spreadOld = [0.0f32; 26];
+    if (c == 1) {
+        spreadOld[start] = oldE[start];
+        for (i in start + 1..end) {
+            spreadOld[i] = celtFmax(spreadOld[i - 1] - 1.0, oldE[i]);
+        }
+    } else {
+        spreadOld[start] = celtFmax(oldE[start], oldE[start + NB_EBANDS]);
+        for (i in start + 1..end) {
+            spreadOld[i] = celtFmax(spreadOld[i - 1] - 1.0, celtFmax(oldE[i], oldE[i + NB_EBANDS]));
+        }
+    }
+    var i = end - 1;
+    while (i > start) {
+        i -= 1;
+        spreadOld[i] = celtFmax(spreadOld[i], spreadOld[i + 1] - 1.0);
+    }
+    var meanDiff: f32 = 0.0;
+    let first = if (start > 2) start else 2;
+    for (ch in 0usize..c) {
+        for (k in first..end - 1) {
+            let x1 = celtFmax(0.0, newE[k + ch * NB_EBANDS]);
+            let x2 = celtFmax(0.0, spreadOld[k]);
+            meanDiff = meanDiff + celtFmax(0.0, x1 - x2);
+        }
+    }
+    meanDiff = meanDiff / round<f32>(truncate<i32>(c * (end - 1 - first)));
+    return meanDiff > 1.0;
+}
+
+/// libopus's compute_mdcts: the frame's MDCTs (one long, or `shortBlocks` short ones interleaved) into `freq`.
+fn computeMdcts(input: Slice<f32>, freq: SliceMut<f32>, shortBlocks: usize, c: usize, cc: usize, lm: usize) {
+    let overlap = OVERLAP;
+    var b: usize = 1;
+    var n: usize = 120 << lm;
+    var shift: usize = 3 - lm;
+    if (shortBlocks != 0) {
+        b = shortBlocks;
+        n = 120;
+        shift = 3;
+    }
+    for (ch in 0usize..cc) {
+        for (k in 0usize..b) {
+            mdctForward(input, ch * (b * n + overlap) + k * n, mut freq[..], k + ch * n * b, shift, b);
+        }
+    }
+    if (cc == 2 && c == 1) {
+        for (i in 0usize..b * n) {
+            freq[i] = 0.5 * freq[i] + 0.5 * freq[b * n + i];
+        }
+    }
+}
+
+fn median5(x: Slice<f32>, at: usize) -> f32 {
+    var t0: f32 = 0.0;
+    var t1: f32 = 0.0;
+    var t3: f32 = 0.0;
+    var t4: f32 = 0.0;
+    let t2 = x[at + 2];
+    if (x[at] > x[at + 1]) {
+        t0 = x[at + 1];
+        t1 = x[at];
+    } else {
+        t0 = x[at];
+        t1 = x[at + 1];
+    }
+    if (x[at + 3] > x[at + 4]) {
+        t3 = x[at + 4];
+        t4 = x[at + 3];
+    } else {
+        t3 = x[at + 3];
+        t4 = x[at + 4];
+    }
+    if (t0 > t3) {
+        let a = t0;
+        t0 = t3;
+        t3 = a;
+        let b = t1;
+        t1 = t4;
+        t4 = b;
+    }
+    if (t2 > t1) {
+        if (t1 < t3) {
+            return celtFmin(t2, t3);
+        }
+        return celtFmin(t4, t1);
+    }
+    if (t2 < t3) {
+        return celtFmin(t1, t3);
+    }
+    return celtFmin(t2, t4);
+}
+
+fn median3(x: Slice<f32>, at: usize) -> f32 {
+    var t0: f32 = 0.0;
+    var t1: f32 = 0.0;
+    if (x[at] > x[at + 1]) {
+        t0 = x[at + 1];
+        t1 = x[at];
+    } else {
+        t0 = x[at];
+        t1 = x[at + 1];
+    }
+    let t2 = x[at + 2];
+    if (t1 < t2) {
+        return t1;
+    } else if (t0 < t2) {
+        return t2;
+    }
+    return t0;
+}
+
+/// libopus's dynalloc_analysis (no surround, no LFE, no tonality analysis): the bands' boosts, importance and spreading
+/// weights; gives the deepest band below the noise floor.
+fn dynallocAnalysis(bandLogE: borrow [f32; 42], bandLogE2: borrow [f32; 42], oldBandE: borrow [f32; 42], start: usize,
+    end: usize, c: usize, offsets: borrow mut [i32; 21], lsbDepth: i32, isTransient: bool, vbr: bool, constrainedVbr: bool,
+    lm: i32, effectiveBytes: i32, totBoostOut: borrow mut i32, importance: borrow mut [i32; 21],
+    spreadWeight: borrow mut [i32; 21]) -> f32 {
+    var totBoost: i32 = 0;
+    var follower = [0.0f32; 42];
+    var noiseFloor = [0.0f32; 21];
+    var bandLogE3 = [0.0f32; 21];
+    for (i in 0usize..21) {
+        offsets[i] = 0;
+    }
+    var maxDepth: f32 = -31.9;
+    let k0062 = round<f32>(0.0062f64);
+    for (i in 0usize..end) {
+        let ii = truncate<i32>(i);
+        noiseFloor[i] = 0.0625 * round<f32>(LOGN400[i] as i32) + 0.5 + round<f32>(9 - lsbDepth) - E_MEANS[i]
+            + k0062 * round<f32>((ii + 5) * (ii + 5));
+    }
+    for (ch in 0usize..c) {
+        for (i in 0usize..end) {
+            maxDepth = celtFmax(maxDepth, bandLogE[ch * NB_EBANDS + i] - noiseFloor[i]);
+        }
+    }
+    var mask = [0.0f32; 21];
+    var sig = [0.0f32; 21];
+    for (i in 0usize..end) {
+        mask[i] = bandLogE[i] - noiseFloor[i];
+    }
+    if (c == 2) {
+        for (i in 0usize..end) {
+            mask[i] = celtFmax(mask[i], bandLogE[NB_EBANDS + i] - noiseFloor[i]);
+        }
+    }
+    for (i in 0usize..end) {
+        sig[i] = mask[i];
+    }
+    for (i in 1usize..end) {
+        mask[i] = celtFmax(mask[i], mask[i - 1] - 2.0);
+    }
+    var k = end - 1;
+    while (k > 0) {
+        k -= 1;
+        mask[k] = celtFmax(mask[k], mask[k + 1] - 3.0);
+    }
+    for (i in 0usize..end) {
+        let smr = sig[i] - celtFmax(celtFmax(0.0, maxDepth - 12.0), mask[i]);
+        let shift = celtImin(5, celtImax(0, -truncate<i32>((0.5 + smr).floor())));
+        spreadWeight[i] = celtShr(32, shift);
+    }
+    if (effectiveBytes >= 30 + 5 * lm) {
+        var last: usize = 0;
+        for (ch in 0usize..c) {
+            for (i in 0usize..end) {
+                bandLogE3[i] = bandLogE2[ch * NB_EBANDS + i];
+            }
+            if (lm == 0) {
+                for (i in 0usize..(if (end < 8) end else 8)) {
+                    bandLogE3[i] = celtFmax(bandLogE2[ch * NB_EBANDS + i], oldBandE[ch * NB_EBANDS + i]);
+                }
+            }
+            let f = ch * NB_EBANDS;
+            follower[f] = bandLogE3[0];
+            for (i in 1usize..end) {
+                if (bandLogE3[i] > bandLogE3[i - 1] + 0.5) {
+                    last = i;
+                }
+                follower[f + i] = celtFmin(follower[f + i - 1] + 1.5, bandLogE3[i]);
+            }
+            var j = last;
+            while (j > 0) {
+                j -= 1;
+                follower[f + j] = celtFmin(follower[f + j], celtFmin(follower[f + j + 1] + 2.0, bandLogE3[j]));
+            }
+            let offset: f32 = 1.0;
+            for (i in 2usize..end - 2) {
+                follower[f + i] = celtFmax(follower[f + i], median5(bandLogE3[..], i - 2) - offset);
+            }
+            var tmp = median3(bandLogE3[..], 0) - offset;
+            follower[f] = celtFmax(follower[f], tmp);
+            follower[f + 1] = celtFmax(follower[f + 1], tmp);
+            tmp = median3(bandLogE3[..], end - 3) - offset;
+            follower[f + end - 2] = celtFmax(follower[f + end - 2], tmp);
+            follower[f + end - 1] = celtFmax(follower[f + end - 1], tmp);
+            for (i in 0usize..end) {
+                follower[f + i] = celtFmax(follower[f + i], noiseFloor[i]);
+            }
+        }
+        if (c == 2) {
+            for (i in start..end) {
+                follower[NB_EBANDS + i] = celtFmax(follower[NB_EBANDS + i], follower[i] - 4.0);
+                follower[i] = celtFmax(follower[i], follower[NB_EBANDS + i] - 4.0);
+                follower[i] = 0.5 * (celtFmax(0.0, bandLogE[i] - follower[i])
+                    + celtFmax(0.0, bandLogE[NB_EBANDS + i] - follower[NB_EBANDS + i]));
+            }
+        } else {
+            for (i in start..end) {
+                follower[i] = celtFmax(0.0, bandLogE[i] - follower[i]);
+            }
+        }
+        for (i in start..end) {
+            follower[i] = celtFmax(follower[i], 0.0);
+        }
+        for (i in start..end) {
+            importance[i] = truncate<i32>((0.5 + 13.0 * celtExp2(celtFmin(follower[i], 4.0))).floor());
+        }
+        if ((!vbr || constrainedVbr) && !isTransient) {
+            for (i in start..end) {
+                follower[i] = 0.5 * follower[i];
+            }
+        }
+        for (i in start..end) {
+            if (i < 8) {
+                follower[i] *= 2.0;
+            }
+            if (i >= 12) {
+                follower[i] = 0.5 * follower[i];
+            }
+        }
+        let ci = truncate<i32>(c);
+        for (i in start..end) {
+            follower[i] = celtFmin(follower[i], 4.0);
+            let width = celtShl(ci * (EBAND5MS[i + 1] as i32 - EBAND5MS[i] as i32), lm);
+            var boost: i32 = 0;
+            var boostBits: i32 = 0;
+            if (width < 6) {
+                boost = truncate<i32>(follower[i]);
+                boostBits = celtShl(boost * width, 3);
+            } else if (width > 48) {
+                boost = truncate<i32>(follower[i] * 8.0);
+                boostBits = celtShl(boost * width, 3) / 8;
+            } else {
+                boost = truncate<i32>(follower[i] * round<f32>(width) / 6.0);
+                boostBits = celtShl(boost * 6, 3);
+            }
+            if ((!vbr || (constrainedVbr && !isTransient)) && celtShr(celtShr(totBoost + boostBits, 3), 3) > 2 * effectiveBytes / 3) {
+                let cap = celtShl(celtShl(2 * effectiveBytes / 3, 3), 3);
+                offsets[i] = cap - totBoost;
+                totBoost = cap;
+                break;
+            }
+            offsets[i] = boost;
+            totBoost += boostBits;
+        }
+    } else {
+        for (i in start..end) {
+            importance[i] = 13;
+        }
+    }
+    totBoostOut = totBoost;
+    return maxDepth;
+}
+
+fn l1Metric(tmp: Slice<f32>, n: usize, lm: i32, bias: f32) -> f32 {
+    var l1: f32 = 0.0;
+    for (i in 0usize..n) {
+        l1 += tmp[i].abs();
+    }
+    return l1 + (round<f32>(lm) * bias) * l1;
+}
+
+fn tfSelectAt(lm: usize, isTransient: bool, sel: i32, k: i32) -> i32 =>
+    TF_SELECT_TABLE[lm * 8 + (if (isTransient) 4usize else 0) + truncate<usize>(2 * sel + k)] as i32;
+
+/// libopus's tf_analysis: each band's time-frequency resolution change; gives tf_select.
+fn tfAnalysis(len: usize, isTransient: bool, tfRes: borrow mut [i32; 21], lambda: i32, x: Slice<f32>, n0: usize, lm: usize,
+    tfEstimate: f32, tfChan: usize, importance: borrow [i32; 21]) -> i32 {
+    let lmi = truncate<i32>(lm);
+    let bias = 0.04 * celtFmax(-0.25, 0.5 - tfEstimate);
+    var metric = [0i32; 21];
+    var tmp = [0.0f32; 176];
+    var tmp1 = [0.0f32; 176];
+    var path0 = [0i32; 21];
+    var path1 = [0i32; 21];
+    for (i in 0usize..len) {
+        let width = ebu(i + 1) - ebu(i);
+        let n = width << lm;
+        let narrow = width == 1;
+        for (j in 0usize..n) {
+            tmp[j] = x[tfChan * n0 + (ebu(i) << lm) + j];
+        }
+        var l1 = l1Metric(tmp[..], n, if (isTransient) lmi else 0, bias);
+        var bestL1 = l1;
+        var bestLevel: i32 = 0;
+        if (isTransient && !narrow) {
+            for (j in 0usize..n) {
+                tmp1[j] = tmp[j];
+            }
+            haar1(mut tmp1[..], 0, n >> lm, 1usize << lm);
+            l1 = l1Metric(tmp1[..], n, lmi + 1, bias);
+            if (l1 < bestL1) {
+                bestL1 = l1;
+                bestLevel = -1;
+            }
+        }
+        let levels = lmi + (if (isTransient || narrow) 0 else 1);
+        for (k in 0..levels) {
+            let b = if (isTransient) lmi - k - 1 else k + 1;
+            haar1(mut tmp[..], 0, n >> truncate<usize>(k), 1usize << truncate<usize>(k));
+            l1 = l1Metric(tmp[..], n, b, bias);
+            if (l1 < bestL1) {
+                bestL1 = l1;
+                bestLevel = k + 1;
+            }
+        }
+        metric[i] = if (isTransient) 2 * bestLevel else -2 * bestLevel;
+        if (narrow && (metric[i] == 0 || metric[i] == -2 * lmi)) {
+            metric[i] -= 1;
+        }
+    }
+    var selcost = [0i32; 2];
+    for (sel in 0..2) {
+        var cost0 = importance[0] * celtAbsI(metric[0] - 2 * tfSelectAt(lm, isTransient, sel, 0));
+        var cost1 = importance[0] * celtAbsI(metric[0] - 2 * tfSelectAt(lm, isTransient, sel, 1))
+            + (if (isTransient) 0 else lambda);
+        for (i in 1usize..len) {
+            let curr0 = celtImin(cost0, cost1 + lambda);
+            let curr1 = celtImin(cost0 + lambda, cost1);
+            cost0 = curr0 + importance[i] * celtAbsI(metric[i] - 2 * tfSelectAt(lm, isTransient, sel, 0));
+            cost1 = curr1 + importance[i] * celtAbsI(metric[i] - 2 * tfSelectAt(lm, isTransient, sel, 1));
+        }
+        selcost[truncate<usize>(sel)] = celtImin(cost0, cost1);
+    }
+    var tfSelect: i32 = 0;
+    if (selcost[1] < selcost[0] && isTransient) {
+        tfSelect = 1;
+    }
+    var cost0 = importance[0] * celtAbsI(metric[0] - 2 * tfSelectAt(lm, isTransient, tfSelect, 0));
+    var cost1 = importance[0] * celtAbsI(metric[0] - 2 * tfSelectAt(lm, isTransient, tfSelect, 1))
+        + (if (isTransient) 0 else lambda);
+    for (i in 1usize..len) {
+        var from0 = cost0;
+        var from1 = cost1 + lambda;
+        var curr0: i32 = 0;
+        var curr1: i32 = 0;
+        if (from0 < from1) {
+            curr0 = from0;
+            path0[i] = 0;
+        } else {
+            curr0 = from1;
+            path0[i] = 1;
+        }
+        from0 = cost0 + lambda;
+        from1 = cost1;
+        if (from0 < from1) {
+            curr1 = from0;
+            path1[i] = 0;
+        } else {
+            curr1 = from1;
+            path1[i] = 1;
+        }
+        cost0 = curr0 + importance[i] * celtAbsI(metric[i] - 2 * tfSelectAt(lm, isTransient, tfSelect, 0));
+        cost1 = curr1 + importance[i] * celtAbsI(metric[i] - 2 * tfSelectAt(lm, isTransient, tfSelect, 1));
+    }
+    tfRes[len - 1] = if (cost0 < cost1) 0 else 1;
+    var i = len - 1;
+    while (i > 0) {
+        i -= 1;
+        tfRes[i] = if (tfRes[i + 1] == 1) path1[i + 1] else path0[i + 1];
+    }
+    return tfSelect;
+}
+
+/// libopus's tf_encode: tf_res coded, then made the resolution changes themselves.
+fn tfEncode<region r>(start: usize, end: usize, isTransient: bool, tfRes: borrow mut [i32; 21], lm: usize, tfSelect0: i32,
+    enc: borrow mut RangeDecoder<r>) {
+    var tfSelect = tfSelect0;
+    var budget = truncate<i32>(enc.storageBytes() * 8);
+    var tell = enc.tell();
+    var logp: i32 = if (isTransient) 2 else 4;
+    let rsv = lm > 0 && tell + logp + 1 <= budget;
+    if (rsv) {
+        budget -= 1;
+    }
+    var curr: i32 = 0;
+    var changed: i32 = 0;
+    for (i in start..end) {
+        if (tell + logp <= budget) {
+            enc.encBitLogp(tfRes[i] != curr, truncate<u32>(logp));
+            tell = enc.tell();
+            curr = tfRes[i];
+            if (curr != 0) {
+                changed = 1;
+            }
+        } else {
+            tfRes[i] = curr;
+        }
+        logp = if (isTransient) 4 else 5;
+    }
+    if (rsv && tfSelectAt(lm, isTransient, 0, changed) != tfSelectAt(lm, isTransient, 1, changed)) {
+        enc.encBitLogp(tfSelect != 0, 1);
+    } else {
+        tfSelect = 0;
+    }
+    for (i in start..end) {
+        tfRes[i] = tfSelectAt(lm, isTransient, tfSelect, tfRes[i]);
+    }
+}
+
+/// libopus's alloc_trim_analysis (no tonality analysis, no surround).
+fn allocTrimAnalysis(x: Slice<f32>, bandLogE: borrow [f32; 42], end: usize, lm: usize, c: usize, n0: usize,
+    stereoSaving: borrow mut f32, tfEstimate: f32, intensity: i32, equivRate: i32) -> i32 {
+    var diff: f32 = 0.0;
+    var trim: f32 = 5.0;
+    if (equivRate < 64000) {
+        trim = 4.0;
+    } else if (equivRate < 80000) {
+        let frac = celtShr(equivRate - 64000, 10);
+        trim = 4.0 + (1.0 / 16.0) * round<f32>(frac);
+    }
+    if (c == 2) {
+        var sum: f32 = 0.0;
+        for (i in 0usize..8) {
+            let from = ebu(i) << lm;
+            let len = (ebu(i + 1) - ebu(i)) << lm;
+            var partial: f32 = 0.0;
+            for (j in 0usize..len) {
+                partial = partial + x[from + j] * x[n0 + from + j];
+            }
+            sum = sum + partial;
+        }
+        sum = (1.0 / 8.0) * sum;
+        sum = celtFmin(1.0, sum.abs());
+        var minXC = sum;
+        var i: usize = 8;
+        while (truncate<i32>(i) < intensity) {
+            let from = ebu(i) << lm;
+            let len = (ebu(i + 1) - ebu(i)) << lm;
+            var partial: f32 = 0.0;
+            for (j in 0usize..len) {
+                partial = partial + x[from + j] * x[n0 + from + j];
+            }
+            minXC = celtFmin(minXC, partial.abs());
+            i += 1;
+        }
+        minXC = celtFmin(1.0, minXC.abs());
+        let logXC = celtLog2(1.001 - sum * sum);
+        let logXC2 = celtFmax(0.5 * logXC, celtLog2(1.001 - minXC * minXC));
+        trim += celtFmax(-4.0, 0.75 * logXC);
+        stereoSaving = celtFmin(stereoSaving + 0.25, -(0.5 * logXC2));
+    }
+    for (ch in 0usize..c) {
+        for (i in 0usize..end - 1) {
+            diff += bandLogE[i + ch * NB_EBANDS] * round<f32>(2 + 2 * truncate<i32>(i) - truncate<i32>(end));
+        }
+    }
+    diff /= round<f32>(truncate<i32>(c * (end - 1)));
+    trim -= celtFmax(-2.0, celtFmin(2.0, (diff + 1.0) / 6.0));
+    trim -= 0.0;
+    trim -= 2.0 * tfEstimate;
+    let index = truncate<i32>((0.5 + trim).floor());
+    return celtImax(0, celtImin(10, index));
+}
+
+/// libopus's stereo_analysis: whether to code the stereo as L/R (dual stereo) rather than M/S.
+fn stereoAnalysis(x: Slice<f32>, lm: usize, n0: usize) -> bool {
+    var sumLR: f32 = 1e-15;
+    var sumMS: f32 = 1e-15;
+    for (i in 0usize..13) {
+        for (j in (ebu(i) << lm)..(ebu(i + 1) << lm)) {
+            let l = x[j];
+            let r = x[n0 + j];
+            let mm = l + r;
+            let s = l - r;
+            sumLR = sumLR + (l.abs() + r.abs());
+            sumMS = sumMS + (mm.abs() + s.abs());
+        }
+    }
+    sumMS = 0.707107 * sumMS;
+    var thetas: i32 = 13;
+    if (lm <= 1) {
+        thetas -= 8;
+    }
+    let e13 = truncate<i32>(ebu(13));
+    let wide = celtShl(e13, truncate<i32>(lm) + 1);
+    return round<f32>(wide + thetas) * sumMS > round<f32>(wide) * sumLR;
+}
+
+/// libopus's compute_vbr (no tonality analysis, no surround, no LFE): the frame's target in eighth bits.
+fn computeVbr(baseTarget: i32, lm: i32, bitrate: i32, lastCodedBands: i32, c: i32, intensity: i32, constrainedVbr: bool,
+    stereoSaving0: f32, totBoost: i32, tfEstimate: f32, maxDepth: f32, temporalVbr: f32) -> i32 {
+    let codedBands = if (lastCodedBands != 0) lastCodedBands else 21;
+    var codedBins = celtShl(EBAND5MS[truncate<usize>(codedBands)] as i32, lm);
+    if (c == 2) {
+        codedBins += celtShl(EBAND5MS[truncate<usize>(celtImin(intensity, codedBands))] as i32, lm);
+    }
+    var target = baseTarget;
+    if (c == 2) {
+        let codedStereoBands = celtImin(intensity, codedBands);
+        let dof = celtShl(EBAND5MS[truncate<usize>(codedStereoBands)] as i32, lm) - codedStereoBands;
+        let maxFrac = (0.8 * round<f32>(dof)) / round<f32>(codedBins);
+        let stereoSaving = celtFmin(stereoSaving0, 1.0);
+        target -= truncate<i32>(celtFmin(maxFrac * round<f32>(target), (stereoSaving - 0.1) * round<f32>(celtShl(dof, 3))));
+    }
+    target += totBoost - celtShl(19, lm);
+    target += truncate<i32>((tfEstimate - 0.044) * round<f32>(target));
+    let bins = celtShl(EBAND5MS[19] as i32, lm);
+    var floorDepth = truncate<i32>(round<f32>(celtShl(c * bins, 3)) * maxDepth);
+    floorDepth = celtImax(floorDepth, celtShr(target, 2));
+    target = celtImin(target, floorDepth);
+    if (constrainedVbr) {
+        target = baseTarget + truncate<i32>(0.67 * round<f32>(target - baseTarget));
+    }
+    if (tfEstimate < 0.2) {
+        let amount = 0.0000031 * round<f32>(celtImax(0, celtImin(32000, 96000 - bitrate)));
+        let factor = temporalVbr * amount;
+        target += truncate<i32>(factor * round<f32>(target));
+    }
+    return celtImin(2 * baseTarget, target);
+}

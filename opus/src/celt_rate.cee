@@ -55,8 +55,20 @@ struct Allocation {
     balance: i32;
 }
 
+/// What an encoder brings to the allocation (libopus's encode, prev, signalBandwidth and the intensity and dual stereo it
+/// asks for); a decoder passes `ALLOC_DECODE`.
+struct AllocEncode {
+    encode: bool;
+    prev: i32;
+    signalBandwidth: i32;
+    intensity: i32;
+    dualStereo: i32;
+}
+
+const ALLOC_DECODE: AllocEncode = AllocEncode { encode: false, prev: 0, signalBandwidth: 0, intensity: 0, dualStereo: 0 };
+
 fn computeAllocation<region r>(start: i32, end: i32, offsets: borrow [i32; 21], cap: borrow [i32; 21], allocTrim: i32,
-    total0: i32, c: i32, lm: i32, ec: borrow mut RangeDecoder<r>) -> Allocation {
+    total0: i32, c: i32, lm: i32, ec: borrow mut RangeDecoder<r>, enc: AllocEncode) -> Allocation {
     var total = celtImax(total0, 0);
     let len = NB_EBANDS;
     var skipStart = start;
@@ -143,12 +155,12 @@ fn computeAllocation<region r>(start: i32, end: i32, offsets: borrow [i32; 21], 
         bits2[j] = bits2j;
     }
     return interpBits2pulses(start, end, skipStart, borrow bits1, borrow bits2, borrow thresh, cap, total, skipRsv,
-        intensityRsv, dualStereoRsv, c, lm, ec);
+        intensityRsv, dualStereoRsv, c, lm, ec, enc);
 }
 
 fn interpBits2pulses<region r>(start: i32, end: i32, skipStart: i32, bits1: borrow [i32; 21], bits2: borrow [i32; 21],
     thresh: borrow [i32; 21], cap: borrow [i32; 21], total0: i32, skipRsv: i32, intensityRsv0: i32,
-    dualStereoRsv0: i32, c: i32, lm: i32, ec: borrow mut RangeDecoder<r>) -> Allocation {
+    dualStereoRsv0: i32, c: i32, lm: i32, ec: borrow mut RangeDecoder<r>, enc: AllocEncode) -> Allocation {
     var a = Allocation {
         pulses: [0i32; 21],
         ebits: [0i32; 21],
@@ -221,7 +233,15 @@ fn interpBits2pulses<region r>(start: i32, end: i32, skipStart: i32, bits1: borr
         let bandWidth = eband(cb) - eband(ju);
         var bandBits = a.pulses[ju] + percoeff * bandWidth + rem;
         if (bandBits >= celtImax(thresh[ju], allocFloor + 8)) {
-            if (ec.bitLogp(1)) {
+            if (enc.encode) {
+                let depth: i32 = if (codedBands > 17) (if (jj < enc.prev) 7 else 9) else 0;
+                if (codedBands <= start + 2
+                    || (bandBits > celtShr(celtShl(celtShl(depth * bandWidth, lm), 3), 4) && jj <= enc.signalBandwidth)) {
+                    ec.encBitLogp(true, 1);
+                    break;
+                }
+                ec.encBitLogp(false, 1);
+            } else if (ec.bitLogp(1)) {
                 break;
             }
             psum += 8;
@@ -241,7 +261,12 @@ fn interpBits2pulses<region r>(start: i32, end: i32, skipStart: i32, bits1: borr
         codedBands -= 1;
     }
     if (intensityRsv > 0) {
-        a.intensity = start + truncate<i32>(ec.uint(truncate<u32>(codedBands + 1 - start)));
+        if (enc.encode) {
+            a.intensity = celtImin(enc.intensity, codedBands);
+            ec.encUint(truncate<u32>(a.intensity - start), truncate<u32>(codedBands + 1 - start));
+        } else {
+            a.intensity = start + truncate<i32>(ec.uint(truncate<u32>(codedBands + 1 - start)));
+        }
     } else {
         a.intensity = 0;
     }
@@ -250,7 +275,12 @@ fn interpBits2pulses<region r>(start: i32, end: i32, skipStart: i32, bits1: borr
         dualStereoRsv = 0;
     }
     if (dualStereoRsv > 0) {
-        a.dualStereo = if (ec.bitLogp(1)) 1 else 0;
+        if (enc.encode) {
+            a.dualStereo = enc.dualStereo;
+            ec.encBitLogp(enc.dualStereo != 0, 1);
+        } else {
+            a.dualStereo = if (ec.bitLogp(1)) 1 else 0;
+        }
     } else {
         a.dualStereo = 0;
     }

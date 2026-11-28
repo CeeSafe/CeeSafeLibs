@@ -1,7 +1,7 @@
 # opus
 
 Opus (RFC 6716, with RFC 8251's updates) in CeeSafe, ported from libopus 1.5.2 (BSD; its notice is COPYING.libopus
-below): the decoder now, the encoder next. No C.
+below): the whole decoder, and a CELT-only encoder. No C.
 
 - `OpusDecoder.create(channels)` at 48 kHz, mono or stereo; `decode(packet, mut pcm, frameSize, fec)` into 16-bit
   samples (soft-clipped, as `opus_decode`), `decodeFloat` into floats; a null packet is concealed; `fec` decodes the
@@ -15,7 +15,13 @@ below): the decoder now, the encoder next. No C.
 in mono. SILK alone (`tools/silkcheck`) is byte-identical to libopus on vectors 02 to 04, lost packets included; CELT
 alone (`tools/celtcheck`) is sample-identical to libopus's plain C build on 01, 07 and 11, concealment included.
 
-Not yet: an output rate below 48 kHz; speed (about 20 times real time on an M-series Mac, unoptimised).
+- `OpusEncoder.create(channels)`: CELT-only packets as libopus makes them in `RESTRICTED_LOWDELAY` mode, frames of 2.5
+  to 20 ms; `setBitrate`, `setVbr`, `setComplexity`; `encode` (16-bit) and `encodeFloat`. From complexity 0 to 6 its
+  packets are byte-identical to libopus's (tools/encodecheck against a plain-C libopus, speech and music, mono and
+  stereo, 16 to 64 kbps, VBR and CBR); from 7 to 10 they equal libopus's with its tonality analysis off (`analysis.c`
+  is not ported).
+
+Not yet: SILK and hybrid encoding, the tonality analysis, an output rate below 48 kHz; speed (about 20 times real time on an M-series Mac, unoptimised).
 
 ## libopus's notice
 

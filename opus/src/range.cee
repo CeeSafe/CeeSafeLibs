@@ -1,5 +1,6 @@
-// Opus's range decoder (RFC 6716 §4.1; libopus celt/entdec.c, entcode.c), and the Laplace decoder CELT's energies use
-// (celt/laplace.c). Ported from libopus 1.5.2 (BSD); every value is as libopus computes it, so a packet's final range
+// Opus's range coder (RFC 6716 §4.1; libopus celt/entdec.c, entenc.c, entcode.c), and the Laplace coder CELT's energies
+// use (celt/laplace.c). One type both ways, as libopus's ec_ctx is: `RangeDecoder.create` reads a frame, and
+// `RangeDecoder.encoder` writes one, so the code CELT shares between its encoder and decoder takes either. Ported from libopus 1.5.2 (BSD); every value is as libopus computes it, so a packet's final range
 // matches libopus's.
 
 const SYM_BITS: u32 = 8;
@@ -24,7 +25,7 @@ public fn ilog(v: u32) -> u32 {
     return n;
 }
 
-/// A range decoder over one frame's bytes.
+/// A range decoder over one frame's bytes, or (made by `encoder`) a range encoder writing one.
 public struct RangeDecoder<region r> {
     buffer: Slice<r, u8>;
     storage: u32;
@@ -37,8 +38,12 @@ public struct RangeDecoder<region r> {
     value: u32;
     ext: u32;
     rem: u32;
-    /// A symbol out of range was read (the packet is corrupt).
+    /// A symbol out of range was read (the packet is corrupt), or, encoding, the bytes ran out.
     public error: bool;
+    /// Encoding: the frame being written (its first `storage` bytes), and the byte held back for a carry (-1: none).
+    out: Vector<u8>;
+    encRem: i32;
+    public encoding: bool;
 
     public fn create(buffer: Slice<r, u8>) -> RangeDecoder<r> {
         var d = RangeDecoder {
@@ -54,6 +59,9 @@ public struct RangeDecoder<region r> {
             ext: 0,
             rem: 0,
             error: false,
+            out: Vector<u8>.create(),
+            encRem: -1,
+            encoding: false,
         };
         d.rem = d.readByte();
         d.value = d.range - 1 - (d.rem >> (SYM_BITS - CODE_EXTRA));

@@ -195,3 +195,195 @@ fn plcPitchSearch(mem: Slice<f32>, stride: usize, c: usize, lp: SliceMut<f32>, s
     let pitch = truncate<i32>(2 * best[0]) - offset;
     return truncate<usize>(truncate<i32>(maxLag) - pitch);
 }
+
+// ---- The encoder's pitch analysis, for its prefilter (libopus's pitch_downsample, pitch_search, remove_doubling) ----
+
+/// `x` (CC channels, each `stride` apart, `len` samples) low-passed and halved into `lp`, then whitened (pitch_downsample).
+fn celtPitchDownsample(x: Slice<f32>, stride: usize, cc: usize, lp: SliceMut<f32>, len: usize, scratch: SliceMut<f32>) {
+    let half = len >> 1;
+    for (i in 1usize..half) {
+        lp[i] = 0.25 * x[2 * i - 1] + 0.25 * x[2 * i + 1] + 0.5 * x[2 * i];
+    }
+    lp[0] = 0.25 * x[1] + 0.5 * x[0];
+    if (cc == 2) {
+        for (i in 1usize..half) {
+            lp[i] += 0.25 * x[stride + 2 * i - 1] + 0.25 * x[stride + 2 * i + 1] + 0.5 * x[stride + 2 * i];
+        }
+        lp[0] += 0.25 * x[stride + 1] + 0.5 * x[stride];
+    }
+    var ac = [0.0f32; 5];
+    celtAutocorr(lp[..], 0, mut ac[..], 0, 4, half, mut scratch[..]);
+    ac[0] *= 1.0001;
+    for (i in 1usize..5) {
+        let f = 0.008 * round<f32>(truncate<i32>(i));
+        ac[i] -= ac[i] * f * f;
+    }
+    var lpc = [0.0f32; 4];
+    celtLpc(mut lpc[..], 0, ac[..], 4);
+    var tmp: f32 = 1.0;
+    for (i in 0usize..4) {
+        tmp = 0.9 * tmp;
+        lpc[i] = lpc[i] * tmp;
+    }
+    let c1: f32 = 0.8;
+    let lpc2: [f32; 5] = [lpc[0] + 0.8, lpc[1] + c1 * lpc[0], lpc[2] + c1 * lpc[1], lpc[3] + c1 * lpc[2], c1 * lpc[3]];
+    celtFir5(mut lp[..], borrow lpc2, half);
+}
+
+/// The pitch of `buf[xAt..]` against the history `buf[yAt..]` (pitch_search): a lag below `maxPitch`, in samples.
+fn celtPitchSearch(buf: Slice<f32>, xAt: usize, yAt: usize, len: usize, maxPitch: usize, scratch: SliceMut<f32>) -> i32 {
+    let lag = len + maxPitch;
+    let x4 = 0usize;
+    let y4 = len >> 2;
+    let xc = y4 + (lag >> 2);
+    for (j in 0usize..len >> 2) {
+        scratch[x4 + j] = buf[xAt + 2 * j];
+    }
+    for (j in 0usize..lag >> 2) {
+        scratch[y4 + j] = buf[yAt + 2 * j];
+    }
+    for (i in 0usize..maxPitch >> 2) {
+        var sum: f32 = 0.0;
+        for (j in 0usize..len >> 2) {
+            sum += scratch[x4 + j] * scratch[y4 + i + j];
+        }
+        scratch[xc + i] = sum;
+    }
+    var best = [0usize; 2];
+    findBestPitch(scratch[xc..], scratch[..], y4, len >> 2, maxPitch >> 2, mut best);
+    for (i in 0usize..maxPitch >> 1) {
+        scratch[xc + i] = 0.0;
+        let d0 = if (i > 2 * best[0]) i - 2 * best[0] else 2 * best[0] - i;
+        let d1 = if (i > 2 * best[1]) i - 2 * best[1] else 2 * best[1] - i;
+        if (d0 > 2 && d1 > 2) {
+            continue;
+        }
+        var sum: f32 = 0.0;
+        for (j in 0usize..len >> 1) {
+            sum += buf[xAt + j] * buf[yAt + i + j];
+        }
+        scratch[xc + i] = celtFmax(-1.0, sum);
+    }
+    findBestPitch(scratch[xc..], buf, yAt, len >> 1, maxPitch >> 1, mut best);
+    var offset: i32 = 0;
+    if (best[0] > 0 && best[0] < (maxPitch >> 1) - 1) {
+        let a = scratch[xc + best[0] - 1];
+        let b = scratch[xc + best[0]];
+        let cc = scratch[xc + best[0] + 1];
+        if ((cc - a) > 0.7 * (b - a)) {
+            offset = 1;
+        } else if ((a - cc) > 0.7 * (b - cc)) {
+            offset = -1;
+        }
+    }
+    return truncate<i32>(2 * best[0]) - offset;
+}
+
+fn celtPitchGain(xy: f32, xx: f32, yy: f32) -> f32 => xy / (1.0 + xx * yy).sqrt();
+
+const SECOND_CHECK: [i32; 16] = [0, 0, 3, 2, 3, 2, 5, 2, 3, 2, 3, 2, 5, 2, 3, 2];
+
+/// libopus's remove_doubling over `x` (the halved signal, from index 0 = its maxperiod/2 history): the pitch `t0`
+/// checked against its submultiples; gives the gain and updates `t0`.
+fn celtRemoveDoubling(x: Slice<f32>, maxperiod0: i32, minperiod0: i32, n0: i32, t0: borrow mut i32, prevPeriod0: i32,
+    prevGain: f32, yyLookup: SliceMut<f32>) -> f32 {
+    let maxperiod = maxperiod0 / 2;
+    let minperiod = minperiod0 / 2;
+    t0 = t0 / 2;
+    let prevPeriod = prevPeriod0 / 2;
+    let n = truncate<usize>(n0 / 2);
+    let base = truncate<usize>(maxperiod);
+    if (t0 >= maxperiod) {
+        t0 = maxperiod - 1;
+    }
+    var tt: i32 = t0;
+    let tz: i32 = t0;
+    let tzu = truncate<usize>(tz);
+    var xx: f32 = 0.0;
+    var xy: f32 = 0.0;
+    for (i in 0usize..n) {
+        xx = xx + x[base + i] * x[base + i];
+        xy = xy + x[base + i] * x[base + i - tzu];
+    }
+    yyLookup[0] = xx;
+    var yy = xx;
+    for (i in 1usize..(base + 1)) {
+        yy = yy + x[base - i] * x[base - i] - x[base + n - i] * x[base + n - i];
+        yyLookup[i] = celtFmax(0.0, yy);
+    }
+    yy = yyLookup[tzu];
+    var bestXy = xy;
+    var bestYy = yy;
+    let g0 = celtPitchGain(xy, xx, yy);
+    var g = g0;
+    for (k in 2..16) {
+        let t1 = (2 * tz + k) / (2 * k);
+        if (t1 < minperiod) {
+            break;
+        }
+        var t1b: i32 = 0;
+        if (k == 2) {
+            t1b = if (t1 + tz > maxperiod) tz else tz + t1;
+        } else {
+            t1b = (2 * SECOND_CHECK[truncate<usize>(k)] * tz + k) / (2 * k);
+        }
+        let t1u = truncate<usize>(t1);
+        let t1bu = truncate<usize>(t1b);
+        var a: f32 = 0.0;
+        var b: f32 = 0.0;
+        for (i in 0usize..n) {
+            a = a + x[base + i] * x[base + i - t1u];
+            b = b + x[base + i] * x[base + i - t1bu];
+        }
+        xy = 0.5 * (a + b);
+        yy = 0.5 * (yyLookup[t1u] + yyLookup[t1bu]);
+        let g1 = celtPitchGain(xy, xx, yy);
+        let dist = if (t1 > prevPeriod) t1 - prevPeriod else prevPeriod - t1;
+        var cont: f32 = 0.0;
+        if (dist <= 1) {
+            cont = prevGain;
+        } else if (dist <= 2 && 5 * k * k < tz) {
+            cont = 0.5 * prevGain;
+        }
+        var thresh = celtFmax(0.3, 0.7 * g0 - cont);
+        if (t1 < 3 * minperiod) {
+            thresh = celtFmax(0.4, 0.85 * g0 - cont);
+        } else if (t1 < 2 * minperiod) {
+            thresh = celtFmax(0.5, 0.9 * g0 - cont);
+        }
+        if (g1 > thresh) {
+            bestXy = xy;
+            bestYy = yy;
+            tt = t1;
+            g = g1;
+        }
+    }
+    bestXy = celtFmax(0.0, bestXy);
+    var pg: f32 = 1.0;
+    if (bestYy > bestXy) {
+        pg = bestXy / (bestYy + 1.0);
+    }
+    var xcorr = [0.0f32; 3];
+    for (k in 0usize..3) {
+        let lagK = truncate<usize>(tt + truncate<i32>(k) - 1);
+        var s: f32 = 0.0;
+        for (i in 0usize..n) {
+            s = s + x[base + i] * x[base + i - lagK];
+        }
+        xcorr[k] = s;
+    }
+    var offset: i32 = 0;
+    if ((xcorr[2] - xcorr[0]) > 0.7 * (xcorr[1] - xcorr[0])) {
+        offset = 1;
+    } else if ((xcorr[0] - xcorr[2]) > 0.7 * (xcorr[1] - xcorr[2])) {
+        offset = -1;
+    }
+    if (pg > g) {
+        pg = g;
+    }
+    t0 = 2 * tt + offset;
+    if (t0 < minperiod0) {
+        t0 = minperiod0;
+    }
+    return pg;
+}

@@ -1,0 +1,42 @@
+// The encoder's packets decoded by this package's decoder: every final range the same on both sides, and the tone
+// heard again.
+
+fn roundTrip(channels: usize, vbr: bool, complexity: u32, bitrate: u32) -> Result<void, TestFailure> {
+    var enc = OpusEncoder.create(channels);
+    enc.setBitrate(bitrate);
+    enc.setVbr(vbr);
+    enc.setComplexity(complexity);
+    var dec = OpusDecoder.create(channels);
+    var pcm = [0i16; 1920];
+    var out = [0i16; 1920];
+    var packet = [0u8; 1500];
+    var phase: f64 = 0.0;
+    var energy: f64 = 0.0;
+    for (frame in 0..50) {
+        for (i in 0usize..960) {
+            let v = truncate<i16>(saturatingTruncate<i64>((phase.sin() * 8000.0).roundEven()));
+            phase += 2.0 * 3.141592653589793 * 440.0 / 48000.0;
+            for (c in 0usize..channels) {
+                pcm[i * channels + c] = v;
+            }
+        }
+        let n = enc.encode(pcm[0..960 * channels], 960, mut packet[..])!;
+        let got = dec.decode(Some(packet[0..n]), mut out[0..960 * channels], 960, false)!;
+        Check.equalU64(960, got as u64)?;
+        Check.equalU64(enc.finalRange() as u64, dec.finalRange as u64)?;
+        if (frame >= 10) {
+            for (i in 0usize..960 * channels) {
+                let s = round<f64>(out[i]);
+                energy += s * s;
+            }
+        }
+    }
+    let rms = (energy / round<f64>(40 * 960 * truncate<i32>(channels))).sqrt();
+    return Check.isTrue(rms > 3000.0 && rms < 8000.0, "the tone comes back");
+}
+
+@test
+fn monoVbrRoundTrips() -> Result<void, TestFailure> => roundTrip(1, true, 5, 24000);
+
+@test
+fn stereoCbrRoundTrips() -> Result<void, TestFailure> => roundTrip(2, false, 10, 64000);

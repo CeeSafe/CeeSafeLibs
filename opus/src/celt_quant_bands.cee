@@ -70,3 +70,208 @@ fn unquantEnergyFinalise<region r>(start: usize, end: usize, old: SliceMut<f32>,
         }
     }
 }
+
+// ---- Encoding (libopus's quant_coarse_energy, quant_fine_energy, quant_energy_finalise, amp2Log2) ----
+
+fn lossDistortion(e: Slice<f32>, old: Slice<f32>, start: usize, end: usize, c: usize) -> f32 {
+    var dist: f32 = 0.0;
+    for (ch in 0usize..c) {
+        for (i in start..end) {
+            let d = e[i + ch * NB_EBANDS] - old[i + ch * NB_EBANDS];
+            dist = dist + d * d;
+        }
+    }
+    return if (dist < 200.0) dist else 200.0;
+}
+
+fn quantCoarseEnergyImpl<region r>(start: usize, end: usize, e: Slice<f32>, old: SliceMut<f32>, budget: i32, tell0: i32,
+    model: usize, error: SliceMut<f32>, enc: borrow mut RangeDecoder<r>, c: usize, lm: usize, intra: bool, maxDecay: f32,
+    lfe: bool) -> i32 {
+    var badness: i32 = 0;
+    var prev = [0.0f32; 2];
+    var tell = tell0;
+    if (tell + 3 <= budget) {
+        enc.encBitLogp(intra, 3);
+    }
+    let coef: f32 = if (intra) 0.0 else PRED_COEF[lm];
+    let beta: f32 = if (intra) BETA_INTRA else BETA_COEF[lm];
+    let ci = truncate<i32>(c);
+    for (i in start..end) {
+        for (ch in 0usize..c) {
+            let at = i + ch * NB_EBANDS;
+            let x = e[at];
+            let oldE = celtFmax(-9.0, old[at]);
+            let f = x - coef * oldE - prev[ch];
+            var qi = truncate<i32>((0.5 + f).floor());
+            let decayBound = celtFmax(-28.0, old[at]) - maxDecay;
+            if (qi < 0 && x < decayBound) {
+                qi += truncate<i32>(decayBound - x);
+                if (qi > 0) {
+                    qi = 0;
+                }
+            }
+            let qi0 = qi;
+            tell = enc.tell();
+            let bitsLeft = budget - tell - 3 * ci * truncate<i32>(end - i);
+            if (i != start && bitsLeft < 30) {
+                if (bitsLeft < 24) {
+                    qi = celtImin(1, qi);
+                }
+                if (bitsLeft < 16) {
+                    qi = celtImax(-1, qi);
+                }
+            }
+            if (lfe && i >= 2) {
+                qi = celtImin(qi, 0);
+            }
+            if (budget - tell >= 15) {
+                let pi = 2 * (if (i < 20) i else 20);
+                qi = enc.encLaplace(qi, (E_PROB_MODEL[model + pi] as u32) << 7, (E_PROB_MODEL[model + pi + 1] as u32) << 6);
+            } else if (budget - tell >= 2) {
+                qi = celtImax(-1, celtImin(qi, 1));
+                let symbol: u32 = if (qi < 0) 1 else truncate<u32>(2 * qi);
+                enc.encIcdf(symbol, SMALL_ENERGY_ICDF[..], 2);
+            } else if (budget - tell >= 1) {
+                qi = celtImin(0, qi);
+                enc.encBitLogp(qi != 0, 1);
+            } else {
+                qi = -1;
+            }
+            let q = round<f32>(qi);
+            error[at] = f - q;
+            badness += celtAbsI(qi0 - qi);
+            let tmp = coef * oldE + prev[ch] + q;
+            old[at] = tmp;
+            prev[ch] = prev[ch] + q - beta * q;
+        }
+    }
+    return if (lfe) 0 else badness;
+}
+
+/// Encodes the coarse energies (`e`, log2) against `old`, which becomes what the decoder will have; `error` gets the
+/// residuals. Chooses intra coding when it is cheaper (two passes) or forced.
+fn quantCoarseEnergy<region r>(start: usize, end: usize, effEnd: usize, e: Slice<f32>, old: SliceMut<f32>, budget: u32,
+    error: SliceMut<f32>, enc: borrow mut RangeDecoder<r>, c: usize, lm: usize, nbAvailableBytes: i32, forceIntra: bool,
+    delayedIntra: borrow mut f32, twoPass0: bool, lossRate: i32, lfe: bool) {
+    var twoPass = twoPass0;
+    let ci = truncate<i32>(c);
+    let span = truncate<i32>(end - start);
+    var intra = forceIntra || (!twoPass && delayedIntra > round<f32>(2 * ci * span) && nbAvailableBytes > span * ci);
+    let intraBias = truncate<i32>((round<f32>(budget) * delayedIntra * round<f32>(lossRate)) / round<f32>(ci * 512));
+    let newDistortion = lossDistortion(e, old[..], start, effEnd, c);
+    let tell = enc.tell();
+    if (tell + 3 > truncate<i32>(budget)) {
+        twoPass = false;
+        intra = false;
+    }
+    var maxDecay: f32 = 16.0;
+    if (end - start > 10) {
+        maxDecay = celtFmin(maxDecay, 0.125 * round<f32>(nbAvailableBytes));
+    }
+    if (lfe) {
+        maxDecay = 3.0;
+    }
+    let startState = enc.saveState();
+    var oldIntra = [0.0f32; 42];
+    var errorIntra = [0.0f32; 42];
+    for (k in 0usize..c * NB_EBANDS) {
+        oldIntra[k] = old[k];
+    }
+    var badness1: i32 = 0;
+    let budgetI = truncate<i32>(budget);
+    if (twoPass || intra) {
+        badness1 = quantCoarseEnergyImpl(start, end, e, mut oldIntra[..], budgetI, tell, lm * 84 + 42, mut errorIntra[..], mut enc,
+            c, lm, true, maxDecay, lfe);
+    }
+    if (!intra) {
+        let tellIntra = truncate<i32>(enc.tellFrac());
+        let intraState = enc.saveState();
+        let startBytes = startState.offset;
+        let intraBytes = intraState.offset;
+        var intraBits = [0u8; 1275];
+        enc.saveBytes(startBytes, intraBytes, mut intraBits);
+        enc.restoreState(startState);
+        let badness2 = quantCoarseEnergyImpl(start, end, e, mut old[..], budgetI, tell, lm * 84, mut error[..], mut enc, c, lm,
+            false, maxDecay, lfe);
+        if (twoPass && (badness1 < badness2 || (badness1 == badness2 && truncate<i32>(enc.tellFrac()) + intraBias > tellIntra))) {
+            enc.restoreState(intraState);
+            enc.restoreBytes(startBytes, intraBytes, borrow intraBits);
+            for (k in 0usize..c * NB_EBANDS) {
+                old[k] = oldIntra[k];
+                error[k] = errorIntra[k];
+            }
+            intra = true;
+        }
+    } else {
+        for (k in 0usize..c * NB_EBANDS) {
+            old[k] = oldIntra[k];
+            error[k] = errorIntra[k];
+        }
+    }
+    if (intra) {
+        delayedIntra = newDistortion;
+    } else {
+        delayedIntra = (PRED_COEF[lm] * PRED_COEF[lm]) * delayedIntra + newDistortion;
+    }
+}
+
+fn quantFineEnergy<region r>(start: usize, end: usize, old: SliceMut<f32>, error: SliceMut<f32>, fine: borrow [i32; 21],
+    enc: borrow mut RangeDecoder<r>, c: usize) {
+    for (i in start..end) {
+        if (fine[i] <= 0) {
+            continue;
+        }
+        let frac = celtShl(1, fine[i]);
+        for (ch in 0usize..c) {
+            let at = i + ch * NB_EBANDS;
+            var q2 = truncate<i32>(((error[at] + 0.5) * round<f32>(frac)).floor());
+            if (q2 > frac - 1) {
+                q2 = frac - 1;
+            }
+            if (q2 < 0) {
+                q2 = 0;
+            }
+            enc.encBits(truncate<u32>(q2), truncate<u32>(fine[i]));
+            let offset = (round<f32>(q2) + 0.5) * round<f32>(celtShl(1, 14 - fine[i])) * (1.0 / 16384.0) - 0.5;
+            old[at] += offset;
+            error[at] -= offset;
+        }
+    }
+}
+
+fn quantEnergyFinalise<region r>(start: usize, end: usize, old: SliceMut<f32>, error: SliceMut<f32>, fine: borrow [i32; 21],
+    priority: borrow [i32; 21], bitsLeft0: i32, enc: borrow mut RangeDecoder<r>, c: usize) {
+    var bitsLeft = bitsLeft0;
+    let ci = truncate<i32>(c);
+    for (prio in 0..2) {
+        var i = start;
+        while (i < end && bitsLeft >= ci) {
+            if (fine[i] >= MAX_FINE_BITS || priority[i] != prio) {
+                i += 1;
+                continue;
+            }
+            for (ch in 0usize..c) {
+                let at = i + ch * NB_EBANDS;
+                let q2: u32 = if (error[at] < 0.0) 0 else 1;
+                enc.encBits(q2, 1);
+                let offset = (round<f32>(q2) - 0.5) * round<f32>(celtShl(1, 14 - fine[i] - 1)) * (1.0 / 16384.0);
+                old[at] += offset;
+                error[at] -= offset;
+                bitsLeft -= 1;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Band energies to log2, less the means (libopus's amp2Log2).
+fn amp2Log2(effEnd: usize, end: usize, bandE: borrow [f32; 42], logE: SliceMut<f32>, c: usize) {
+    for (ch in 0usize..c) {
+        for (i in 0usize..effEnd) {
+            logE[i + ch * NB_EBANDS] = celtLog2(bandE[i + ch * NB_EBANDS]) - E_MEANS[i];
+        }
+        for (i in effEnd..end) {
+            logE[ch * NB_EBANDS + i] = -14.0;
+        }
+    }
+}

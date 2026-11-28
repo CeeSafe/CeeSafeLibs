@@ -112,3 +112,140 @@ fn renormaliseVector(x: SliceMut<f32>, n: usize, gain: f32) {
         x[i] = g * x[i];
     }
 }
+
+/// libopus's fast_atan2f.
+fn celtFastAtan2(y: f32, x: f32) -> f32 {
+    let ca: f32 = 0.43157974;
+    let cb: f32 = 0.67848403;
+    let cc: f32 = 0.08595542;
+    let ce: f32 = round<f32>(3.1415926535897931f64) / 2.0;
+    let x2 = x * x;
+    let y2 = y * y;
+    if (x2 + y2 < 1e-18) {
+        return 0.0;
+    }
+    if (x2 < y2) {
+        let den = (y2 + cb * x2) * (y2 + cc * x2);
+        return (-x) * y * (y2 + ca * x2) / den + (if (y < 0.0) -ce else ce);
+    }
+    let den = (x2 + cb * y2) * (x2 + cc * y2);
+    return x * y * (x2 + ca * y2) / den + (if (y < 0.0) -ce else ce) - (if (x * y < 0.0) -ce else ce);
+}
+
+/// The pulse vector nearest the shape `x` (n values, k pulses; libopus's op_pvq_search_c): into `iy`; gives its
+/// squared norm. `x` is left as its absolute values.
+fn celtPvqSearch(x: SliceMut<f32>, iy: SliceMut<i32>, k: i32, n: usize) -> f32 {
+    var y = [0.0f32; 176];
+    var signx = [false; 176];
+    var sum: f32 = 0.0;
+    for (j in 0usize..n) {
+        signx[j] = x[j] < 0.0;
+        x[j] = x[j].abs();
+        iy[j] = 0;
+        y[j] = 0.0;
+    }
+    var xy: f32 = 0.0;
+    var yy: f32 = 0.0;
+    var pulsesLeft = k;
+    if (k > truncate<i32>(n >> 1)) {
+        for (j in 0usize..n) {
+            sum += x[j];
+        }
+        if (!(sum > 1e-15 && sum < 64.0)) {
+            x[0] = 1.0;
+            for (j in 1usize..n) {
+                x[j] = 0.0;
+            }
+            sum = 1.0;
+        }
+        let rcp = (round<f32>(k) + 0.8) * (1.0 / sum);
+        for (j in 0usize..n) {
+            iy[j] = truncate<i32>((rcp * x[j]).floor());
+            y[j] = round<f32>(iy[j]);
+            yy = yy + y[j] * y[j];
+            xy = xy + x[j] * y[j];
+            y[j] *= 2.0;
+            pulsesLeft -= iy[j];
+        }
+    }
+    if (pulsesLeft > truncate<i32>(n) + 3) {
+        let tmp = round<f32>(pulsesLeft);
+        yy = yy + tmp * tmp;
+        yy = yy + tmp * y[0];
+        iy[0] += pulsesLeft;
+        pulsesLeft = 0;
+    }
+    for (i in 0..pulsesLeft) {
+        var bestId: usize = 0;
+        yy = yy + 1.0;
+        var rxy = xy + x[0];
+        var ryy = yy + y[0];
+        rxy = rxy * rxy;
+        var bestDen = ryy;
+        var bestNum = rxy;
+        for (j in 1usize..n) {
+            rxy = xy + x[j];
+            ryy = yy + y[j];
+            rxy = rxy * rxy;
+            if (bestDen * rxy > ryy * bestNum) {
+                bestDen = ryy;
+                bestNum = rxy;
+                bestId = j;
+            }
+        }
+        xy = xy + x[bestId];
+        yy = yy + y[bestId];
+        y[bestId] += 2.0;
+        iy[bestId] += 1;
+    }
+    for (j in 0usize..n) {
+        if (signx[j]) {
+            iy[j] = -iy[j];
+        }
+    }
+    return yy;
+}
+
+/// Quantises the shape `x` (n values) to `k` pulses and encodes them (libopus's alg_quant); with `resynth`, `x`
+/// becomes what the decoder will have. Gives the collapse mask.
+fn algQuant<region r>(x: SliceMut<f32>, n: usize, k: i32, spread: i32, b: usize, enc: borrow mut RangeDecoder<r>, gain: f32,
+    resynth: bool) -> u32 {
+    var iy = [0i32; 179];
+    expRotation(mut x[..], n, 1, b, k, spread);
+    let yy = celtPvqSearch(mut x[..], mut iy[..], k, n);
+    encodePulses(iy[..], truncate<i32>(n), k, enc);
+    if (resynth) {
+        normaliseResidual(iy[..], mut x[..], n, yy, gain);
+        expRotation(mut x[..], n, -1, b, k, spread);
+    }
+    return extractCollapseMask(iy[..], n, b);
+}
+
+/// The angle between the two halves (or, `stereo`, the mid and side of the two channels) at `xa` and `ya`, in Q14 of
+/// a quarter turn (libopus's stereo_itheta).
+fn stereoItheta(buf: Slice<f32>, xa: usize, ya: usize, stereo: bool, n: usize) -> i32 {
+    var emid: f32 = 1e-15;
+    var eside: f32 = 1e-15;
+    if (stereo) {
+        for (i in 0usize..n) {
+            let m = buf[xa + i] + buf[ya + i];
+            let s = buf[xa + i] - buf[ya + i];
+            emid = emid + m * m;
+            eside = eside + s * s;
+        }
+    } else {
+        var a: f32 = 0.0;
+        var b: f32 = 0.0;
+        for (i in 0usize..n) {
+            a = a + buf[xa + i] * buf[xa + i];
+        }
+        for (i in 0usize..n) {
+            b = b + buf[ya + i] * buf[ya + i];
+        }
+        emid += a;
+        eside += b;
+    }
+    let mid = emid.sqrt();
+    let side = eside.sqrt();
+    return truncate<i32>((0.5 + 16384.0 * 0.63662 * celtFastAtan2(side, mid)).floor());
+}

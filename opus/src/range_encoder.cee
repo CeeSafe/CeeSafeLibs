@@ -1,0 +1,345 @@
+// The range coder's encoding side (libopus celt/entenc.c) and the Laplace encoder (celt/laplace.c), on RangeDecoder,
+// which is libopus's ec_ctx both ways. Ported from libopus 1.5.2 (BSD); every value is as libopus computes it.
+
+static EMPTY_FRAME: [u8; 1] = [0];
+
+/// The coder's scalar state, for theta RDO's save and restore (libopus copies the whole ec_ctx).
+struct CoderState {
+    storage: u32;
+    endOffset: u32;
+    endWindow: u32;
+    endBits: u32;
+    totalBits: i32;
+    offset: u32;
+    range: u32;
+    value: u32;
+    ext: u32;
+    encRem: i32;
+    error: bool;
+}
+
+impl<region r> RangeDecoder<r> {
+    /// A range encoder writing a frame of `size` bytes (at most 1275).
+    public fn encoder(size: usize) -> RangeDecoder<static> {
+        var e = RangeDecoder.create(EMPTY_FRAME[0..0]);
+        e.encoding = true;
+        e.storage = truncate<u32>(size);
+        e.endOffset = 0;
+        e.endWindow = 0;
+        e.endBits = 0;
+        e.totalBits = truncate<i32>(CODE_BITS + 1);
+        e.offset = 0;
+        e.range = CODE_TOP;
+        e.encRem = -1;
+        e.value = 0;
+        e.ext = 0;
+        e.error = false;
+        let _ = e.out.resize(size, 0);
+        return e;
+    }
+
+    /// The frame written: its first `storageBytes()` bytes are the frame after `done`.
+    public fn written(borrow this) -> Slice<u8> => this.out.view();
+
+    /// The bytes written at the front so far (ec_range_bytes).
+    public fn rangeBytes(borrow this) -> u32 => this.offset;
+
+    fn saveState(borrow this) -> CoderState => CoderState {
+        storage: this.storage,
+        endOffset: this.endOffset,
+        endWindow: this.endWindow,
+        endBits: this.endBits,
+        totalBits: this.totalBits,
+        offset: this.offset,
+        range: this.range,
+        value: this.value,
+        ext: this.ext,
+        encRem: this.encRem,
+        error: this.error,
+    };
+
+    fn restoreState(borrow mut this, s: CoderState) {
+        this.storage = s.storage;
+        this.endOffset = s.endOffset;
+        this.endWindow = s.endWindow;
+        this.endBits = s.endBits;
+        this.totalBits = s.totalBits;
+        this.offset = s.offset;
+        this.range = s.range;
+        this.value = s.value;
+        this.ext = s.ext;
+        this.encRem = s.encRem;
+        this.error = s.error;
+    }
+
+    /// Copies the bytes from `from` to `to` of the frame into `into` (theta RDO's bytes_save).
+    fn saveBytes(borrow this, from: u32, to: u32, into: borrow mut [u8; 1275]) {
+        var k = from;
+        while (k < to) {
+            into[(k - from) as usize] = this.out[k as usize];
+            k += 1;
+        }
+    }
+
+    fn restoreBytes(borrow mut this, from: u32, to: u32, saved: borrow [u8; 1275]) {
+        var k = from;
+        while (k < to) {
+            this.out[k as usize] = saved[(k - from) as usize];
+            k += 1;
+        }
+    }
+
+    fn writeByte(borrow mut this, value: u32) -> bool {
+        if (this.offset + this.endOffset >= this.storage) {
+            return false;
+        }
+        this.out[this.offset as usize] = truncate<u8>(value);
+        this.offset += 1;
+        return true;
+    }
+
+    fn writeByteAtEnd(borrow mut this, value: u32) -> bool {
+        if (this.offset + this.endOffset >= this.storage) {
+            return false;
+        }
+        this.endOffset += 1;
+        this.out[(this.storage - this.endOffset) as usize] = truncate<u8>(value);
+        return true;
+    }
+
+    fn carryOut(borrow mut this, c: u32) {
+        if (c != SYM_MAX) {
+            let carry = c >> SYM_BITS;
+            if (this.encRem >= 0) {
+                if (!this.writeByte(truncate<u32>(this.encRem) + carry)) {
+                    this.error = true;
+                }
+            }
+            if (this.ext > 0) {
+                let sym = (SYM_MAX + carry) & SYM_MAX;
+                loop {
+                    if (!this.writeByte(sym)) {
+                        this.error = true;
+                    }
+                    this.ext -= 1;
+                    if (this.ext == 0) {
+                        break;
+                    }
+                }
+            }
+            this.encRem = truncate<i32>(c & SYM_MAX);
+        } else {
+            this.ext += 1;
+        }
+    }
+
+    fn encNormalize(borrow mut this) {
+        while (this.range <= CODE_BOT) {
+            this.carryOut(this.value >> (CODE_BITS - SYM_BITS - 1));
+            this.value = (this.value << SYM_BITS) & (CODE_TOP - 1);
+            this.range = this.range << SYM_BITS;
+            this.totalBits += truncate<i32>(SYM_BITS);
+        }
+    }
+
+    /// Encodes the symbol of frequencies [fl, fh) of a total of ft.
+    public fn encode(borrow mut this, fl: u32, fh: u32, ft: u32) {
+        let r = this.range / ft;
+        if (fl > 0) {
+            this.value += this.range - r * (ft - fl);
+            this.range = r * (fh - fl);
+        } else {
+            this.range -= r * (ft - fh);
+        }
+        this.encNormalize();
+    }
+
+    /// As `encode`, with a total of 1 << bits.
+    public fn encodeBin(borrow mut this, fl: u32, fh: u32, bits: u32) {
+        let r = this.range >> bits;
+        if (fl > 0) {
+            this.value += this.range - r * ((1u32 << bits) - fl);
+            this.range = r * (fh - fl);
+        } else {
+            this.range -= r * ((1u32 << bits) - fh);
+        }
+        this.encNormalize();
+    }
+
+    /// A bit whose probability of being 1 is 1/2^logp.
+    public fn encBitLogp(borrow mut this, one: bool, logp: u32) {
+        var r = this.range;
+        let l = this.value;
+        let s = r >> logp;
+        r -= s;
+        if (one) {
+            this.value = l + r;
+        }
+        this.range = if (one) s else r;
+        this.encNormalize();
+    }
+
+    /// Symbol `s` of an 8-bit inverse CDF table of total 1 << ftb.
+    public fn encIcdf(borrow mut this, s: u32, table: Slice<u8>, ftb: u32) {
+        let r = this.range >> ftb;
+        let k = s as usize;
+        if (s > 0) {
+            this.value += this.range - r * (table[k - 1] as u32);
+            this.range = r * ((table[k - 1] as u32) - (table[k] as u32));
+        } else {
+            this.range -= r * (table[k] as u32);
+        }
+        this.encNormalize();
+    }
+
+    /// `fl`, from 0 to ft - 1, each equally likely (ft > 1).
+    public fn encUint(borrow mut this, fl: u32, total: u32) {
+        let ft0 = total - 1;
+        var ftb = ilog(ft0);
+        if (ftb > UINT_BITS) {
+            ftb -= UINT_BITS;
+            let ft = (ft0 >> ftb) + 1;
+            let f = fl >> ftb;
+            this.encode(f, f + 1, ft);
+            this.encBits(fl & ((1u32 << ftb) - 1), ftb);
+        } else {
+            this.encode(fl, fl + 1, ft0 + 1);
+        }
+    }
+
+    /// `bits` raw bits of `fl`, at the end of the frame.
+    public fn encBits(borrow mut this, fl: u32, bits: u32) {
+        var window = this.endWindow;
+        var used = this.endBits;
+        if (used + bits > WINDOW_SIZE) {
+            loop {
+                if (!this.writeByteAtEnd(window & SYM_MAX)) {
+                    this.error = true;
+                }
+                window = window >> SYM_BITS;
+                used -= SYM_BITS;
+                if (used < SYM_BITS) {
+                    break;
+                }
+            }
+        }
+        window = window | (fl << used);
+        used += bits;
+        this.endWindow = window;
+        this.endBits = used;
+        this.totalBits += truncate<i32>(bits);
+    }
+
+    /// Overwrites the first `nbits` bits of the frame with `val` (CELT's silence flag after the fact).
+    public fn patchInitialBits(borrow mut this, val: u32, nbits: u32) {
+        let shift = SYM_BITS - nbits;
+        let mask = ((1u32 << nbits) - 1) << shift;
+        if (this.offset > 0) {
+            this.out[0] = truncate<u8>(((this.out[0] as u32) & ~mask) | (val << shift));
+        } else if (this.encRem >= 0) {
+            this.encRem = truncate<i32>((truncate<u32>(this.encRem) & ~mask) | (val << shift));
+        } else if (this.range <= (CODE_TOP >> nbits)) {
+            let codeShift = CODE_BITS - SYM_BITS - 1;
+            this.value = (this.value & ~(mask << codeShift)) | (val << (codeShift + shift));
+        } else {
+            this.error = true;
+        }
+    }
+
+    /// Shortens the frame to `size` bytes, moving what was written at the end.
+    public fn encShrink(borrow mut this, size: u32) {
+        let end = this.endOffset;
+        for (k in 0u32..end) {
+            this.out[(size - end + k) as usize] = this.out[(this.storage - end + k) as usize];
+        }
+        this.storage = size;
+    }
+
+    /// Ends the frame: the final bits, and the end's raw bits, written.
+    public fn encDone(borrow mut this) {
+        var l: i32 = truncate<i32>(CODE_BITS) - truncate<i32>(ilog(this.range));
+        var msk = (CODE_TOP - 1) >> truncate<u32>(l);
+        var end = (this.value.wrappingAdd(msk)) & ~msk;
+        if ((end | msk) >= this.value.wrappingAdd(this.range)) {
+            l += 1;
+            msk = msk >> 1;
+            end = (this.value.wrappingAdd(msk)) & ~msk;
+        }
+        while (l > 0) {
+            this.carryOut(end >> (CODE_BITS - SYM_BITS - 1));
+            end = (end << SYM_BITS) & (CODE_TOP - 1);
+            l -= truncate<i32>(SYM_BITS);
+        }
+        if (this.encRem >= 0 || this.ext > 0) {
+            this.carryOut(0);
+        }
+        var window = this.endWindow;
+        var used: i32 = truncate<i32>(this.endBits);
+        while (used >= truncate<i32>(SYM_BITS)) {
+            if (!this.writeByteAtEnd(window & SYM_MAX)) {
+                this.error = true;
+            }
+            window = window >> SYM_BITS;
+            used -= truncate<i32>(SYM_BITS);
+        }
+        if (!this.error) {
+            var k = this.offset;
+            while (k < this.storage - this.endOffset) {
+                this.out[k as usize] = 0;
+                k += 1;
+            }
+            if (used > 0) {
+                if (this.endOffset >= this.storage) {
+                    this.error = true;
+                } else {
+                    l = -l;
+                    if (this.offset + this.endOffset >= this.storage && l < used) {
+                        window = window & ((1u32 << truncate<u32>(l)) - 1);
+                        this.error = true;
+                    }
+                    let at = (this.storage - this.endOffset - 1) as usize;
+                    this.out[at] = truncate<u8>((this.out[at] as u32) | window);
+                }
+            }
+        }
+    }
+
+    /// A Laplace-distributed value (CELT's coarse energy), `fs0` the frequency of 0, `decay` the decay, both in Q15;
+    /// gives the value coded, which is clamped where the distribution runs out (ec_laplace_encode).
+    public fn encLaplace(borrow mut this, value: i32, fs0: u32, decay: u32) -> i32 {
+        var val = value;
+        var coded = value;
+        var fl: u32 = 0;
+        var fs = fs0;
+        if (val != 0) {
+            let negative = val < 0;
+            if (negative) {
+                val = -val;
+            }
+            fl = fs;
+            fs = laplaceFreq1(fs, decay);
+            var i: i32 = 1;
+            while (fs > 0 && i < val) {
+                fs *= 2;
+                fl += fs + 2;
+                fs = (fs * decay) >> 15;
+                i += 1;
+            }
+            if (fs == 0) {
+                let s: i32 = if (negative) -1 else 0;
+                let ndiMax = (truncate<i32>(32768 - fl) - s) / 2;
+                let di = celtImin(val - i, ndiMax - 1);
+                fl = truncate<u32>(truncate<i32>(fl) + 2 * di + 1 + s);
+                fs = if (32768 - fl < 1) 32768 - fl else 1;
+                coded = if (negative) -(i + di) else i + di;
+            } else {
+                fs += 1;
+                if (!negative) {
+                    fl += fs;
+                }
+            }
+        }
+        this.encodeBin(fl, fl + fs, 15);
+        return coded;
+    }
+}

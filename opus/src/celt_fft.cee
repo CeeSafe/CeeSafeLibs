@@ -320,3 +320,106 @@ fn mdctBackward(input: Slice<f32>, inAt: usize, out: SliceMut<f32>, outAt: usize
         }
     }
 }
+
+/// The FFT's scale for size 480 >> s (the static modes' 1/nfft, as float literals).
+fn fftScale(s: usize) -> f32 {
+    if (s == 0) {
+        return 0.002083333;
+    } else if (s == 1) {
+        return 0.004166667;
+    } else if (s == 2) {
+        return 0.008333333;
+    }
+    return 0.016666667;
+}
+
+/// The forward MDCT (libopus's clt_mdct_forward_c): N = 1920 >> shift samples of `input` from `inAt`, their overlap
+/// windowed with `WINDOW120`, to N/2 coefficients at `out[outAt], out[outAt + stride], ...`.
+fn mdctForward(input: Slice<f32>, inAt: usize, out: SliceMut<f32>, outAt: usize, shift: usize, stride: usize) {
+    let overlap: usize = 120;
+    let scale = fftScale(shift);
+    var n: usize = 1920;
+    var trig: usize = 0;
+    for (i in 0usize..shift) {
+        n = n >> 1;
+        trig += n;
+    }
+    let n2 = n >> 1;
+    let n4 = n >> 2;
+    var f = [0.0f32; 960];
+    var f2 = [0.0f32; 960];
+    // Window, shuffle, fold.
+    var xp1 = inAt + (overlap >> 1);
+    var xp2 = inAt + n2 - 1 + (overlap >> 1);
+    var yp: usize = 0;
+    var wp1 = overlap >> 1;
+    var wp2 = (overlap >> 1) - 1;
+    let quarter = (overlap + 3) >> 2;
+    var i: usize = 0;
+    while (i < quarter) {
+        f[yp] = WINDOW120[wp2] * input[xp1 + n2] + WINDOW120[wp1] * input[xp2];
+        f[yp + 1] = WINDOW120[wp1] * input[xp1] - WINDOW120[wp2] * input[xp2 - n2];
+        yp += 2;
+        xp1 += 2;
+        xp2 -= 2;
+        wp1 += 2;
+        if (wp2 >= 2) {
+            wp2 -= 2;
+        }
+        i += 1;
+    }
+    wp1 = 0;
+    wp2 = overlap - 1;
+    while (i < n4 - quarter) {
+        f[yp] = input[xp2];
+        f[yp + 1] = input[xp1];
+        yp += 2;
+        xp1 += 2;
+        xp2 -= 2;
+        i += 1;
+    }
+    while (i < n4) {
+        f[yp] = -(WINDOW120[wp1] * input[xp1 - n2]) + WINDOW120[wp2] * input[xp2];
+        f[yp + 1] = WINDOW120[wp2] * input[xp1] + WINDOW120[wp1] * input[xp2 + n2];
+        yp += 2;
+        xp1 += 2;
+        if (xp2 >= 2) {
+            xp2 -= 2;
+        }
+        wp1 += 2;
+        if (wp2 >= 2) {
+            wp2 -= 2;
+        }
+        i += 1;
+    }
+    // Pre-rotation.
+    for (k in 0usize..n4) {
+        let t0 = MDCT_TWIDDLES960[trig + k];
+        let t1 = MDCT_TWIDDLES960[trig + n4 + k];
+        let re = f[2 * k];
+        let im = f[2 * k + 1];
+        let yr = re * t0 - im * t1;
+        let yi = im * t0 + re * t1;
+        let rev = bitrev(shift, k);
+        f2[2 * rev] = scale * yr;
+        f2[2 * rev + 1] = scale * yi;
+    }
+    fftImpl(shift, mut f2[..], 0);
+    // Post-rotation.
+    var yp1 = outAt;
+    var yp2 = outAt + stride * (n2 - 1);
+    for (k in 0usize..n4) {
+        let fr = f2[2 * k];
+        let fi = f2[2 * k + 1];
+        let t0 = MDCT_TWIDDLES960[trig + k];
+        let t1 = MDCT_TWIDDLES960[trig + n4 + k];
+        let yr = fi * t1 - fr * t0;
+        let yi = fr * t1 + fi * t0;
+        out[yp1] = yr;
+        out[yp2] = yi;
+        yp1 += 2 * stride;
+        if (yp2 >= 2 * stride) {
+            yp2 -= 2 * stride;
+        }
+    }
+}

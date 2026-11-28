@@ -1,0 +1,443 @@
+// The Opus encoder for CELT-only packets (libopus 1.5.2 src/opus_encoder.c with OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+// float build; BSD): 48 kHz, mono or stereo, 2.5 to 20 ms frames, VBR (constrained) or CBR, the bandwidth and the
+// stream's channel count chosen from the bitrate as libopus chooses them. libopus runs its tonality analysis from
+// complexity 7, which this encoder does not have; at complexity 7 to 10 its packets are valid but not libopus's.
+
+const BANDWIDTH_NB: i32 = 1101;
+const BANDWIDTH_MB: i32 = 1102;
+const BANDWIDTH_WB: i32 = 1103;
+const BANDWIDTH_SWB: i32 = 1104;
+const BANDWIDTH_FB: i32 = 1105;
+/// libopus's OPUS_AUTO.
+const OPUS_AUTO: i32 = -1000;
+
+const VOICE_BANDWIDTH_THRESHOLDS: [i32; 8] = [9000, 700, 9000, 700, 13500, 1000, 14000, 2000];
+const MUSIC_BANDWIDTH_THRESHOLDS: [i32; 8] = [9000, 700, 9000, 700, 11000, 1000, 12000, 2000];
+
+public struct OpusEncoder {
+    public channels: usize;
+    celt: CeltEncoder;
+    userBitrate: i32;
+    bitrateBps: i32;
+    useVbr: bool;
+    vbrConstraint: bool;
+    complexity: i32;
+    lossPercent: i32;
+    streamChannels: usize;
+    bandwidth: i32;
+    autoBandwidth: i32;
+    first: bool;
+    prevMode: i32;
+    hpMem: [f32; 4];
+    hybridStereoWidthQ14: i32;
+    rangeFinal: u32;
+    pcmBuf: Vector<f32>;
+
+    /// A 48 kHz encoder for `channels` (1 or 2): VBR (constrained), complexity 9, the bitrate libopus's OPUS_AUTO
+    /// gives (60 * 48000 / frame + 48000 * channels).
+    public fn create(channels: usize) -> OpusEncoder {
+        var celt = CeltEncoder.create(channels);
+        celt.setComplexity(9);
+        var e = OpusEncoder {
+            channels: channels,
+            celt: celt,
+            userBitrate: OPUS_AUTO,
+            bitrateBps: 3000 + 48000 * truncate<i32>(channels),
+            useVbr: true,
+            vbrConstraint: true,
+            complexity: 9,
+            lossPercent: 0,
+            streamChannels: channels,
+            bandwidth: BANDWIDTH_FB,
+            autoBandwidth: 0,
+            first: true,
+            prevMode: 0,
+            hpMem: [0.0f32; 4],
+            hybridStereoWidthQ14: 16384,
+            rangeFinal: 0,
+            pcmBuf: Vector<f32>.create(),
+        };
+        let _ = e.pcmBuf.resize(2 * 960, 0.0);
+        return e;
+    }
+
+    /// OPUS_SET_BITRATE, in bits per second (500 to 300000 per channel).
+    public fn setBitrate(borrow mut this, bitsPerSecond: u32) {
+        var value = truncate<i32>(if (bitsPerSecond > 1000000) 1000000u32 else bitsPerSecond);
+        if (value <= 500) {
+            value = 500;
+        } else if (value > 300000 * truncate<i32>(this.channels)) {
+            value = 300000 * truncate<i32>(this.channels);
+        }
+        this.userBitrate = value;
+    }
+
+    public fn setVbr(borrow mut this, on: bool) {
+        this.useVbr = on;
+    }
+
+    public fn setVbrConstraint(borrow mut this, on: bool) {
+        this.vbrConstraint = on;
+    }
+
+    /// OPUS_SET_COMPLEXITY, 0 to 10.
+    public fn setComplexity(borrow mut this, complexity: u32) {
+        let c = truncate<i32>(if (complexity > 10) 10u32 else complexity);
+        this.complexity = c;
+        this.celt.setComplexity(c);
+    }
+
+    /// OPUS_SET_PACKET_LOSS_PERC: CELT weakens its prefilter as the expected loss grows.
+    public fn setPacketLossPercent(borrow mut this, percent: u32) {
+        let p = truncate<i32>(if (percent > 100) 100u32 else percent);
+        this.lossPercent = p;
+        this.celt.setPacketLoss(p);
+    }
+
+    public fn finalRange(borrow this) -> u32 => this.rangeFinal;
+
+    /// One frame (120, 240, 480 or 960 samples per channel) of interleaved 16-bit samples into `out`: the packet's
+    /// length.
+    public fn encode(borrow mut this, pcm: Slice<i16>, frameSize: usize, out: SliceMut<u8>) -> Result<usize, OpusError> {
+        if (frameSize != 120 && frameSize != 240 && frameSize != 480 && frameSize != 960) {
+            return Err(OpusError.BadArgument);
+        }
+        if (pcm.length < frameSize * this.channels) {
+            return Err(OpusError.BadArgument);
+        }
+        var input = [0.0f32; 1920];
+        for (i in 0usize..frameSize * this.channels) {
+            input[i] = (1.0 / 32768.0) * round<f32>(pcm[i]);
+        }
+        return this.encodeNative(input[..], frameSize, out, 16, false);
+    }
+
+    /// As `encode`, from floats at ±1.0 full scale.
+    public fn encodeFloat(borrow mut this, pcm: Slice<f32>, frameSize: usize, out: SliceMut<u8>) -> Result<usize, OpusError> {
+        if (frameSize != 120 && frameSize != 240 && frameSize != 480 && frameSize != 960) {
+            return Err(OpusError.BadArgument);
+        }
+        if (pcm.length < frameSize * this.channels) {
+            return Err(OpusError.BadArgument);
+        }
+        return this.encodeNative(pcm, frameSize, out, 24, true);
+    }
+
+    fn encodeNative(borrow mut this, pcm: Slice<f32>, frameSize: usize, out: SliceMut<u8>, lsbDepth0: i32, floatApi: bool)
+        -> Result<usize, OpusError> {
+        let channels = truncate<i32>(this.channels);
+        var maxDataBytes = truncate<i32>(if (out.length > 1276) 1276 else out.length);
+        this.rangeFinal = 0;
+        if (maxDataBytes <= 0) {
+            return Err(OpusError.BadArgument);
+        }
+        if (maxDataBytes == 1 && 48000 == truncate<i32>(frameSize) * 10) {
+            return Err(OpusError.BufferTooSmall);
+        }
+        let lsbDepth = celtImin(lsbDepth0, 24);
+        let fs = truncate<i32>(frameSize);
+        this.bitrateBps = if (this.userBitrate == OPUS_AUTO) 60 * 48000 / fs + 48000 * channels else this.userBitrate;
+        var frameRate = 48000 / fs;
+        var cbrBytes: i32 = -1;
+        if (!this.useVbr) {
+            let frameRate12 = 12 * 48000 / fs;
+            cbrBytes = celtImin((12 * this.bitrateBps / 8 + frameRate12 / 2) / frameRate12, maxDataBytes);
+            this.bitrateBps = cbrBytes * frameRate12 * 8 / 12;
+            maxDataBytes = celtImax(1, cbrBytes);
+        }
+        if (maxDataBytes < 3 || this.bitrateBps < 3 * frameRate * 8 || (frameRate < 50 && (maxDataBytes * frameRate < 300
+            || this.bitrateBps < 2400))) {
+            // Too few bits: a packet of its TOC alone (CELT-only from 10 ms down).
+            var bw = if (this.bandwidth == 0) BANDWIDTH_NB else this.bandwidth;
+            if (bw == BANDWIDTH_MB) {
+                bw = BANDWIDTH_NB;
+            }
+            out[0] = genToc(frameRate, bw, this.streamChannels);
+            if (!this.useVbr && maxDataBytes > 1) {
+                return padPacket(out, 1, truncate<usize>(maxDataBytes));
+            }
+            return Ok(1);
+        }
+        var equivRate = computeEquivRate(this.bitrateBps, channels, frameRate, this.useVbr, 0, this.complexity, this.lossPercent);
+        let voiceEst: i32 = 48;
+        if (this.channels == 2) {
+            var threshold = 17000 + ((voiceEst * voiceEst * (19000 - 17000)) / 16384);
+            if (this.streamChannels == 2) {
+                threshold -= 1000;
+            } else {
+                threshold += 1000;
+            }
+            this.streamChannels = if (equivRate > threshold) 2 else 1;
+        } else {
+            this.streamChannels = this.channels;
+        }
+        let streamCh = truncate<i32>(this.streamChannels);
+        equivRate = computeEquivRate(this.bitrateBps, streamCh, frameRate, this.useVbr, 1002, this.complexity, this.lossPercent);
+        // The bandwidth, from the bitrate.
+        var thresholds = [0i32; 8];
+        for (i in 0usize..8) {
+            thresholds[i] = MUSIC_BANDWIDTH_THRESHOLDS[i]
+                + ((voiceEst * voiceEst * (VOICE_BANDWIDTH_THRESHOLDS[i] - MUSIC_BANDWIDTH_THRESHOLDS[i])) / 16384);
+        }
+        var bandwidth = BANDWIDTH_FB;
+        loop {
+            let at = truncate<usize>(2 * (bandwidth - BANDWIDTH_MB));
+            var threshold = thresholds[at];
+            let hysteresis = thresholds[at + 1];
+            if (!this.first) {
+                if (this.autoBandwidth >= bandwidth) {
+                    threshold -= hysteresis;
+                } else {
+                    threshold += hysteresis;
+                }
+            }
+            if (equivRate >= threshold) {
+                break;
+            }
+            bandwidth -= 1;
+            if (bandwidth <= BANDWIDTH_NB) {
+                break;
+            }
+        }
+        if (bandwidth == BANDWIDTH_MB) {
+            bandwidth = BANDWIDTH_WB;
+        }
+        this.bandwidth = bandwidth;
+        this.autoBandwidth = bandwidth;
+        this.celt.setLsbDepth(lsbDepth);
+        if (this.bandwidth == BANDWIDTH_MB) {
+            this.bandwidth = BANDWIDTH_WB;
+        }
+        let _ = cbrBytes;
+        return this.encodeFrame(pcm, frameSize, out, maxDataBytes, equivRate, floatApi);
+    }
+
+    fn encodeFrame(borrow mut this, pcm: Slice<f32>, frameSize: usize, out: SliceMut<u8>, maxDataBytes: i32, equivRate: i32,
+        floatApi: bool) -> Result<usize, OpusError> {
+        let ch = this.channels;
+        let frameRate = 48000 / truncate<i32>(frameSize);
+        let currBandwidth = this.bandwidth;
+        var enc = RangeDecoder.encoder(truncate<usize>(maxDataBytes - 1));
+        // DC rejection (libopus's dc_reject at 3 Hz), into pcmBuf.
+        let coef: f32 = 6.3 * 3.0 / 48000.0;
+        let coef2: f32 = 1.0 - coef;
+        if (ch == 2) {
+            var m0 = this.hpMem[0];
+            var m2 = this.hpMem[2];
+            for (i in 0usize..frameSize) {
+                let x0 = pcm[2 * i];
+                let x1 = pcm[2 * i + 1];
+                let out0 = x0 - m0;
+                let out1 = x1 - m2;
+                m0 = coef * x0 + 1e-30 + coef2 * m0;
+                m2 = coef * x1 + 1e-30 + coef2 * m2;
+                this.pcmBuf[2 * i] = out0;
+                this.pcmBuf[2 * i + 1] = out1;
+            }
+            this.hpMem[0] = m0;
+            this.hpMem[2] = m2;
+        } else {
+            var m0 = this.hpMem[0];
+            for (i in 0usize..frameSize) {
+                let x = pcm[i];
+                let y = x - m0;
+                m0 = coef * x + 1e-30 + coef2 * m0;
+                this.pcmBuf[i] = y;
+            }
+            this.hpMem[0] = m0;
+        }
+        if (floatApi) {
+            var sum: f32 = 0.0;
+            for (i in 0usize..frameSize * ch) {
+                sum = sum + this.pcmBuf[i] * this.pcmBuf[i];
+            }
+            if (!(sum < 1e9) || sum != sum) {
+                for (i in 0usize..frameSize * ch) {
+                    this.pcmBuf[i] = 0.0;
+                }
+                this.hpMem = [0.0f32; 4];
+            }
+        }
+        let endband: usize = if (currBandwidth == BANDWIDTH_NB) 13 else if (currBandwidth <= BANDWIDTH_WB) 17
+            else if (currBandwidth == BANDWIDTH_SWB) 19 else 21;
+        this.celt.setEndBand(endband);
+        this.celt.setStreamChannels(this.streamChannels);
+        this.celt.setBitrate(CELT_BITRATE_MAX);
+        this.celt.setPrediction(2);
+        // The stereo width (SILK's, which the CELT-only path still applies).
+        var widthQ14: i32 = 0;
+        if (equivRate > 32000) {
+            widthQ14 = 16384;
+        } else if (equivRate < 16000) {
+            widthQ14 = 0;
+        } else {
+            widthQ14 = 16384 - 2048 * (32000 - equivRate) / (equivRate - 14000);
+        }
+        if (ch == 2 && (this.hybridStereoWidthQ14 < 16384 || widthQ14 < 16384)) {
+            let g1 = round<f32>(this.hybridStereoWidthQ14) * (1.0 / 16384.0);
+            let g2 = round<f32>(widthQ14) * (1.0 / 16384.0);
+            stereoFade(mut this.pcmBuf[..], g1, g2, frameSize);
+            this.hybridStereoWidthQ14 = widthQ14;
+        }
+        let nbComprBytes = maxDataBytes - 1;
+        enc.encShrink(truncate<u32>(nbComprBytes));
+        this.celt.setStartBand(0);
+        this.celt.setVbr(this.useVbr);
+        if (this.useVbr) {
+            this.celt.setVbr(true);
+            this.celt.setVbrConstraint(this.vbrConstraint);
+            this.celt.setBitrate(this.bitrateBps);
+        }
+        var ret: i32 = 0;
+        if (enc.tell() <= 8 * nbComprBytes) {
+            match (this.celt.encode(this.pcmBuf[0..frameSize * ch], frameSize, truncate<usize>(nbComprBytes), mut enc)) {
+                Ok(n) => {
+                    ret = truncate<i32>(n);
+                },
+                Err(_) => {
+                    return Err(OpusError.Internal);
+                },
+            }
+        }
+        out[0] = genToc(frameRate, currBandwidth, this.streamChannels);
+        let written = enc.written();
+        for (k in 0usize..truncate<usize>(ret)) {
+            out[1 + k] = written[k];
+        }
+        this.rangeFinal = enc.range;
+        this.prevMode = 1002;
+        this.first = false;
+        if (enc.tell() > (maxDataBytes - 1) * 8) {
+            if (maxDataBytes < 2) {
+                return Err(OpusError.BufferTooSmall);
+            }
+            out[1] = 0;
+            ret = 1;
+            this.rangeFinal = 0;
+        }
+        ret += 1;
+        if (!this.useVbr && ret < maxDataBytes) {
+            return padPacket(out, truncate<usize>(ret), truncate<usize>(maxDataBytes));
+        }
+        return Ok(truncate<usize>(ret));
+    }
+}
+
+/// libopus's compute_equiv_rate.
+fn computeEquivRate(bitrate: i32, channels: i32, frameRate: i32, vbr: bool, mode: i32, complexity: i32, loss: i32) -> i32 {
+    var equiv = bitrate;
+    if (frameRate > 50) {
+        equiv -= (40 * channels + 20) * (frameRate - 50);
+    }
+    if (!vbr) {
+        equiv -= equiv / 12;
+    }
+    equiv = equiv * (90 + complexity) / 100;
+    if (mode == 1000 || mode == 1001) {
+        if (complexity < 2) {
+            equiv = equiv * 4 / 5;
+        }
+        equiv -= equiv * loss / (6 * loss + 10);
+    } else if (mode == 1002) {
+        if (complexity < 5) {
+            equiv = equiv * 9 / 10;
+        }
+    } else {
+        equiv -= equiv * loss / (12 * loss + 20);
+    }
+    return equiv;
+}
+
+/// A CELT-only packet's TOC byte (libopus's gen_toc).
+fn genToc(frameRate0: i32, bandwidth: i32, channels: usize) -> u8 {
+    var frameRate = frameRate0;
+    var period: u32 = 0;
+    while (frameRate < 400) {
+        frameRate = frameRate * 2;
+        period += 1;
+    }
+    var tmp = bandwidth - BANDWIDTH_MB;
+    if (tmp < 0) {
+        tmp = 0;
+    }
+    var toc: u32 = 0x80 | (truncate<u32>(tmp) << 5) | (period << 3);
+    if (channels == 2) {
+        toc = toc | 4;
+    }
+    return truncate<u8>(toc);
+}
+
+/// libopus's stereo_fade over the frame, in place: the side narrowed from width g1 to g2.
+fn stereoFade(pcm: SliceMut<f32>, g1in: f32, g2in: f32, frameSize: usize) {
+    let g1 = 1.0 - g1in;
+    let g2 = 1.0 - g2in;
+    let overlap: usize = 120;
+    var i: usize = 0;
+    while (i < overlap) {
+        let w = WINDOW120[i] * WINDOW120[i];
+        let g = w * g2 + (1.0 - w) * g1;
+        var diff = 0.5 * (pcm[2 * i] - pcm[2 * i + 1]);
+        diff = g * diff;
+        pcm[2 * i] = pcm[2 * i] - diff;
+        pcm[2 * i + 1] = pcm[2 * i + 1] + diff;
+        i += 1;
+    }
+    while (i < frameSize) {
+        var diff = 0.5 * (pcm[2 * i] - pcm[2 * i + 1]);
+        diff = g2 * diff;
+        pcm[2 * i] = pcm[2 * i] - diff;
+        pcm[2 * i + 1] = pcm[2 * i + 1] + diff;
+        i += 1;
+    }
+}
+
+/// A one-frame packet of `len` bytes padded to `newLen` (libopus's opus_packet_pad): code 3, one frame, with padding.
+fn padPacket(data: SliceMut<u8>, len: usize, newLen: usize) -> Result<usize, OpusError> {
+    if (len == newLen) {
+        return Ok(len);
+    }
+    if (len > newLen || len < 1 || newLen < len + 2) {
+        return Err(OpusError.BadArgument);
+    }
+    // TOC | 3, then the frame count with the padding flag, then the padding length (255s and a remainder), the frame,
+    // and zeros.
+    var frame = [0u8; 1276];
+    let frameLen = len - 1;
+    for (k in 0usize..frameLen) {
+        frame[k] = data[1 + k];
+    }
+    let toc = data[0];
+    let padding = newLen - len - 2;
+    var at: usize = 0;
+    data[at] = (toc & 0xFC) | 3;
+    at += 1;
+    data[at] = if (padding > 0) 0x41 else 0x01;
+    at += 1;
+    if (padding > 0) {
+        var left = padding;
+        // Each 255 says 254 bytes and that more follows; the count of the length bytes is part of the padding.
+        var lengthBytes = (left + 253) / 255;
+        if (lengthBytes == 0) {
+            lengthBytes = 1;
+        }
+        var amount = padding - (lengthBytes - 1);
+        while (amount >= 255) {
+            data[at] = 255;
+            at += 1;
+            amount -= 254;
+        }
+        data[at] = truncate<u8>(amount);
+        at += 1;
+        left = amount;
+        let _ = left;
+    }
+    for (k in 0usize..frameLen) {
+        data[at + k] = frame[k];
+    }
+    at += frameLen;
+    while (at < newLen) {
+        data[at] = 0;
+        at += 1;
+    }
+    return Ok(newLen);
+}

@@ -9,7 +9,7 @@ const CELT_SIG_SCALE: f32 = 32768.0;
 fn celtLog2(x: f32) -> f32 {
     var bits = x.bits();
     let integer = truncate<i32>(bits >> 23) - 127;
-    bits = bits - (truncate<u32>(integer) << 23);
+    bits = bits.wrappingSub(truncate<u32>(integer) << 23);
     var frac = f32.fromBits(bits) - 1.5;
     frac = -0.41445418 + frac * (0.95909232 + frac * (-0.33951290 + frac * 0.16541097));
     return 1.0 + round<f32>(integer) + frac;

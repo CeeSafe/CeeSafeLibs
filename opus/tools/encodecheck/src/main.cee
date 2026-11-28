@@ -1,0 +1,94 @@
+// encodecheck: encodes 16-bit little-endian PCM at 48 kHz with this package's encoder into opus_demo's .bit format
+// (4-byte big-endian length, 4-byte big-endian final range, the packet), as scratch refenc does with libopus.
+//
+//   encodecheck <in.pcm> <out.bit> <channels> <bitrate> <vbr 0|1> <complexity> [frame=960]
+
+import opus;
+
+fn main() -> i32 {
+    let input = Process.argument(1) ?? "";
+    let output = Process.argument(2) ?? "";
+    let channels = NumberParsing.parseUsize((Process.argument(3) ?? "1").bytes()) ?? 1;
+    let bitrate = NumberParsing.parseU32((Process.argument(4) ?? "0").bytes()) ?? 0;
+    let vbr = (Process.argument(5) ?? "1") == "1";
+    let complexity = NumberParsing.parseU32((Process.argument(6) ?? "9").bytes()) ?? 9;
+    let frame = NumberParsing.parseUsize((Process.argument(7) ?? "960").bytes()) ?? 960;
+    let bytes = match (readAll(input)) {
+        Ok(b) => b,
+        Err(e) => {
+            Console.writeLine(e.message());
+            return 2;
+        },
+    };
+    var encoder = OpusEncoder.create(channels);
+    if (bitrate > 0) {
+        encoder.setBitrate(bitrate);
+    }
+    encoder.setVbr(vbr);
+    encoder.setComplexity(complexity);
+    var pcm = Vector<i16>.create();
+    let _ = pcm.resize(frame * channels, 0);
+    var packet = [0u8; 1500];
+    var out = Vector<u8>.create();
+    let step = frame * channels * 2;
+    var at: usize = 0;
+    var packets: u64 = 0;
+    let started = Clock.monotonicNanos();
+    while (at + step <= bytes.length) {
+        for (i in 0usize..frame * channels) {
+            pcm[i] = truncate<i16>((bytes[at + 2 * i] as u32) | ((bytes[at + 2 * i + 1] as u32) << 8));
+        }
+        at += step;
+        match (encoder.encode(pcm.view(), frame, mut packet[..])) {
+            Ok(n) => {
+                be32(mut out, truncate<u32>(n));
+                be32(mut out, encoder.finalRange());
+                let _ = out.extend(packet[0..n]);
+            },
+            Err(_) => {
+                Console.writeLine("encode error");
+                return 1;
+            },
+        }
+        packets += 1;
+    }
+    let ns = Clock.monotonicNanos() - started;
+    match (File.create(output)) {
+        Ok(var f) => {
+            let _ = f.write(out.view());
+        },
+        Err(e) => {
+            Console.writeLine(e.message());
+            return 2;
+        },
+    }
+    var s = String.create();
+    let _ = s.appendNumber(truncate<i64>(packets));
+    let _ = s.append(" packets, ");
+    let _ = s.appendNumber(truncate<i64>(ns / 1000000));
+    let _ = s.append(" ms");
+    Console.writeLine(s.view());
+    return 0;
+}
+
+fn be32(out: borrow mut Vector<u8>, v: u32) {
+    let _ = out.push(truncate<u8>(v >> 24));
+    let _ = out.push(truncate<u8>(v >> 16));
+    let _ = out.push(truncate<u8>(v >> 8));
+    let _ = out.push(truncate<u8>(v));
+}
+
+fn readAll(path: StringView) -> Result<Vector<u8>, IoError> {
+    var file = File.open(path)?;
+    var bytes = Vector<u8>.create();
+    var buffer = [0u8; 65536];
+    loop {
+        let n = file.read(mut buffer[..])?;
+        if (n == 0) {
+            return Ok(bytes);
+        }
+        if (bytes.extend(buffer[0..n]) is Err(_)) {
+            return Err(IoError.OutOfMemory);
+        }
+    }
+}
