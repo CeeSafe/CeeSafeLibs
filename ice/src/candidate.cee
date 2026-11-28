@@ -1,0 +1,166 @@
+// ICE candidates (RFC 8445 §5.1, RFC 8839 §5.1): their priority, and the SDP `candidate:` line read and written.
+
+import stun;
+
+/// A candidate's type.
+public enum CandidateKind {
+    Host,
+    ServerReflexive,
+    PeerReflexive,
+    Relayed,
+}
+
+/// A candidate's type preference (RFC 8445 §5.1.2.2's recommended values).
+public fn typePreference(kind: CandidateKind) -> u32 => match (kind) {
+    CandidateKind.Host => 126,
+    CandidateKind.PeerReflexive => 110,
+    CandidateKind.ServerReflexive => 100,
+    CandidateKind.Relayed => 0,
+};
+
+/// A candidate's priority (RFC 8445 §5.1.2.1).
+public fn candidatePriority(kind: CandidateKind, localPreference: u32, component: u32) -> u32 =>
+    (typePreference(kind) << 24) | ((localPreference & 0xFFFF) << 8) | (256 - (component & 0xFF));
+
+/// A pair's priority (RFC 8445 §6.1.2.3), from the controlling agent's candidate's priority and the controlled's.
+public fn pairPriority(controlling: u32, controlled: u32) -> u64 {
+    let g = controlling as u64;
+    let d = controlled as u64;
+    let low = if (g < d) g else d;
+    let high = if (g < d) d else g;
+    return (low << 32) + 2 * high + (if (g > d) 1u64 else 0u64);
+}
+
+/// A candidate, as a `candidate:` line carries it. UDP only (TCP candidates are read as null).
+public struct IceCandidate {
+    public foundation: String;
+    public component: u32;
+    public priority: u32;
+    public address: StunAddress;
+    public kind: CandidateKind;
+    public related: StunAddress?;
+
+    /// A `candidate:` line (with or without `a=`); null for TCP, a host name (mDNS `.local`) or bad text.
+    public fn parse(line: StringView) -> IceCandidate? {
+        var text = line.trim();
+        if (text.startsWith("a=")) {
+            text = text[2..];
+        }
+        if (!text.startsWith("candidate:")) {
+            return null;
+        }
+        text = text[10..];
+        var fields = Vector<StringView>.create();
+        for (f in text.split(" ")) {
+            if (f.length > 0) {
+                if (fields.push(f) is Err(_)) {
+                    return null;
+                }
+            }
+        }
+        if (fields.length < 8 || !fields[2].equalsIgnoreAsciiCase("udp") || fields[6] != "typ") {
+            return null;
+        }
+        var foundation = String.create();
+        if (foundation.append(fields[0]) is Err(_)) {
+            return null;
+        }
+        let component = NumberParsing.parseU32(fields[1].bytes())?;
+        let priority = NumberParsing.parseU32(fields[3].bytes())?;
+        let port = NumberParsing.parseU16(fields[5].bytes())?;
+        let address = addressOf(fields[4], port)?;
+        let kind = if (fields[7] == "host") CandidateKind.Host else if (fields[7] == "srflx") CandidateKind.ServerReflexive
+            else if (fields[7] == "prflx") CandidateKind.PeerReflexive else if (fields[7] == "relay") CandidateKind.Relayed
+            else { return null; };
+        var related: StunAddress? = null;
+        var k: usize = 8;
+        var raddr: StringView? = null;
+        var rport: u16? = null;
+        while (k + 1 < fields.length) {
+            if (fields[k] == "raddr") {
+                raddr = Some(fields[k + 1]);
+            } else if (fields[k] == "rport") {
+                rport = NumberParsing.parseU16(fields[k + 1].bytes());
+            }
+            k += 2;
+        }
+        if (raddr is Some(r) && rport is Some(p)) {
+            related = addressOf(r, p);
+        }
+        return Some(IceCandidate {
+            foundation: foundation,
+            component: component,
+            priority: priority,
+            address: address,
+            kind: kind,
+            related: related,
+        });
+    }
+
+    /// The `candidate:` line, without `a=`.
+    public fn format(borrow this) -> String {
+        var out = String.create();
+        let _ = out.append("candidate:");
+        let _ = out.append(this.foundation.view());
+        let _ = out.append(" ");
+        let _ = out.appendNumber(this.component as i64);
+        let _ = out.append(" udp ");
+        let _ = out.appendNumber(this.priority as i64);
+        let _ = out.append(" ");
+        appendAddress(mut out, this.address);
+        let _ = out.append(" ");
+        let _ = out.appendNumber(this.address.port as i64);
+        let _ = out.append(" typ ");
+        let _ = out.append(match (this.kind) {
+            CandidateKind.Host => "host",
+            CandidateKind.ServerReflexive => "srflx",
+            CandidateKind.PeerReflexive => "prflx",
+            CandidateKind.Relayed => "relay",
+        });
+        if (this.related is Some(r)) {
+            let _ = out.append(" raddr ");
+            appendAddress(mut out, r);
+            let _ = out.append(" rport ");
+            let _ = out.appendNumber(r.port as i64);
+        }
+        return out;
+    }
+}
+
+/// An IP address in text (IPv4 dotted, or IPv6) and a port.
+public fn addressOf(text: StringView, port: u16) -> StunAddress? {
+    let socket = SocketAddresses.parseIp(text, port)?;
+    return Some(fromSocket(socket));
+}
+
+public fn fromSocket(address: SocketAddress) -> StunAddress => match (address) {
+    SocketAddress.V4(ip, port) => StunAddress.v4(ip[0], ip[1], ip[2], ip[3], port),
+    SocketAddress.V6(ip, port, _) => StunAddress { ip: ip, v6: true, port: port },
+};
+
+public fn toSocket(address: StunAddress) -> SocketAddress {
+    if (address.v6) {
+        return SocketAddress.V6(address.ip, address.port, 0);
+    }
+    return SocketAddress.V4([address.ip[0], address.ip[1], address.ip[2], address.ip[3]], address.port);
+}
+
+/// The address's IP in text: IPv4 dotted, IPv6 as eight groups of hex (not shortened).
+public fn appendAddress(out: borrow mut String, address: StunAddress) {
+    if (!address.v6) {
+        for (k in 0usize..4) {
+            if (k > 0) {
+                let _ = out.append(".");
+            }
+            let _ = out.appendNumber(address.ip[k] as i64);
+        }
+        return;
+    }
+    for (k in 0usize..8) {
+        if (k > 0) {
+            let _ = out.append(":");
+        }
+        let group = ((address.ip[2 * k] as u64) << 8) | (address.ip[2 * k + 1] as u64);
+        let _ = out.appendHex(group, 1, false);
+    }
+}

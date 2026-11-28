@@ -1,0 +1,124 @@
+// Candidates read and written, and two agents connecting over an in-memory network.
+
+import stun;
+
+@test
+fn aCandidateLineIsReadAndWritten() -> Result<void, TestFailure> {
+    let c = IceCandidate.parse("a=candidate:842163049 1 udp 1677729535 203.0.113.7 61234 typ srflx raddr 192.168.1.20 rport 61234 generation 0")!;
+    Check.isTrue(c.foundation.view() == "842163049", "foundation")?;
+    Check.equalU64(1677729535, c.priority as u64)?;
+    Check.isTrue(c.kind is CandidateKind.ServerReflexive, "srflx")?;
+    Check.isTrue(c.address.same(StunAddress.v4(203, 0, 113, 7, 61234)), "address")?;
+    Check.isTrue(c.related!.same(StunAddress.v4(192, 168, 1, 20, 61234)), "related")?;
+    let line = c.format();
+    Check.isTrue(line.view() == "candidate:842163049 1 udp 1677729535 203.0.113.7 61234 typ srflx raddr 192.168.1.20 rport 61234", "written")?;
+    let v6 = IceCandidate.parse("candidate:1 1 UDP 2122262783 2001:db8::9 50000 typ host")!;
+    Check.isTrue(v6.address.v6 && v6.address.ip[15] == 9 && v6.address.port == 50000, "IPv6")?;
+    Check.isTrue(v6.format().view() == "candidate:1 1 udp 2122262783 2001:db8:0:0:0:0:0:9 50000 typ host", "IPv6 written")?;
+    Check.isTrue(IceCandidate.parse("candidate:1 1 tcp 1518280447 192.168.1.2 9 typ host tcptype active") == null, "TCP: none")?;
+    Check.isTrue(IceCandidate.parse("candidate:1 1 udp 2122262783 abcd.local 50000 typ host") == null, "mDNS: none")?;
+    return Check.equalU64(2130706431, candidatePriority(CandidateKind.Host, 65535, 1) as u64);
+}
+
+/// Datagrams between two agents: a moves to b and b to a, each to the address it was sent to.
+fn exchange(a: borrow mut IceAgent, aAt: StunAddress, b: borrow mut IceAgent, bAt: StunAddress, now: u64, lose: bool) {
+    for (step in 0..8) {
+        match (a.poll(now)) {
+            Some(t) => {
+                if (!lose && t.to.same(bAt)) {
+                    let _ = b.receive(0, aAt, t.bytes.view(), now);
+                }
+            },
+            null => {},
+        }
+        match (b.poll(now)) {
+            Some(t) => {
+                if (!lose && t.to.same(aAt)) {
+                    let _ = a.receive(0, bAt, t.bytes.view(), now);
+                }
+            },
+            null => {},
+        }
+    }
+}
+
+@test
+fn twoAgentsConnect() -> Result<void, TestFailure> {
+    var a = IceAgent.create(true, 0);
+    var b = IceAgent.create(false, 0);
+    let aAt = StunAddress.v4(10, 0, 0, 1, 5000);
+    let bAt = StunAddress.v4(10, 0, 0, 2, 6000);
+    a.setRemoteCredentials(b.localUfrag.view(), b.localPassword.view());
+    b.setRemoteCredentials(a.localUfrag.view(), a.localPassword.view());
+    a.addHost(0, aAt);
+    b.addHost(0, bAt);
+    // Only a's candidate reaches b: b learns a peer-reflexive remote from a's check, and a pairs with b's.
+    let fromA = a.takeCandidate()!;
+    let fromB = b.takeCandidate()!;
+    b.addRemote(borrow IceCandidate.parse(fromA.format().view())!);
+    a.addRemote(borrow fromB);
+    var now: u64 = 0;
+    while (now < 2000 && !(a.state is IceState.Connected && b.state is IceState.Connected)) {
+        exchange(mut a, aAt, mut b, bAt, now, false);
+        now += 20;
+    }
+    Check.isTrue(a.state is IceState.Connected && b.state is IceState.Connected, "both connected")?;
+    Check.isTrue(a.isSelected(0, bAt) && b.isSelected(0, aAt), "on the one pair")?;
+    let t = a.send("dtls".bytes())!;
+    Check.isTrue(t.to.same(bAt) && t.bytes.view() == "dtls".bytes(), "data goes on it")?;
+    Check.isTrue(!b.receive(0, aAt, t.bytes.view(), now), "and is the application's")?;
+    // Keep-alives hold it; silence fails it.
+    var later = now;
+    while (later < now + 40000) {
+        exchange(mut a, aAt, mut b, bAt, later, false);
+        later += 500;
+    }
+    Check.isTrue(a.state is IceState.Connected, "kept alive")?;
+    while (later < now + 80000) {
+        exchange(mut a, aAt, mut b, bAt, later, true);
+        later += 500;
+    }
+    return Check.isTrue(a.state is IceState.Failed, "failed after 30 s of silence");
+}
+
+@test
+fn aRoleConflictIsSettled() -> Result<void, TestFailure> {
+    var a = IceAgent.create(true, 0);
+    var b = IceAgent.create(true, 0);
+    let aAt = StunAddress.v4(10, 0, 0, 1, 5000);
+    let bAt = StunAddress.v4(10, 0, 0, 2, 6000);
+    a.setRemoteCredentials(b.localUfrag.view(), b.localPassword.view());
+    b.setRemoteCredentials(a.localUfrag.view(), a.localPassword.view());
+    a.addHost(0, aAt);
+    b.addHost(0, bAt);
+    let fromA = a.takeCandidate()!;
+    let fromB = b.takeCandidate()!;
+    b.addRemote(borrow fromA);
+    a.addRemote(borrow fromB);
+    var now: u64 = 0;
+    while (now < 3000 && !(a.state is IceState.Connected && b.state is IceState.Connected)) {
+        exchange(mut a, aAt, mut b, bAt, now, false);
+        now += 20;
+    }
+    Check.isTrue(a.controlling != b.controlling, "one controls")?;
+    return Check.isTrue(a.state is IceState.Connected && b.state is IceState.Connected, "both connected");
+}
+
+@test
+fn aServerReflexiveCandidateIsGathered() -> Result<void, TestFailure> {
+    var a = IceAgent.create(true, 0);
+    let host = StunAddress.v4(192, 168, 1, 5, 5000);
+    let server = StunAddress.v4(198, 51, 100, 1, 3478);
+    a.addHost(0, host);
+    let _ = a.takeCandidate()!;
+    a.gather(0, server);
+    let t = a.poll(0)!;
+    Check.isTrue(t.to.same(server), "asks the server")?;
+    let request = StunMessage.decode(t.bytes.view())!;
+    var reply = StunMessage.create(BINDING, StunClass.Success, request.transaction);
+    Check.isTrue(reply.addAddress(XOR_MAPPED_ADDRESS, StunAddress.v4(203, 0, 113, 9, 40000)), "mapped")?;
+    Check.isTrue(a.receive(0, server, reply.encode(Vector<u8>.create().view(), true).view(), 10), "STUN")?;
+    let c = a.takeCandidate()!;
+    Check.isTrue(c.kind is CandidateKind.ServerReflexive && c.address.port == 40000, "srflx")?;
+    return Check.isTrue(c.related!.same(host), "its base");
+}

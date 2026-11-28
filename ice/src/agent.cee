@@ -1,0 +1,576 @@
+// An ICE agent (RFC 8445) for one component (WebRTC's BUNDLE and rtcp-mux): host and server-reflexive candidates,
+// trickled; connectivity checks paced and retransmitted; triggered checks; peer-reflexive remotes; role conflicts;
+// nomination (the controlling agent nominates every check, the controlled one takes the first pair that works until a
+// pair is nominated); and keep-alive checks on the pair in use (consent, RFC 7675). No I/O: the caller hands it each
+// datagram that arrives and sends what `poll` gives, on the socket it names.
+
+import stun;
+
+/// Where the agent is.
+public enum IceState {
+    Checking,
+    Connected,
+    Failed,
+}
+
+/// A datagram to send: from which of the caller's sockets, and to where.
+public struct Transmit {
+    public socket: usize;
+    public to: StunAddress;
+    public bytes: Vector<u8>;
+}
+
+enum PairState {
+    Waiting,
+    InProgress,
+    Succeeded,
+    Failed,
+}
+
+struct Local {
+    address: StunAddress;
+    socket: usize;
+    kind: CandidateKind;
+    priority: u32;
+}
+
+struct Remote {
+    address: StunAddress;
+    priority: u32;
+}
+
+struct Pair {
+    local: usize;
+    remote: usize;
+    state: PairState;
+    transaction: [u8; 12];
+    sentAt: u64;
+    tries: u32;
+    nominated: bool;
+}
+
+struct Gathering {
+    socket: usize;
+    server: StunAddress;
+    transaction: [u8; 12];
+    sentAt: u64;
+    tries: u32;
+    done: bool;
+}
+
+/// The checks' pace (RFC 8445 §14.2's Ta) and their first retransmission time, in milliseconds.
+const PACE: u64 = 20;
+const FIRST_RTO: u64 = 100;
+const TRIES: u32 = 7;
+const KEEPALIVE: u64 = 2000;
+/// No answer on the pair in use for this long, or no pair working this long after the start: failed.
+const SILENCE: u64 = 30000;
+
+public struct IceAgent {
+    public controlling: bool;
+    tieBreaker: u64;
+    public localUfrag: String;
+    public localPassword: String;
+    remoteUfrag: String;
+    remotePassword: String;
+    locals: Vector<Local>;
+    remotes: Vector<Remote>;
+    pairs: Vector<Pair>;
+    gatherings: Vector<Gathering>;
+    pending: Vector<Transmit>;
+    trickle: Vector<IceCandidate>;
+    selected: usize?;
+    started: u64;
+    lastCheck: u64;
+    keepaliveAt: u64;
+    lastHeard: u64;
+    public state: IceState;
+    keepalive: [u8; 12];
+
+    /// An agent with fresh credentials and tie-breaker; `now` in milliseconds starts its clock.
+    public fn create(controlling: bool, now: u64) -> IceAgent {
+        var seed = [0u8; 8];
+        let _ = Random.fill(mut seed[..]);
+        var tie: u64 = 0;
+        for (b in seed) {
+            tie = (tie << 8) | (b as u64);
+        }
+        return IceAgent {
+            controlling: controlling,
+            tieBreaker: tie,
+            localUfrag: randomText(8),
+            localPassword: randomText(24),
+            remoteUfrag: String.create(),
+            remotePassword: String.create(),
+            locals: Vector<Local>.create(),
+            remotes: Vector<Remote>.create(),
+            pairs: Vector<Pair>.create(),
+            gatherings: Vector<Gathering>.create(),
+            pending: Vector<Transmit>.create(),
+            trickle: Vector<IceCandidate>.create(),
+            selected: null,
+            started: now,
+            lastCheck: 0,
+            keepaliveAt: 0,
+            lastHeard: now,
+            state: IceState.Checking,
+            keepalive: [0u8; 12],
+        };
+    }
+
+    /// The other side's `ice-ufrag` and `ice-pwd`.
+    public fn setRemoteCredentials(borrow mut this, ufrag: StringView, password: StringView) {
+        this.remoteUfrag.clear();
+        let _ = this.remoteUfrag.append(ufrag);
+        this.remotePassword.clear();
+        let _ = this.remotePassword.append(password);
+    }
+
+    /// A host candidate: the caller's socket `socket`, bound at `address`. Its candidate is given to trickle.
+    public fn addHost(borrow mut this, socket: usize, address: StunAddress) {
+        let preference = 65535 - truncate<u32>(this.locals.length);
+        let priority = candidatePriority(CandidateKind.Host, preference, 1);
+        let _ = this.locals.push(Local { address: address, socket: socket, kind: CandidateKind.Host, priority: priority });
+        this.announce(CandidateKind.Host, address, priority, null);
+        let index = this.locals.length - 1;
+        for (r in 0usize..this.remotes.length) {
+            this.pairWith(index, r);
+        }
+    }
+
+    /// Asks the STUN server `server`, from socket `socket`, for a server-reflexive candidate.
+    public fn gather(borrow mut this, socket: usize, server: StunAddress) {
+        let _ = this.gatherings.push(Gathering {
+            socket: socket,
+            server: server,
+            transaction: newTransaction(),
+            sentAt: 0,
+            tries: 0,
+            done: false,
+        });
+    }
+
+    /// A remote candidate, from the SDP or trickled.
+    public fn addRemote(borrow mut this, candidate: borrow IceCandidate) {
+        for (r in this.remotes.view()) {
+            if (r.address.same(candidate.address)) {
+                return;
+            }
+        }
+        let _ = this.remotes.push(Remote { address: candidate.address, priority: candidate.priority });
+        let index = this.remotes.length - 1;
+        for (l in 0usize..this.locals.length) {
+            this.pairWith(l, index);
+        }
+    }
+
+    /// A local candidate to trickle to the other side, if one is new.
+    public fn takeCandidate(borrow mut this) -> IceCandidate? {
+        if (this.trickle.length == 0) {
+            return null;
+        }
+        return Some(this.trickle.remove(0));
+    }
+
+    /// Whether the pair in use goes to `from` on `socket`.
+    public fn isSelected(borrow this, socket: usize, from: StunAddress) -> bool {
+        match (this.selected) {
+            Some(p) => {
+                let pair = this.pairs[p];
+                return this.locals[pair.local].socket == socket && this.remotes[pair.remote].address.same(from);
+            },
+            null => {
+                return false;
+            },
+        }
+    }
+
+    /// Where the pair in use sends: the socket and the remote address.
+    public fn route(borrow this) -> Transmit? {
+        let p = this.selected?;
+        let pair = this.pairs[p];
+        return Some(Transmit {
+            socket: this.locals[pair.local].socket,
+            to: this.remotes[pair.remote].address,
+            bytes: Vector<u8>.create(),
+        });
+    }
+
+    /// `bytes` to the other side on the pair in use; null while there is none.
+    public fn send(borrow this, bytes: Slice<u8>) -> Transmit? {
+        var t = this.route()?;
+        if (t.bytes.extend(bytes) is Err(_)) {
+            return null;
+        }
+        return Some(t);
+    }
+
+    /// A datagram that came to socket `socket` from `from`: true when it was STUN and the agent took it, false when
+    /// it is the application's (DTLS, RTP or RTCP).
+    public fn receive(borrow mut this, socket: usize, from: StunAddress, bytes: Slice<u8>, now: u64) -> bool {
+        if (!isStun(bytes)) {
+            if (this.isSelected(socket, from)) {
+                this.lastHeard = now;
+            }
+            return false;
+        }
+        let message = StunMessage.decode(bytes) ?? { return true; };
+        if (message.method != BINDING) {
+            return true;
+        }
+        if (message.has(FINGERPRINT) && !checkFingerprint(bytes)) {
+            return true;
+        }
+        match (message.messageClass) {
+            StunClass.Request => {
+                this.request(socket, from, borrow message, bytes, now);
+            },
+            StunClass.Success => {
+                this.answer(from, borrow message, bytes, true, now);
+            },
+            StunClass.Error => {
+                this.answer(from, borrow message, bytes, false, now);
+            },
+            StunClass.Indication => {},
+        }
+        return true;
+    }
+
+    /// The next datagram the agent wants sent, if any; call it every few milliseconds (`PACE`, 20 ms), and until it
+    /// gives null.
+    public fn poll(borrow mut this, now: u64) -> Transmit? {
+        if (this.pending.length > 0) {
+            return Some(this.pending.remove(0));
+        }
+        for (g in 0usize..this.gatherings.length) {
+            let gathering = this.gatherings[g];
+            if (gathering.done || gathering.tries >= TRIES) {
+                continue;
+            }
+            if (gathering.tries == 0 || now >= gathering.sentAt + rto(gathering.tries)) {
+                this.gatherings[g].tries = gathering.tries + 1;
+                this.gatherings[g].sentAt = now;
+                let request = StunMessage.create(BINDING, StunClass.Request, gathering.transaction);
+                return Some(Transmit {
+                    socket: gathering.socket,
+                    to: gathering.server,
+                    bytes: request.encode(Vector<u8>.create().view(), true),
+                });
+            }
+        }
+        match (this.state) {
+            IceState.Failed => {
+                return null;
+            },
+            IceState.Connected => {
+                if (now >= this.lastHeard + SILENCE) {
+                    this.state = IceState.Failed;
+                    return null;
+                }
+            },
+            IceState.Checking => {
+                if (now >= this.started + SILENCE) {
+                    this.state = IceState.Failed;
+                    return null;
+                }
+            },
+        }
+        if (this.remotePassword.length == 0) {
+            return null;
+        }
+        // Retransmissions first, then the best waiting pair, at most one check per PACE.
+        if (now < this.lastCheck + PACE) {
+            return null;
+        }
+        for (p in 0usize..this.pairs.length) {
+            let pair = this.pairs[p];
+            if (!(pair.state is PairState.InProgress)) {
+                continue;
+            }
+            if (now >= pair.sentAt + rto(pair.tries)) {
+                if (pair.tries >= TRIES) {
+                    this.pairs[p].state = PairState.Failed;
+                    continue;
+                }
+                return Some(this.check(p, now));
+            }
+        }
+        var best: usize? = null;
+        var bestPriority: u64 = 0;
+        for (p in 0usize..this.pairs.length) {
+            if (this.pairs[p].state is PairState.Waiting) {
+                let priority = this.priorityOf(p);
+                if (best == null || priority > bestPriority) {
+                    best = Some(p);
+                    bestPriority = priority;
+                }
+            }
+        }
+        if (best is Some(p)) {
+            this.pairs[p].tries = 0;
+            this.pairs[p].transaction = newTransaction();
+            return Some(this.check(p, now));
+        }
+        // The pair in use: a keep-alive check every KEEPALIVE.
+        if (this.selected is Some(p) && now >= this.keepaliveAt + KEEPALIVE) {
+            this.keepaliveAt = now;
+            this.keepalive = newTransaction();
+            this.lastCheck = now;
+            return Some(this.requestOn(p, this.keepalive));
+        }
+        return null;
+    }
+
+    fn priorityOf(borrow this, p: usize) -> u64 {
+        let pair = this.pairs[p];
+        let l = this.locals[pair.local].priority;
+        let r = this.remotes[pair.remote].priority;
+        return if (this.controlling) pairPriority(l, r) else pairPriority(r, l);
+    }
+
+    fn check(borrow mut this, p: usize, now: u64) -> Transmit {
+        this.pairs[p].state = PairState.InProgress;
+        this.pairs[p].sentAt = now;
+        this.pairs[p].tries = this.pairs[p].tries + 1;
+        this.lastCheck = now;
+        return this.requestOn(p, this.pairs[p].transaction);
+    }
+
+    /// A Binding request on pair `p` with `transaction`.
+    fn requestOn(borrow this, p: usize, transaction: [u8; 12]) -> Transmit {
+        let pair = this.pairs[p];
+        let local = this.locals[pair.local];
+        var m = StunMessage.create(BINDING, StunClass.Request, transaction);
+        var user = String.create();
+        let _ = user.append(this.remoteUfrag.view());
+        let _ = user.append(":");
+        let _ = user.append(this.localUfrag.view());
+        let _ = m.add(USERNAME, user.view().bytes());
+        let _ = m.addU32(PRIORITY, candidatePriority(CandidateKind.PeerReflexive, (local.priority >> 8) & 0xFFFF, 1));
+        if (this.controlling) {
+            let _ = m.addU64(ICE_CONTROLLING, this.tieBreaker);
+            let _ = m.add(USE_CANDIDATE, Vector<u8>.create().view());
+        } else {
+            let _ = m.addU64(ICE_CONTROLLED, this.tieBreaker);
+        }
+        return Transmit {
+            socket: local.socket,
+            to: this.remotes[pair.remote].address,
+            bytes: m.encode(this.remotePassword.view().bytes(), true),
+        };
+    }
+
+    /// A Binding request from the other side: answered, and its pair checked (a triggered check).
+    fn request(borrow mut this, socket: usize, from: StunAddress, message: borrow StunMessage, bytes: Slice<u8>, now: u64) {
+        if (!checkIntegrity(bytes, this.localPassword.view().bytes())) {
+            return;
+        }
+        let user = message.get(USERNAME) ?? { return; };
+        let ufrag = this.localUfrag.view().bytes();
+        if (user.length <= ufrag.length || user[0..ufrag.length] != ufrag || user[ufrag.length] != ':') {
+            return;
+        }
+        // A role conflict (RFC 8445 §7.3.1.1).
+        let theirs = tieOf(message.get(if (this.controlling) ICE_CONTROLLING else ICE_CONTROLLED));
+        if (theirs is Some(t)) {
+            let keep = if (this.controlling) this.tieBreaker >= t else this.tieBreaker < t;
+            if (keep) {
+                var refusal = StunMessage.create(BINDING, StunClass.Error, message.transaction);
+                let _ = refusal.add(ERROR_CODE, [0u8, 0, 4, 87][..]);
+                let _ = this.pending.push(Transmit {
+                    socket: socket,
+                    to: from,
+                    bytes: refusal.encode(this.localPassword.view().bytes(), true),
+                });
+                return;
+            }
+            this.controlling = !this.controlling;
+        }
+        var reply = StunMessage.create(BINDING, StunClass.Success, message.transaction);
+        let _ = reply.addAddress(XOR_MAPPED_ADDRESS, from);
+        let _ = this.pending.push(Transmit {
+            socket: socket,
+            to: from,
+            bytes: reply.encode(this.localPassword.view().bytes(), true),
+        });
+        // The remote, peer-reflexive when it is new, and the pair.
+        var remote: usize? = null;
+        for (r in 0usize..this.remotes.length) {
+            if (this.remotes[r].address.same(from)) {
+                remote = Some(r);
+            }
+        }
+        if (remote == null) {
+            let _ = this.remotes.push(Remote { address: from, priority: message.getU32(PRIORITY) ?? 0 });
+            remote = Some(this.remotes.length - 1);
+        }
+        var local: usize? = null;
+        for (l in 0usize..this.locals.length) {
+            if (this.locals[l].socket == socket && this.locals[l].kind is CandidateKind.Host) {
+                local = Some(l);
+            }
+        }
+        let r = remote!;
+        let l = local ?? { return; };
+        let p = this.pairWith(l, r) ?? { return; };
+        if (this.isSelected(socket, from)) {
+            this.lastHeard = now;
+        }
+        if (this.pairs[p].state is PairState.Failed) {
+            this.pairs[p].state = PairState.Waiting;
+        }
+        if (!this.controlling && message.has(USE_CANDIDATE)) {
+            this.pairs[p].nominated = true;
+            if (this.pairs[p].state is PairState.Succeeded) {
+                this.select(p, now);
+            }
+        }
+    }
+
+    /// A response to a check, a keep-alive or a gathering request.
+    fn answer(borrow mut this, from: StunAddress, message: borrow StunMessage, bytes: Slice<u8>, success: bool, now: u64) {
+        for (g in 0usize..this.gatherings.length) {
+            if (this.gatherings[g].transaction == message.transaction && !this.gatherings[g].done) {
+                this.gatherings[g].done = true;
+                if (success && message.address(XOR_MAPPED_ADDRESS) is Some(mapped)) {
+                    let socket = this.gatherings[g].socket;
+                    var base: StunAddress? = null;
+                    for (l in this.locals.view()) {
+                        if (l.socket == socket && l.kind is CandidateKind.Host) {
+                            base = Some(l.address);
+                        }
+                    }
+                    for (l in this.locals.view()) {
+                        if (l.address.same(mapped)) {
+                            return;
+                        }
+                    }
+                    let priority = candidatePriority(CandidateKind.ServerReflexive, 65535, 1);
+                    let _ = this.locals.push(Local {
+                        address: mapped,
+                        socket: socket,
+                        kind: CandidateKind.ServerReflexive,
+                        priority: priority,
+                    });
+                    this.announce(CandidateKind.ServerReflexive, mapped, priority, base);
+                }
+                return;
+            }
+        }
+        if (!checkIntegrity(bytes, this.remotePassword.view().bytes())) {
+            return;
+        }
+        if (message.transaction == this.keepalive) {
+            this.lastHeard = now;
+            return;
+        }
+        for (p in 0usize..this.pairs.length) {
+            if (!(this.pairs[p].state is PairState.InProgress) || this.pairs[p].transaction != message.transaction) {
+                continue;
+            }
+            if (!this.remotes[this.pairs[p].remote].address.same(from)) {
+                return;
+            }
+            if (!success) {
+                if (message.errorCode() == Some(487u16)) {
+                    this.controlling = !this.controlling;
+                    this.pairs[p].state = PairState.Waiting;
+                } else {
+                    this.pairs[p].state = PairState.Failed;
+                }
+                return;
+            }
+            this.pairs[p].state = PairState.Succeeded;
+            if (this.controlling || this.pairs[p].nominated || this.selected == null) {
+                this.select(p, now);
+            }
+            return;
+        }
+    }
+
+    fn select(borrow mut this, p: usize, now: u64) {
+        if (this.selected is Some(s)) {
+            // A nominated pair replaces a provisional one; a working selection otherwise stays.
+            if (s == p || this.pairs[s].nominated || !this.pairs[p].nominated) {
+                return;
+            }
+        }
+        this.selected = Some(p);
+        this.state = IceState.Connected;
+        this.lastHeard = now;
+        this.keepaliveAt = now;
+    }
+
+    /// The pair of local `l` and remote `r` (made when new; not for server-reflexive locals, whose base is paired, nor
+    /// across address families).
+    fn pairWith(borrow mut this, l: usize, r: usize) -> usize? {
+        let local = this.locals[l];
+        if (local.kind is CandidateKind.ServerReflexive || local.address.v6 != this.remotes[r].address.v6) {
+            return null;
+        }
+        for (p in 0usize..this.pairs.length) {
+            if (this.pairs[p].local == l && this.pairs[p].remote == r) {
+                return Some(p);
+            }
+        }
+        let _ = this.pairs.push(Pair {
+            local: l,
+            remote: r,
+            state: PairState.Waiting,
+            transaction: newTransaction(),
+            sentAt: 0,
+            tries: 0,
+            nominated: false,
+        });
+        return Some(this.pairs.length - 1);
+    }
+
+    fn announce(borrow mut this, kind: CandidateKind, address: StunAddress, priority: u32, related: StunAddress?) {
+        var foundation = String.create();
+        let _ = foundation.appendNumber(typePreference(kind) as i64 * 1000 + (address.ip[3] as i64));
+        let _ = this.trickle.push(IceCandidate {
+            foundation: foundation,
+            component: 1,
+            priority: priority,
+            address: address,
+            kind: kind,
+            related: related,
+        });
+    }
+}
+
+fn rto(tries: u32) -> u64 {
+    let shift = if (tries > 4) 4u32 else tries;
+    return FIRST_RTO << (shift as u64);
+}
+
+fn tieOf(value: Slice<u8>?) -> u64? {
+    let v = value?;
+    if (v.length < 8) {
+        return null;
+    }
+    var t: u64 = 0;
+    for (k in 0usize..8) {
+        t = (t << 8) | (v[k] as u64);
+    }
+    return Some(t);
+}
+
+fn newTransaction() -> [u8; 12] {
+    var t = [0u8; 12];
+    let _ = Random.fill(mut t[..]);
+    return t;
+}
+
+/// `n` characters of ICE's alphabet (RFC 8839 §5.4: letters, digits, `+` and `/`).
+fn randomText(n: usize) -> String {
+    let alphabet: StringView = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var bytes = [0u8; 32];
+    let _ = Random.fill(mut bytes[..]);
+    var out = String.create();
+    for (k in 0usize..n) {
+        let at = (bytes[k] & 63) as usize;
+        let _ = out.append(alphabet[at..at + 1]);
+    }
+    return out;
+}
