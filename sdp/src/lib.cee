@@ -1,0 +1,480 @@
+// SDP (RFC 8866) as WebRTC uses it (RFC 8829's JSEP, RFC 8839's ICE attributes, RFC 8842's DTLS ones): a session's
+// BUNDLE group and its media sections, each with its codecs, ICE credentials and candidates, DTLS fingerprint and
+// role, direction, header extensions and SSRCs. Read leniently (unknown lines are kept aside, session-level ICE and
+// DTLS attributes apply to every section) and written as JSEP writes it, with CRLF line ends.
+
+/// Which way a section's media flows.
+public enum Direction {
+    SendRecv,
+    SendOnly,
+    RecvOnly,
+    Inactive,
+}
+
+/// A codec: `a=rtpmap`, with its `a=fmtp` and `a=rtcp-fb` lines.
+public struct Codec {
+    public payloadType: u8;
+    public name: String;
+    public clockRate: u32;
+    public channels: u32;
+    public parameters: String;
+    public feedback: Vector<String>;
+}
+
+/// An RTP header extension: `a=extmap:<id> <uri>`.
+public struct Extension {
+    public id: u8;
+    public uri: String;
+}
+
+/// An `m=` section.
+public struct MediaSection {
+    /// "audio", "video" or "application".
+    public kind: String;
+    /// 0 rejects the section (in an answer).
+    public port: u16;
+    public protocol: String;
+    public formats: Vector<u8>;
+    public mid: String;
+    public ufrag: String;
+    public password: String;
+    /// The fingerprint's hash ("sha-256") and value (colon-separated hex).
+    public fingerprintHash: String;
+    public fingerprint: String;
+    /// "actpass", "active" or "passive".
+    public setup: String;
+    /// `a=candidate:` lines' values (after "candidate:").
+    public candidates: Vector<String>;
+    public endOfCandidates: bool;
+    public rtcpMux: bool;
+    public direction: Direction;
+    public codecs: Vector<Codec>;
+    public extensions: Vector<Extension>;
+    public ssrcs: Vector<u32>;
+    public cname: String;
+    /// The lines this reader does not know, kept as they were (without `a=`).
+    public others: Vector<String>;
+
+    /// An empty section of `kind`, sending and receiving, with rtcp-mux.
+    public fn create(kind: StringView, mid: StringView) -> MediaSection => MediaSection {
+        kind: textOf(kind),
+        port: 9,
+        protocol: textOf("UDP/TLS/RTP/SAVPF"),
+        formats: Vector<u8>.create(),
+        mid: textOf(mid),
+        ufrag: String.create(),
+        password: String.create(),
+        fingerprintHash: textOf("sha-256"),
+        fingerprint: String.create(),
+        setup: String.create(),
+        candidates: Vector<String>.create(),
+        endOfCandidates: false,
+        rtcpMux: true,
+        direction: Direction.SendRecv,
+        codecs: Vector<Codec>.create(),
+        extensions: Vector<Extension>.create(),
+        ssrcs: Vector<u32>.create(),
+        cname: String.create(),
+        others: Vector<String>.create(),
+    };
+
+    /// Adds a codec (and its payload type to the `m=` line's formats).
+    public fn addCodec(borrow mut this, payloadType: u8, name: StringView, clockRate: u32, channels: u32, parameters: StringView) {
+        let _ = this.formats.push(payloadType);
+        let _ = this.codecs.push(Codec {
+            payloadType: payloadType,
+            name: textOf(name),
+            clockRate: clockRate,
+            channels: channels,
+            parameters: textOf(parameters),
+            feedback: Vector<String>.create(),
+        });
+    }
+
+    /// The codec named `name` (any case), if the section has it.
+    public fn codecNamed(borrow this, name: StringView) -> usize? {
+        for (k in 0usize..this.codecs.length) {
+            if (this.codecs[k].name.view().equalsIgnoreAsciiCase(name)) {
+                return Some(k);
+            }
+        }
+        return null;
+    }
+
+    /// The extension with `uri`, if the section has it.
+    public fn extensionId(borrow this, uri: StringView) -> u8? {
+        for (e in this.extensions.view()) {
+            if (e.uri.view() == uri) {
+                return Some(e.id);
+            }
+        }
+        return null;
+    }
+}
+
+/// A session description.
+public struct SessionDescription {
+    public sessionId: u64;
+    public version: u64;
+    /// The mids of `a=group:BUNDLE`.
+    public bundle: Vector<String>;
+    public media: Vector<MediaSection>;
+
+    public fn create(sessionId: u64) -> SessionDescription => SessionDescription {
+        sessionId: sessionId,
+        version: 2,
+        bundle: Vector<String>.create(),
+        media: Vector<MediaSection>.create(),
+    };
+
+    /// A description read from `text`; null when it has no `v=0` or a malformed `m=` line.
+    public fn parse(text: StringView) -> SessionDescription? {
+        var description = SessionDescription.create(0);
+        // Session-level ICE and DTLS attributes, which every section without its own takes.
+        var defaults = MediaSection.create("", "");
+        var sawVersion = false;
+        var inMedia = false;
+        for (raw in text.split("\n")) {
+            let line = raw.trim();
+            if (line.length < 2 || line[1..2] != "=") {
+                continue;
+            }
+            let kind = line[0..1];
+            let value = line[2..];
+            if (kind == "v") {
+                sawVersion = value == "0";
+            } else if (kind == "o") {
+                var k = 0;
+                for (field in value.split(" ")) {
+                    if (k == 1) {
+                        description.sessionId = NumberParsing.parseU64(field.bytes()) ?? 0;
+                    } else if (k == 2) {
+                        description.version = NumberParsing.parseU64(field.bytes()) ?? 0;
+                    }
+                    k += 1;
+                }
+            } else if (kind == "m") {
+                var section = MediaSection.create("", "");
+                var k = 0;
+                for (field in value.split(" ")) {
+                    if (k == 0) {
+                        section.kind = textOf(field);
+                    } else if (k == 1) {
+                        let port = field.splitOnce("/");
+                        section.port = NumberParsing.parseU16(match (port) {
+                            Some(h) => h.left.bytes(),
+                            null => field.bytes(),
+                        }) ?? { return null; };
+                    } else if (k == 2) {
+                        section.protocol = textOf(field);
+                    } else if (field.length > 0) {
+                        if (NumberParsing.parseU8(field.bytes()) is Some(pt)) {
+                            let _ = section.formats.push(pt);
+                        }
+                    }
+                    k += 1;
+                }
+                if (k < 3) {
+                    return null;
+                }
+                section.rtcpMux = false;
+                let _ = description.media.push(section);
+                inMedia = true;
+            } else if (kind == "a") {
+                if (inMedia) {
+                    let last = description.media.length - 1;
+                    attribute(mut description.media[last], value, false);
+                } else if (value.startsWith("group:BUNDLE")) {
+                    for (mid in value[12..].split(" ")) {
+                        if (mid.length > 0) {
+                            let _ = description.bundle.push(textOf(mid));
+                        }
+                    }
+                } else {
+                    attribute(mut defaults, value, true);
+                }
+            }
+        }
+        if (!sawVersion) {
+            return null;
+        }
+        for (k in 0usize..description.media.length) {
+            if (description.media[k].ufrag.length == 0) {
+                let _ = description.media[k].ufrag.append(defaults.ufrag.view());
+            }
+            if (description.media[k].password.length == 0) {
+                let _ = description.media[k].password.append(defaults.password.view());
+            }
+            if (description.media[k].fingerprint.length == 0) {
+                description.media[k].fingerprintHash.clear();
+                let _ = description.media[k].fingerprintHash.append(defaults.fingerprintHash.view());
+                let _ = description.media[k].fingerprint.append(defaults.fingerprint.view());
+            }
+            if (description.media[k].setup.length == 0) {
+                let _ = description.media[k].setup.append(defaults.setup.view());
+            }
+        }
+        return Some(description);
+    }
+
+    /// The description as text, CRLF after every line.
+    public fn format(borrow this) -> String {
+        var out = String.create();
+        line(mut out, "v=0");
+        let _ = out.append("o=- ");
+        let _ = out.appendNumber(truncate<i64>(this.sessionId & 0x7FFFFFFFFFFFFFFF));
+        let _ = out.append(" ");
+        let _ = out.appendNumber(truncate<i64>(this.version));
+        line(mut out, " IN IP4 127.0.0.1");
+        line(mut out, "s=-");
+        line(mut out, "t=0 0");
+        if (this.bundle.length > 0) {
+            let _ = out.append("a=group:BUNDLE");
+            for (mid in this.bundle.view()) {
+                let _ = out.append(" ");
+                let _ = out.append(mid.view());
+            }
+            line(mut out, "");
+        }
+        line(mut out, "a=msid-semantic: WMS *");
+        for (m in this.media.view()) {
+            let _ = out.append("m=");
+            let _ = out.append(m.kind.view());
+            let _ = out.append(" ");
+            let _ = out.appendNumber(m.port as i64);
+            let _ = out.append(" ");
+            let _ = out.append(m.protocol.view());
+            for (pt in m.formats.view()) {
+                let _ = out.append(" ");
+                let _ = out.appendNumber(pt as i64);
+            }
+            line(mut out, "");
+            line(mut out, "c=IN IP4 0.0.0.0");
+            line(mut out, "a=rtcp:9 IN IP4 0.0.0.0");
+            attr(mut out, "ice-ufrag:", m.ufrag.view());
+            attr(mut out, "ice-pwd:", m.password.view());
+            line(mut out, "a=ice-options:trickle");
+            if (m.fingerprint.length > 0) {
+                let _ = out.append("a=fingerprint:");
+                let _ = out.append(m.fingerprintHash.view());
+                let _ = out.append(" ");
+                line(mut out, m.fingerprint.view());
+            }
+            attr(mut out, "setup:", m.setup.view());
+            attr(mut out, "mid:", m.mid.view());
+            for (e in m.extensions.view()) {
+                let _ = out.append("a=extmap:");
+                let _ = out.appendNumber(e.id as i64);
+                let _ = out.append(" ");
+                line(mut out, e.uri.view());
+            }
+            line(mut out, match (m.direction) {
+                Direction.SendRecv => "a=sendrecv",
+                Direction.SendOnly => "a=sendonly",
+                Direction.RecvOnly => "a=recvonly",
+                Direction.Inactive => "a=inactive",
+            });
+            if (m.rtcpMux) {
+                line(mut out, "a=rtcp-mux");
+            }
+            for (c in m.codecs.view()) {
+                let _ = out.append("a=rtpmap:");
+                let _ = out.appendNumber(c.payloadType as i64);
+                let _ = out.append(" ");
+                let _ = out.append(c.name.view());
+                let _ = out.append("/");
+                let _ = out.appendNumber(c.clockRate as i64);
+                if (c.channels > 1) {
+                    let _ = out.append("/");
+                    let _ = out.appendNumber(c.channels as i64);
+                }
+                line(mut out, "");
+                for (f in c.feedback.view()) {
+                    let _ = out.append("a=rtcp-fb:");
+                    let _ = out.appendNumber(c.payloadType as i64);
+                    let _ = out.append(" ");
+                    line(mut out, f.view());
+                }
+                if (c.parameters.length > 0) {
+                    let _ = out.append("a=fmtp:");
+                    let _ = out.appendNumber(c.payloadType as i64);
+                    let _ = out.append(" ");
+                    line(mut out, c.parameters.view());
+                }
+            }
+            for (s in m.ssrcs.view()) {
+                let _ = out.append("a=ssrc:");
+                let _ = out.appendNumber(s as i64);
+                let _ = out.append(" cname:");
+                line(mut out, m.cname.view());
+            }
+            for (c in m.candidates.view()) {
+                attr(mut out, "candidate:", c.view());
+            }
+            if (m.endOfCandidates) {
+                line(mut out, "a=end-of-candidates");
+            }
+        }
+        return out;
+    }
+}
+
+/// One `a=` line's value into `m` (`session`: a session-level line, of which only ICE and DTLS ones count).
+fn attribute(m: borrow mut MediaSection, value: StringView, session: bool) {
+    let halves = value.splitOnce(":");
+    let name = match (halves) {
+        Some(h) => h.left,
+        null => value,
+    };
+    let rest = match (halves) {
+        Some(h) => h.right,
+        null => "",
+    };
+    if (name == "ice-ufrag") {
+        set(mut m.ufrag, rest);
+    } else if (name == "ice-pwd") {
+        set(mut m.password, rest);
+    } else if (name == "fingerprint") {
+        if (rest.splitOnce(" ") is Some(f)) {
+            set(mut m.fingerprintHash, f.left);
+            set(mut m.fingerprint, f.right.trim());
+        }
+    } else if (name == "setup") {
+        set(mut m.setup, rest);
+    } else if (session) {
+        return;
+    } else if (name == "mid") {
+        set(mut m.mid, rest);
+    } else if (name == "candidate") {
+        let _ = m.candidates.push(textOf(rest));
+    } else if (name == "end-of-candidates") {
+        m.endOfCandidates = true;
+    } else if (name == "rtcp-mux") {
+        m.rtcpMux = true;
+    } else if (name == "sendrecv") {
+        m.direction = Direction.SendRecv;
+    } else if (name == "sendonly") {
+        m.direction = Direction.SendOnly;
+    } else if (name == "recvonly") {
+        m.direction = Direction.RecvOnly;
+    } else if (name == "inactive") {
+        m.direction = Direction.Inactive;
+    } else if (name == "rtpmap") {
+        // "<pt> <name>/<rate>[/<channels>]"
+        let parts = rest.splitOnce(" ") ?? { return; };
+        let pt = NumberParsing.parseU8(parts.left.bytes()) ?? { return; };
+        var codec = Codec {
+            payloadType: pt,
+            name: String.create(),
+            clockRate: 0,
+            channels: 1,
+            parameters: String.create(),
+            feedback: Vector<String>.create(),
+        };
+        var k = 0;
+        for (field in parts.right.split("/")) {
+            if (k == 0) {
+                set(mut codec.name, field);
+            } else if (k == 1) {
+                codec.clockRate = NumberParsing.parseU32(field.bytes()) ?? 0;
+            } else if (k == 2) {
+                codec.channels = NumberParsing.parseU32(field.bytes()) ?? 1;
+            }
+            k += 1;
+        }
+        let at = codecAt(m, pt);
+        match (at) {
+            Some(i) => {
+                m.codecs[i].name = codec.name;
+                m.codecs[i].clockRate = codec.clockRate;
+                m.codecs[i].channels = codec.channels;
+            },
+            null => {
+                let _ = m.codecs.push(codec);
+            },
+        }
+    } else if (name == "fmtp" || name == "rtcp-fb") {
+        let parts = rest.splitOnce(" ") ?? { return; };
+        let pt = NumberParsing.parseU8(parts.left.bytes()) ?? { return; };
+        let i = codecAt(m, pt) ?? {
+            let _ = m.codecs.push(Codec {
+                payloadType: pt,
+                name: String.create(),
+                clockRate: 0,
+                channels: 1,
+                parameters: String.create(),
+                feedback: Vector<String>.create(),
+            });
+            m.codecs.length - 1
+        };
+        if (name == "fmtp") {
+            set(mut m.codecs[i].parameters, parts.right);
+        } else {
+            let _ = m.codecs[i].feedback.push(textOf(parts.right));
+        }
+    } else if (name == "extmap") {
+        let parts = rest.splitOnce(" ") ?? { return; };
+        let id = match (parts.left.splitOnce("/")) {
+            Some(h) => h.left,
+            null => parts.left,
+        };
+        if (NumberParsing.parseU8(id.bytes()) is Some(n)) {
+            let uri = match (parts.right.splitOnce(" ")) {
+                Some(h) => h.left,
+                null => parts.right,
+            };
+            let _ = m.extensions.push(Extension { id: n, uri: textOf(uri) });
+        }
+    } else if (name == "ssrc") {
+        let parts = rest.splitOnce(" ") ?? { return; };
+        let ssrc = NumberParsing.parseU32(parts.left.bytes()) ?? { return; };
+        var known = false;
+        for (s in m.ssrcs.view()) {
+            if (s == ssrc) {
+                known = true;
+            }
+        }
+        if (!known) {
+            let _ = m.ssrcs.push(ssrc);
+        }
+        if (parts.right.startsWith("cname:") && m.cname.length == 0) {
+            set(mut m.cname, parts.right[6..]);
+        }
+    } else {
+        let _ = m.others.push(textOf(value));
+    }
+}
+
+fn codecAt(m: borrow MediaSection, pt: u8) -> usize? {
+    for (k in 0usize..m.codecs.length) {
+        if (m.codecs[k].payloadType == pt) {
+            return Some(k);
+        }
+    }
+    return null;
+}
+
+fn textOf(text: StringView) -> String {
+    var s = String.create();
+    let _ = s.append(text);
+    return s;
+}
+
+fn set(target: borrow mut String, text: StringView) {
+    target.clear();
+    let _ = target.append(text);
+}
+
+fn line(out: borrow mut String, text: StringView) {
+    let _ = out.append(text);
+    let _ = out.append("\r\n");
+}
+
+fn attr(out: borrow mut String, name: StringView, value: StringView) {
+    if (value.length == 0) {
+        return;
+    }
+    let _ = out.append("a=");
+    let _ = out.append(name);
+    line(mut out, value);
+}

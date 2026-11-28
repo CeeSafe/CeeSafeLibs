@@ -1,0 +1,60 @@
+// The MAUI app's offer (SIPSorcery's, captured from tools/maui-peer), a Chrome-style one, and descriptions written and
+// read back.
+
+const SIPSORCERY: StringView = "v=0\r\no=- 19946 0 IN IP4 127.0.0.1\r\ns=sipsorcery\r\nt=0 0\r\na=group:BUNDLE 0\r\nm=audio 9 UDP/TLS/RTP/SAVP 111 101\r\nc=IN IP4 0.0.0.0\r\na=ice-ufrag:QCVN\r\na=ice-pwd:RMTEEWSJRLFKSHWADDPOQVLE\r\na=fingerprint:sha-256 95:D2:CE:CD:15:7D:18:1F:C7:11:6D:C6:23:1E:F8:29:E0:24:89:AB:70:75:B4:AD:F4:0F:92:B9:41:46:AC:E5\r\na=setup:actpass\r\na=candidate:2372358148 1 udp 2113937663 172.20.10.3 50088 typ host generation 0\r\na=ice-options:ice2,trickle\r\na=mid:0\r\na=rtpmap:111 OPUS/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na=rtcp-mux\r\na=rtcp:9 IN IP4 0.0.0.0\r\na=end-of-candidates\r\na=sendrecv\r\na=ssrc:980739456 cname:ee429513-9855-48b5-9134-ce9e93742ef6\r\n";
+
+@test
+fn theMauiAppsOfferIsRead() -> Result<void, TestFailure> {
+    let d = SessionDescription.parse(SIPSORCERY)!;
+    Check.equalU64(19946, d.sessionId)?;
+    Check.isTrue(d.bundle.length == 1 && d.bundle[0].view() == "0", "BUNDLE 0")?;
+    Check.equalU64(1, d.media.length as u64)?;
+    let m = borrow d.media[0];
+    Check.isTrue(m.kind.view() == "audio" && m.port == 9 && m.protocol.view() == "UDP/TLS/RTP/SAVP", "m= line")?;
+    Check.isTrue(m.formats.length == 2 && m.formats[0] == 111 && m.formats[1] == 101, "formats")?;
+    Check.isTrue(m.ufrag.view() == "QCVN" && m.password.view() == "RMTEEWSJRLFKSHWADDPOQVLE", "ICE credentials")?;
+    Check.isTrue(m.fingerprintHash.view() == "sha-256" && m.fingerprint.view().startsWith("95:D2:CE"), "fingerprint")?;
+    Check.isTrue(m.setup.view() == "actpass" && m.mid.view() == "0", "setup and mid")?;
+    Check.isTrue(m.candidates.length == 1 && m.candidates[0].view().startsWith("2372358148 1 udp"), "candidate")?;
+    Check.isTrue(m.endOfCandidates && m.rtcpMux && m.direction is Direction.SendRecv, "flags")?;
+    let opus = m.codecNamed("opus")!;
+    Check.isTrue(m.codecs[opus].payloadType == 111 && m.codecs[opus].clockRate == 48000 && m.codecs[opus].channels == 2, "Opus")?;
+    Check.isTrue(m.codecs[opus].parameters.view() == "minptime=10;useinbandfec=1", "Opus's fmtp")?;
+    return Check.isTrue(m.ssrcs.length == 1 && m.ssrcs[0] == 980739456 && m.cname.view().startsWith("ee429513"), "SSRC");
+}
+
+@test
+fn sessionLevelAttributesReachEverySection() -> Result<void, TestFailure> {
+    let text = "v=0\no=- 4611731400430051336 2 IN IP4 127.0.0.1\ns=-\nt=0 0\na=ice-ufrag:abcd\na=ice-pwd:0123456789abcdefghijklmn\na=fingerprint:sha-256 AA:BB\na=setup:active\na=group:BUNDLE a v\nm=audio 9 UDP/TLS/RTP/SAVPF 111\na=mid:a\na=rtpmap:111 opus/48000/2\na=rtcp-fb:111 transport-cc\nm=video 0 UDP/TLS/RTP/SAVPF 96\na=mid:v\na=rtpmap:96 H264/90000\na=fmtp:96 packetization-mode=1;profile-level-id=42e01f\na=rtcp-fb:96 nack\na=rtcp-fb:96 nack pli\na=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\n";
+    let d = SessionDescription.parse(text)!;
+    Check.equalU64(2, d.media.length as u64)?;
+    Check.isTrue(d.media[1].ufrag.view() == "abcd" && d.media[1].setup.view() == "active", "inherited")?;
+    Check.isTrue(d.media[1].port == 0, "a rejected section")?;
+    Check.isTrue(d.media[1].codecs[0].feedback.length == 2, "two rtcp-fb")?;
+    Check.isTrue(d.media[1].extensionId("http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time") == Some(3u8), "extmap")?;
+    return Check.isTrue(d.media[0].codecs[0].feedback[0].view() == "transport-cc", "audio rtcp-fb");
+}
+
+@test
+fn aDescriptionWrittenIsReadBack() -> Result<void, TestFailure> {
+    var d = SessionDescription.create(123456789);
+    let _ = d.bundle.push(String.from("0")!);
+    var m = MediaSection.create("audio", "0");
+    m.addCodec(111, "opus", 48000, 2, "minptime=10;useinbandfec=1");
+    m.ufrag = String.from("u1x2")!;
+    m.password = String.from("p1p2p3p4p5p6p7p8p9p0p1p2")!;
+    m.fingerprint = String.from("01:02:03")!;
+    m.setup = String.from("actpass")!;
+    let _ = m.ssrcs.push(42);
+    m.cname = String.from("ceesafe")!;
+    let _ = m.candidates.push(String.from("1 1 udp 2130706431 192.168.1.2 50000 typ host")!);
+    let _ = d.media.push(m);
+    let text = d.format();
+    Check.isTrue(text.view().contains("\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\n"), "Opus lines")?;
+    Check.isTrue(text.view().contains("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"), "m= line")?;
+    let back = SessionDescription.parse(text.view())!;
+    let b = borrow back.media[0];
+    Check.isTrue(b.ufrag.view() == "u1x2" && b.fingerprint.view() == "01:02:03" && b.setup.view() == "actpass", "back")?;
+    Check.isTrue(b.candidates[0].view() == "1 1 udp 2130706431 192.168.1.2 50000 typ host", "candidate back")?;
+    return Check.isTrue(b.rtcpMux && b.ssrcs[0] == 42 && back.sessionId == 123456789, "the rest back");
+}
