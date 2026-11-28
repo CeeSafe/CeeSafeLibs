@@ -1,0 +1,155 @@
+// silkcheck: decodes an opus_demo .bit file of SILK-only packets with this package's SilkDecoder, as libopus's
+// opus_decode_frame does for SILK-only frames, checks each packet's final range against the file's, and writes 16-bit
+// little-endian stereo PCM at 48 kHz.
+//
+//   silkcheck in.bit out.pcm
+
+import opus;
+
+fn main() -> i32 {
+    let input = Process.argument(1) ?? "";
+    let output = Process.argument(2) ?? "";
+    let data = readFile(input) ?? {
+        Console.writeLine("silkcheck: cannot read the input");
+        return 2;
+    };
+    var decoder = SilkDecoder.create();
+    var control = SilkControl.create();
+    control.apiChannels = 2;
+    control.apiRate = 48000;
+    var pcm = Vector<u8>.create();
+    var at: usize = 0;
+    var packets: u64 = 0;
+    var mismatches: u64 = 0;
+    var errors: u64 = 0;
+    var lastFrameSize: usize = 960;
+    var out = [0i16; 5760 * 2];
+    while (at + 8 <= data.length) {
+        let len = be32(data.view(), at) as usize;
+        let range = be32(data.view(), at + 4);
+        at += 8;
+        if (at + len > data.length) {
+            break;
+        }
+        let packet = data.view()[at..at + len];
+        at += len;
+        packets += 1;
+        if (len == 0) {
+            // A lost packet: concealed as libopus's opus_decode_frame does for data NULL and the last packet's
+            // duration: payloadSize_ms is max(10, that duration), and SILK is called until it is covered.
+            var done: usize = 0;
+            var ec = RangeDecoder.create(packet);
+            let ms = lastFrameSize * 1000 / 48000;
+            control.payloadMs = if (ms < 10) 10 else truncate<u32>(ms);
+            while (done < lastFrameSize) {
+                let n = match (decoder.decode(mut control, 1, done == 0, mut ec, mut out[..])) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        errors += 1;
+                        break;
+                    },
+                };
+                appendPcm(mut pcm, out[0..2 * n]);
+                done += n;
+            }
+            continue;
+        }
+        let parsed = OpusPacket.parse(packet) ?? {
+            errors += 1;
+            continue;
+        };
+        if (!(parsed.mode is OpusMode.Silk)) {
+            Console.writeLine("silkcheck: a packet that is not SILK-only");
+            return 1;
+        }
+        control.internalChannels = if (parsed.stereo) 2 else 1;
+        control.internalRate = match (parsed.bandwidth) {
+            Bandwidth.Narrow => 8000,
+            Bandwidth.Medium => 12000,
+            _ => 16000,
+        };
+        let frameSize = parsed.frameSize;
+        lastFrameSize = frameSize;
+        var finalRange: u32 = 0;
+        for (f in parsed.frames.view()) {
+            let frame = packet[f.start..f.start + f.length];
+            var ec = RangeDecoder.create(frame);
+            control.payloadMs = if (frameSize * 1000 / 48000 < 10) 10 else truncate<u32>(frameSize * 1000 / 48000);
+            var done: usize = 0;
+            var first = true;
+            while (done < frameSize) {
+                let n = match (decoder.decode(mut control, 0, first, mut ec, mut out[..])) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        errors += 1;
+                        break;
+                    },
+                };
+                first = false;
+                appendPcm(mut pcm, out[0..2 * n]);
+                done += n;
+                if (n == 0) {
+                    break;
+                }
+            }
+            finalRange = ec.range;
+        }
+        if (finalRange != range) {
+            mismatches += 1;
+        }
+    }
+    let _ = File.remove(output);
+    var file = match (File.createNew(output)) {
+        Ok(f) => f,
+        Err(_) => {
+            Console.writeLine("silkcheck: cannot write the output");
+            return 2;
+        },
+    };
+    let _ = file.write(pcm.view());
+    var line = String.create();
+    let _ = line.appendNumber(truncate<i64>(packets));
+    let _ = line.append(" packets, ");
+    let _ = line.appendNumber(truncate<i64>(mismatches));
+    let _ = line.append(" range mismatches, ");
+    let _ = line.appendNumber(truncate<i64>(errors));
+    let _ = line.append(" errors");
+    Console.writeLine(line.view());
+    return if (mismatches == 0 && errors == 0) 0 else 1;
+}
+
+fn appendPcm(pcm: borrow mut Vector<u8>, samples: Slice<i16>) {
+    for (s in samples) {
+        let u = truncate<u16>(s);
+        let _ = pcm.push(truncate<u8>(u));
+        let _ = pcm.push(truncate<u8>(u >> 8));
+    }
+}
+
+fn be32(b: Slice<u8>, at: usize) -> u32 =>
+    ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | (b[at + 3] as u32);
+
+fn readFile(path: StringView) -> Vector<u8>? {
+    var file = match (File.open(path)) {
+        Ok(f) => f,
+        Err(_) => {
+            return null;
+        },
+    };
+    var all = Vector<u8>.create();
+    var piece = [0u8; 65536];
+    loop {
+        let n = match (file.read(mut piece[..])) {
+            Ok(n) => n,
+            Err(_) => {
+                return null;
+            },
+        };
+        if (n == 0) {
+            return Some(all);
+        }
+        if (all.extend(piece[0..n]) is Err(_)) {
+            return null;
+        }
+    }
+}

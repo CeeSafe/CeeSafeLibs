@@ -1,0 +1,762 @@
+// The CELT decoder (libopus 1.5.2 celt/celt_decoder.c and celt.c, float build with FLOAT_APPROX, 48 kHz, signalling
+// off as Opus uses it; BSD).
+
+const DECODE_BUFFER_SIZE: usize = 2048;
+const OVERLAP: usize = 120;
+const MAX_PERIOD: usize = 1024;
+const COMBFILTER_MINPERIOD: i32 = 15;
+const PREEMPH: f32 = 0.85000610;
+/// One channel's history in `mem`: the decode buffer and the overlap.
+const CHANNEL_MEM: usize = DECODE_BUFFER_SIZE + OVERLAP;
+const TRIM_ICDF: [u8; 11] = [126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0];
+const SPREAD_ICDF: [u8; 4] = [25, 23, 2, 0];
+const TAPSET_ICDF: [u8; 3] = [2, 1, 0];
+const COMB_GAINS: [f32; 9] = [0.3066406250, 0.2170410156, 0.1296386719, 0.4638671875, 0.2680664062, 0.0, 0.7998046875,
+    0.1000976562, 0.0];
+
+public enum CeltError {
+    BadArgument,
+    InvalidPacket,
+    InternalError,
+}
+
+/// The overlap window of CELT's 48 kHz mode (120 values), which the Opus decoder also fades with.
+public fn celtWindow() -> Slice<static, f32> => WINDOW120[..];
+
+/// A CELT decoder for one or two channels at 48 kHz.
+public struct CeltDecoder {
+    channels: usize;
+    streamChannels: usize;
+    start: usize;
+    end: usize;
+    disableInv: bool;
+    rng: u32;
+    error: bool;
+    lastPitchIndex: usize;
+    lossDuration: i32;
+    skipPlc: bool;
+    postfilterPeriod: i32;
+    postfilterPeriodOld: i32;
+    postfilterGain: f32;
+    postfilterGainOld: f32;
+    postfilterTapset: i32;
+    postfilterTapsetOld: i32;
+    prefilterAndFold: bool;
+    preemphMem: [f32; 2];
+    /// Each channel's decode buffer and overlap, then 120 values of scratch (the prefilter's output).
+    mem: Vector<f32>;
+    lpc: [f32; 48];
+    oldBandE: [f32; 42];
+    oldLogE: [f32; 42];
+    oldLogE2: [f32; 42];
+    backgroundLogE: [f32; 42];
+    /// The bands' coefficients and folding memory (`BandLayout`).
+    bands: Vector<f32>;
+    freq: Vector<f32>;
+    freq2: Vector<f32>;
+    /// The PLC's work: the excitation and its history, a filtered copy, the downsampled history, and scratch.
+    scratch: Vector<f32>;
+
+    public fn create(channels: usize) -> CeltDecoder {
+        var d = CeltDecoder {
+            channels: channels,
+            streamChannels: channels,
+            start: 0,
+            end: NB_EBANDS,
+            disableInv: channels == 1,
+            rng: 0,
+            error: false,
+            lastPitchIndex: 0,
+            lossDuration: 0,
+            skipPlc: true,
+            postfilterPeriod: 0,
+            postfilterPeriodOld: 0,
+            postfilterGain: 0.0,
+            postfilterGainOld: 0.0,
+            postfilterTapset: 0,
+            postfilterTapsetOld: 0,
+            prefilterAndFold: false,
+            preemphMem: [0.0f32; 2],
+            mem: Vector<f32>.create(),
+            lpc: [0.0f32; 48],
+            oldBandE: [0.0f32; 42],
+            oldLogE: [0.0f32; 42],
+            oldLogE2: [0.0f32; 42],
+            backgroundLogE: [0.0f32; 42],
+            bands: Vector<f32>.create(),
+            freq: Vector<f32>.create(),
+            freq2: Vector<f32>.create(),
+            scratch: Vector<f32>.create(),
+        };
+        let _ = d.mem.resize(channels * CHANNEL_MEM + OVERLAP, 0.0);
+        let _ = d.bands.resize(bandBufferLength(), 0.0);
+        let _ = d.freq.resize(960, 0.0);
+        let _ = d.freq2.resize(960, 0.0);
+        let _ = d.scratch.resize(4096, 0.0);
+        d.reset();
+        return d;
+    }
+
+    /// OPUS_RESET_STATE: everything from the range state on cleared, the energy histories at -28.
+    public fn reset(borrow mut this) {
+        this.rng = 0;
+        this.error = false;
+        this.lastPitchIndex = 0;
+        this.lossDuration = 0;
+        this.postfilterPeriod = 0;
+        this.postfilterPeriodOld = 0;
+        this.postfilterGain = 0.0;
+        this.postfilterGainOld = 0.0;
+        this.postfilterTapset = 0;
+        this.postfilterTapsetOld = 0;
+        this.prefilterAndFold = false;
+        this.preemphMem = [0.0f32; 2];
+        for (i in 0usize..this.mem.length) {
+            this.mem[i] = 0.0;
+        }
+        this.lpc = [0.0f32; 48];
+        this.oldBandE = [0.0f32; 42];
+        this.oldLogE = [-28.0f32; 42];
+        this.oldLogE2 = [-28.0f32; 42];
+        this.backgroundLogE = [0.0f32; 42];
+        this.skipPlc = true;
+    }
+
+    public fn setStartBand(borrow mut this, band: usize) {
+        this.start = band;
+    }
+
+    public fn setEndBand(borrow mut this, band: usize) {
+        this.end = band;
+    }
+
+    public fn setStreamChannels(borrow mut this, channels: usize) {
+        this.streamChannels = channels;
+    }
+
+    public fn finalRange(borrow this) -> u32 => this.rng;
+
+    /// Decodes a frame of `length` bytes from `ec` (a decoder over the frame, or the Opus layer's, shared with SILK
+    /// in hybrid frames) into `pcm`, interleaved at ±1.0 full scale; gives the samples per channel.
+    public fn decode<region r>(borrow mut this, ec: borrow mut RangeDecoder<r>, length: usize, pcm: SliceMut<f32>, frameSize: usize)
+        -> Result<usize, CeltError> {
+        let lm = lmOf(frameSize) ?? { return Err(CeltError.BadArgument); };
+        if (length > 1275) {
+            return Err(CeltError.BadArgument);
+        }
+        if (length <= 1) {
+            return this.conceal(mut pcm[..], frameSize);
+        }
+        let m = 1usize << lm;
+        let n = m * 120;
+        let cc = this.channels;
+        let c = this.streamChannels;
+        let start = this.start;
+        let end = this.end;
+        let effEnd = if (end > NB_EBANDS) NB_EBANDS else end;
+        let lmi = truncate<i32>(lm);
+        if (this.lossDuration == 0) {
+            this.skipPlc = false;
+        }
+        if (c == 1) {
+            for (i in 0usize..NB_EBANDS) {
+                this.oldBandE[i] = celtFmax(this.oldBandE[i], this.oldBandE[NB_EBANDS + i]);
+            }
+        }
+        var totalBits = truncate<i32>(length * 8);
+        var tell = ec.tell();
+        var silence = false;
+        if (tell >= totalBits) {
+            silence = true;
+        } else if (tell == 1) {
+            silence = ec.bitLogp(15);
+        }
+        if (silence) {
+            tell = totalBits;
+            ec.totalBits += tell - ec.tell();
+        }
+        var postfilterGain: f32 = 0.0;
+        var postfilterPitch: i32 = 0;
+        var postfilterTapset: i32 = 0;
+        if (start == 0 && tell + 16 <= totalBits) {
+            if (ec.bitLogp(1)) {
+                let octave = ec.uint(6);
+                postfilterPitch = truncate<i32>((16u32 << octave) + ec.bits(4 + octave)) - 1;
+                let qg = ec.bits(3);
+                if (ec.tell() + 2 <= totalBits) {
+                    postfilterTapset = truncate<i32>(ec.icdf(TAPSET_ICDF[..], 2));
+                }
+                postfilterGain = 0.09375 * round<f32>(qg + 1);
+            }
+            tell = ec.tell();
+        }
+        var isTransient = false;
+        if (lm > 0 && tell + 3 <= totalBits) {
+            isTransient = ec.bitLogp(3);
+            tell = ec.tell();
+        }
+        let shortBlocks = isTransient;
+        let intra = if (tell + 3 <= totalBits) ec.bitLogp(3) else false;
+        if (!intra && this.lossDuration != 0) {
+            for (ch in 0usize..2) {
+                var safety: f32 = 0.0;
+                let missing = celtImin(10, celtShr(this.lossDuration, lmi));
+                if (lm == 0) {
+                    safety = 1.5;
+                } else if (lm == 1) {
+                    safety = 0.5;
+                }
+                for (i in start..end) {
+                    let at = ch * NB_EBANDS + i;
+                    if (this.oldBandE[at] < celtFmax(this.oldLogE[at], this.oldLogE2[at])) {
+                        var e0 = this.oldBandE[at];
+                        let e1 = this.oldLogE[at];
+                        let e2 = this.oldLogE2[at];
+                        let slope = celtFmax(e1 - e0, 0.5 * (e2 - e0));
+                        e0 -= celtFmax(0.0, round<f32>(1 + missing) * slope);
+                        this.oldBandE[at] = celtFmax(-20.0, e0);
+                    } else {
+                        this.oldBandE[at] = celtFmin(celtFmin(this.oldBandE[at], this.oldLogE[at]), this.oldLogE2[at]);
+                    }
+                    this.oldBandE[at] -= safety;
+                }
+            }
+        }
+        unquantCoarseEnergy(start, end, mut this.oldBandE[..], intra, mut ec, c, lm);
+        var tfRes = [0i32; 21];
+        tfDecode(start, end, isTransient, mut tfRes, lm, mut ec);
+        tell = ec.tell();
+        var spread: i32 = 2;
+        if (tell + 4 <= totalBits) {
+            spread = truncate<i32>(ec.icdf(SPREAD_ICDF[..], 5));
+        }
+        var cap = [0i32; 21];
+        for (i in 0usize..NB_EBANDS) {
+            let width = celtShl(EBAND5MS[i + 1] as i32 - EBAND5MS[i] as i32, lmi);
+            cap[i] = celtShr(((CACHE_CAPS50[NB_EBANDS * (2 * lm + c - 1) + i] as i32) + 64) * truncate<i32>(c) * width, 2);
+        }
+        var offsets = [0i32; 21];
+        var dynallocLogp: i32 = 6;
+        totalBits = celtShl(totalBits, 3);
+        var tellFrac = truncate<i32>(ec.tellFrac());
+        for (i in start..end) {
+            let width = celtShl(truncate<i32>(c) * (EBAND5MS[i + 1] as i32 - EBAND5MS[i] as i32), lmi);
+            let quanta = celtImin(celtShl(width, 3), celtImax(48, width));
+            var loopLogp = dynallocLogp;
+            var boost: i32 = 0;
+            while (tellFrac + celtShl(loopLogp, 3) < totalBits && boost < cap[i]) {
+                let flag = ec.bitLogp(truncate<u32>(loopLogp));
+                tellFrac = truncate<i32>(ec.tellFrac());
+                if (!flag) {
+                    break;
+                }
+                boost += quanta;
+                totalBits -= quanta;
+                loopLogp = 1;
+            }
+            offsets[i] = boost;
+            if (boost > 0) {
+                dynallocLogp = celtImax(2, dynallocLogp - 1);
+            }
+        }
+        let allocTrim: i32 = if (tellFrac + 48 <= totalBits) truncate<i32>(ec.icdf(TRIM_ICDF[..], 7)) else 5;
+        var bits = celtShl(truncate<i32>(length * 8), 3) - truncate<i32>(ec.tellFrac()) - 1;
+        let antiCollapseRsv: i32 = if (isTransient && lm >= 2 && bits >= celtShl(lmi + 2, 3)) 8 else 0;
+        bits -= antiCollapseRsv;
+        let alloc = computeAllocation(truncate<i32>(start), truncate<i32>(end), borrow offsets, borrow cap, allocTrim, bits,
+            truncate<i32>(c), lmi, mut ec);
+        unquantFineEnergy(start, end, mut this.oldBandE[..], borrow alloc.ebits, mut ec, c);
+        // The history moves on by a frame.
+        for (ch in 0usize..cc) {
+            let base = ch * CHANNEL_MEM;
+            for (k in 0usize..DECODE_BUFFER_SIZE - n + OVERLAP) {
+                this.mem[base + k] = this.mem[base + k + n];
+            }
+        }
+        var masks = [0u8; 42];
+        let layout = BandLayout { y: n, norm: 2 * n, norm2: 2 * n + 8 * 100 };
+        this.rng = quantAllBands(start, end, mut this.bands[..], layout, c, mut masks[..], borrow alloc.pulses, shortBlocks,
+            spread, alloc.dualStereo != 0, alloc.intensity, borrow tfRes, truncate<i32>(length) * 64 - antiCollapseRsv,
+            alloc.balance, mut ec, lm, alloc.codedBands, this.rng, this.disableInv);
+        var antiCollapseOn = false;
+        if (antiCollapseRsv > 0) {
+            antiCollapseOn = ec.bits(1) != 0;
+        }
+        unquantEnergyFinalise(start, end, mut this.oldBandE[..], borrow alloc.ebits, borrow alloc.finePriority,
+            truncate<i32>(length * 8) - ec.tell(), mut ec, c);
+        if (antiCollapseOn) {
+            this.rng = antiCollapse(mut this.bands[..], masks[..], lm, c, n, start, end, this.oldBandE[..], this.oldLogE[..],
+                this.oldLogE2[..], borrow alloc.pulses, this.rng);
+        }
+        if (silence) {
+            for (i in 0usize..c * NB_EBANDS) {
+                this.oldBandE[i] = -28.0;
+            }
+        }
+        if (this.prefilterAndFold) {
+            this.prefilterFold(n);
+        }
+        this.synthesis(start, effEnd, c, cc, isTransient, lm, silence, false);
+        for (ch in 0usize..cc) {
+            this.postfilterPeriod = celtImax(this.postfilterPeriod, COMBFILTER_MINPERIOD);
+            this.postfilterPeriodOld = celtImax(this.postfilterPeriodOld, COMBFILTER_MINPERIOD);
+            let at = ch * CHANNEL_MEM + DECODE_BUFFER_SIZE - n;
+            combFilter(mut this.mem[..], at, at, this.postfilterPeriodOld, this.postfilterPeriod, 120, this.postfilterGainOld,
+                this.postfilterGain, this.postfilterTapsetOld, this.postfilterTapset, OVERLAP);
+            if (lm != 0) {
+                combFilter(mut this.mem[..], at + 120, at + 120, this.postfilterPeriod, postfilterPitch, n - 120,
+                    this.postfilterGain, postfilterGain, this.postfilterTapset, postfilterTapset, OVERLAP);
+            }
+        }
+        this.postfilterPeriodOld = this.postfilterPeriod;
+        this.postfilterGainOld = this.postfilterGain;
+        this.postfilterTapsetOld = this.postfilterTapset;
+        this.postfilterPeriod = postfilterPitch;
+        this.postfilterGain = postfilterGain;
+        this.postfilterTapset = postfilterTapset;
+        if (lm != 0) {
+            this.postfilterPeriodOld = this.postfilterPeriod;
+            this.postfilterGainOld = this.postfilterGain;
+            this.postfilterTapsetOld = this.postfilterTapset;
+        }
+        if (c == 1) {
+            for (i in 0usize..NB_EBANDS) {
+                this.oldBandE[NB_EBANDS + i] = this.oldBandE[i];
+            }
+        }
+        if (!isTransient) {
+            this.oldLogE2 = this.oldLogE;
+            this.oldLogE = this.oldBandE;
+        } else {
+            for (i in 0usize..2 * NB_EBANDS) {
+                this.oldLogE[i] = celtFmin(this.oldLogE[i], this.oldBandE[i]);
+            }
+        }
+        let increase = round<f32>(celtImin(160, this.lossDuration + truncate<i32>(m))) * 0.001;
+        for (i in 0usize..2 * NB_EBANDS) {
+            this.backgroundLogE[i] = celtFmin(this.backgroundLogE[i] + increase, this.oldBandE[i]);
+        }
+        for (ch in 0usize..2) {
+            for (i in 0usize..start) {
+                this.oldBandE[ch * NB_EBANDS + i] = 0.0;
+                this.oldLogE[ch * NB_EBANDS + i] = -28.0;
+                this.oldLogE2[ch * NB_EBANDS + i] = -28.0;
+            }
+            for (i in end..NB_EBANDS) {
+                this.oldBandE[ch * NB_EBANDS + i] = 0.0;
+                this.oldLogE[ch * NB_EBANDS + i] = -28.0;
+                this.oldLogE2[ch * NB_EBANDS + i] = -28.0;
+            }
+        }
+        this.rng = ec.range;
+        this.deemphasis(mut pcm[..], n);
+        this.lossDuration = 0;
+        this.prefilterAndFold = false;
+        if (ec.tell() > truncate<i32>(8 * length)) {
+            return Err(CeltError.InternalError);
+        }
+        if (ec.error) {
+            this.error = true;
+        }
+        return Ok(frameSize);
+    }
+
+    /// Conceals a lost frame (libopus's celt_decode_lost), then de-emphasises it into `pcm`.
+    public fn conceal(borrow mut this, pcm: SliceMut<f32>, frameSize: usize) -> Result<usize, CeltError> {
+        let lm = lmOf(frameSize) ?? { return Err(CeltError.BadArgument); };
+        let n = 120usize << lm;
+        let c = this.channels;
+        let start = this.start;
+        let lossDuration = this.lossDuration;
+        let noiseBased = lossDuration >= 40 || start != 0 || this.skipPlc;
+        if (noiseBased) {
+            let end = this.end;
+            let effEnd = if (start > (if (end < NB_EBANDS) end else NB_EBANDS)) start else (if (end < NB_EBANDS) end else NB_EBANDS);
+            for (ch in 0usize..c) {
+                let base = ch * CHANNEL_MEM;
+                for (k in 0usize..DECODE_BUFFER_SIZE - n + OVERLAP) {
+                    this.mem[base + k] = this.mem[base + k + n];
+                }
+            }
+            if (this.prefilterAndFold) {
+                this.prefilterFold(n);
+            }
+            let decay: f32 = if (lossDuration == 0) 1.5 else 0.5;
+            for (ch in 0usize..c) {
+                for (i in start..end) {
+                    let at = ch * NB_EBANDS + i;
+                    this.oldBandE[at] = celtFmax(this.backgroundLogE[at], this.oldBandE[at] - decay);
+                }
+            }
+            var seed = this.rng;
+            for (ch in 0usize..c) {
+                for (i in start..effEnd) {
+                    let boffs = n * ch + (ebu(i) << lm);
+                    let blen = (ebu(i + 1) - ebu(i)) << lm;
+                    for (j in 0usize..blen) {
+                        seed = celtLcgRand(seed);
+                        this.bands[boffs + j] = round<f32>(celtShr(truncate<i32>(seed), 20));
+                    }
+                    renormaliseVector(mut this.bands[boffs..], blen, 1.0);
+                }
+            }
+            this.rng = seed;
+            this.synthesis(start, effEnd, c, c, false, lm, false, true);
+            this.prefilterAndFold = false;
+            this.skipPlc = true;
+        } else {
+            this.pitchConceal(n, lossDuration);
+            this.prefilterAndFold = true;
+        }
+        this.lossDuration = celtImin(10000, lossDuration + celtShl(1, truncate<i32>(lm)));
+        this.deemphasis(mut pcm[..], n);
+        return Ok(frameSize);
+    }
+
+    /// The pitch-based concealment: the last period's excitation repeated, decaying, through the LPC filter.
+    fn pitchConceal(borrow mut this, n: usize, lossDuration: i32) {
+        let c = this.channels;
+        var fade: f32 = 1.0;
+        var pitchIndex: usize = 0;
+        if (lossDuration == 0) {
+            // The downsampled history needs 1024 values; the search's scratch follows it.
+            var lp = Vector<f32>.create();
+            let _ = lp.resize(1024, 0.0);
+            pitchIndex = plcPitchSearch(this.mem[..], CHANNEL_MEM, c, mut lp[..], mut this.scratch[..]);
+            this.lastPitchIndex = pitchIndex;
+        } else {
+            pitchIndex = this.lastPitchIndex;
+            fade = 0.8;
+        }
+        let excLength = if (2 * pitchIndex < MAX_PERIOD) 2 * pitchIndex else MAX_PERIOD;
+        // exc (with its LPC history) at 0..1048 of the scratch, the FIR's output after it.
+        let exc = CELT_LPC_ORDER;
+        let firTmp = MAX_PERIOD + CELT_LPC_ORDER;
+        for (ch in 0usize..c) {
+            let buf = ch * CHANNEL_MEM;
+            for (i in 0usize..MAX_PERIOD + CELT_LPC_ORDER) {
+                this.scratch[i] = this.mem[buf + DECODE_BUFFER_SIZE - MAX_PERIOD - CELT_LPC_ORDER + i];
+            }
+            if (lossDuration == 0) {
+                var ac = [0.0f32; 25];
+                var work = Vector<f32>.create();
+                let _ = work.resize(MAX_PERIOD, 0.0);
+                celtAutocorr(this.scratch[..], exc, mut ac[..], OVERLAP, CELT_LPC_ORDER, MAX_PERIOD, mut work[..]);
+                ac[0] *= 1.0001;
+                // (0.008f*0.008f) as C computes it: a float product.
+                let k8: f32 = 0.008;
+                let k64 = k8 * k8;
+                for (i in 1usize..CELT_LPC_ORDER + 1) {
+                    let f = round<f32>(truncate<i32>(i));
+                    ac[i] -= ac[i] * k64 * f * f;
+                }
+                celtLpc(mut this.lpc[..], ch * CELT_LPC_ORDER, ac[..], CELT_LPC_ORDER);
+            }
+            // celt_fir over the excitation's last exc_length values.
+            let x0 = exc + MAX_PERIOD - excLength;
+            // celt_fir's order: the taps reversed (rnum[j] = lpc[ord - 1 - j] times x[i + j - ord]).
+            for (i in 0usize..excLength) {
+                var sum = this.scratch[x0 + i];
+                for (j in 0usize..CELT_LPC_ORDER) {
+                    sum = sum + this.lpc[ch * CELT_LPC_ORDER + CELT_LPC_ORDER - 1 - j] * this.scratch[x0 + i + j - CELT_LPC_ORDER];
+                }
+                this.scratch[firTmp + i] = sum;
+            }
+            for (i in 0usize..excLength) {
+                this.scratch[x0 + i] = this.scratch[firTmp + i];
+            }
+            var e1: f32 = 1.0;
+            var e2: f32 = 1.0;
+            let decayLength = excLength >> 1;
+            for (i in 0usize..decayLength) {
+                var e = this.scratch[exc + MAX_PERIOD - decayLength + i];
+                e1 += e * e;
+                e = this.scratch[exc + MAX_PERIOD - 2 * decayLength + i];
+                e2 += e * e;
+            }
+            e1 = celtFmin(e1, e2);
+            // SHR32 is the identity in the float build: E1 / E2, as libopus's frac_div32(SHR32(E1, 1), E2) is.
+            let decay = celtSqrt(e1 / e2);
+            for (k in 0usize..DECODE_BUFFER_SIZE - n) {
+                this.mem[buf + k] = this.mem[buf + k + n];
+            }
+            let extrapolationOffset = MAX_PERIOD - pitchIndex;
+            let extrapolationLen = n + OVERLAP;
+            var attenuation = fade * decay;
+            var s1: f32 = 0.0;
+            var j: usize = 0;
+            for (i in 0usize..extrapolationLen) {
+                if (j >= pitchIndex) {
+                    j -= pitchIndex;
+                    attenuation = attenuation * decay;
+                }
+                this.mem[buf + DECODE_BUFFER_SIZE - n + i] = attenuation * this.scratch[exc + extrapolationOffset + j];
+                let tmp = this.mem[buf + DECODE_BUFFER_SIZE - MAX_PERIOD - n + extrapolationOffset + j];
+                s1 += tmp * tmp;
+                j += 1;
+            }
+            // celt_iir in place (its blocked form, in libopus's order), its memory the history before the frame.
+            let y = buf + DECODE_BUFFER_SIZE - n;
+            celtIir(mut this.mem[..], y, this.lpc[ch * CELT_LPC_ORDER..], extrapolationLen, mut this.scratch[firTmp..]);
+            var s2: f32 = 0.0;
+            for (i in 0usize..extrapolationLen) {
+                let tmp = this.mem[y + i];
+                s2 += tmp * tmp;
+            }
+            if (!(s1 > 0.2 * s2)) {
+                for (i in 0usize..extrapolationLen) {
+                    this.mem[y + i] = 0.0;
+                }
+            } else if (s1 < s2) {
+                let ratio = celtSqrt((s1 + 1.0) / (s2 + 1.0));
+                for (i in 0usize..OVERLAP) {
+                    let g = 1.0 - WINDOW120[i] * (1.0 - ratio);
+                    this.mem[y + i] = g * this.mem[y + i];
+                }
+                for (i in OVERLAP..extrapolationLen) {
+                    this.mem[y + i] = ratio * this.mem[y + i];
+                }
+            }
+        }
+    }
+
+    /// libopus's prefilter_and_fold: the last frame's comb filter undone over the overlap, folded.
+    fn prefilterFold(borrow mut this, n: usize) {
+        let etmp = this.channels * CHANNEL_MEM;
+        for (ch in 0usize..this.channels) {
+            let x = ch * CHANNEL_MEM + DECODE_BUFFER_SIZE - n;
+            combFilter(mut this.mem[..], etmp, x, this.postfilterPeriodOld, this.postfilterPeriod, OVERLAP,
+                -this.postfilterGainOld, -this.postfilterGain, this.postfilterTapsetOld, this.postfilterTapset, 0);
+            for (i in 0usize..OVERLAP / 2) {
+                this.mem[x + i] = WINDOW120[i] * this.mem[etmp + OVERLAP - 1 - i] + WINDOW120[OVERLAP - i - 1] * this.mem[etmp + i];
+            }
+        }
+    }
+
+    /// libopus's celt_synthesis: the bands denormalised and inverse-MDCT'd into each channel's output. `plc`: the
+    /// coefficients are the concealment's (in `bands`, one channel after another).
+    fn synthesis(borrow mut this, start: usize, effEnd: usize, c: usize, cc: usize, isTransient: bool, lm: usize, silence: bool,
+        plc: bool) {
+        let m = 1usize << lm;
+        let n = 120 * m;
+        var b: usize = 1;
+        var nb = n;
+        var shift = 3 - lm;
+        if (isTransient) {
+            b = m;
+            nb = 120;
+            shift = 3;
+        }
+        let out0 = DECODE_BUFFER_SIZE - n;
+        let out1 = CHANNEL_MEM + DECODE_BUFFER_SIZE - n;
+        if (cc == 2 && c == 1) {
+            denormaliseBands(this.bands[..], mut this.freq[..], this.oldBandE[..], start, effEnd, m, 1, silence);
+            for (k in 0usize..b) {
+                mdctBackward(this.freq[..], k, mut this.mem[..], out0 + nb * k, shift, b);
+            }
+            for (k in 0usize..b) {
+                mdctBackward(this.freq[..], k, mut this.mem[..], out1 + nb * k, shift, b);
+            }
+        } else if (cc == 1 && c == 2) {
+            denormaliseBands(this.bands[..], mut this.freq[..], this.oldBandE[..], start, effEnd, m, 1, silence);
+            denormaliseBands(this.bands[n..], mut this.freq2[..], this.oldBandE[NB_EBANDS..], start, effEnd, m, 1, silence);
+            for (i in 0usize..n) {
+                this.freq[i] = 0.5 * this.freq[i] + 0.5 * this.freq2[i];
+            }
+            for (k in 0usize..b) {
+                mdctBackward(this.freq[..], k, mut this.mem[..], out0 + nb * k, shift, b);
+            }
+        } else {
+            for (ch in 0usize..cc) {
+                denormaliseBands(this.bands[ch * n..], mut this.freq[..], this.oldBandE[ch * NB_EBANDS..], start, effEnd, m, 1, silence);
+                let out = ch * CHANNEL_MEM + DECODE_BUFFER_SIZE - n;
+                for (k in 0usize..b) {
+                    mdctBackward(this.freq[..], k, mut this.mem[..], out + nb * k, shift, b);
+                }
+            }
+        }
+    }
+
+    /// The output: each channel's frame de-emphasised, interleaved, at ±1.0.
+    fn deemphasis(borrow mut this, pcm: SliceMut<f32>, n: usize) {
+        let cc = this.channels;
+        for (ch in 0usize..cc) {
+            var mem = this.preemphMem[ch];
+            let x = ch * CHANNEL_MEM + DECODE_BUFFER_SIZE - n;
+            for (j in 0usize..n) {
+                let tmp = this.mem[x + j] + CELT_VERY_SMALL + mem;
+                mem = PREEMPH * tmp;
+                pcm[j * cc + ch] = tmp * (1.0 / CELT_SIG_SCALE);
+            }
+            this.preemphMem[ch] = mem;
+        }
+    }
+}
+
+fn lmOf(frameSize: usize) -> usize? {
+    for (lm in 0usize..4) {
+        if ((120usize << lm) == frameSize) {
+            return Some(lm);
+        }
+    }
+    return null;
+}
+
+fn tfDecode<region r>(start: usize, end: usize, isTransient: bool, tfRes: borrow mut [i32; 21], lm: usize, dec: borrow mut RangeDecoder<r>) {
+    var budget = dec.storageBytes() * 8;
+    var tell = truncate<u32>(dec.tell());
+    var logp: u32 = if (isTransient) 2 else 4;
+    let rsv = lm > 0 && tell + logp + 1 <= budget;
+    if (rsv) {
+        budget -= 1;
+    }
+    var changed: i32 = 0;
+    var curr: i32 = 0;
+    for (i in start..end) {
+        if (tell + logp <= budget) {
+            if (dec.bitLogp(logp)) {
+                curr = 1 - curr;
+            }
+            tell = truncate<u32>(dec.tell());
+            if (curr != 0) {
+                changed = 1;
+            }
+        }
+        tfRes[i] = curr;
+        logp = if (isTransient) 4 else 5;
+    }
+    var select: i32 = 0;
+    let t = if (isTransient) 4usize else 0;
+    let row = lm * 8;
+    if (rsv && TF_SELECT_TABLE[row + t + truncate<usize>(changed)] != TF_SELECT_TABLE[row + t + 2 + truncate<usize>(changed)]) {
+        select = if (dec.bitLogp(1)) 1 else 0;
+    }
+    for (i in start..end) {
+        tfRes[i] = TF_SELECT_TABLE[row + t + truncate<usize>(2 * select + tfRes[i])] as i32;
+    }
+}
+
+/// libopus's comb_filter over `buf`: y at `y`, x at `x` (the same for the decoder's in-place postfilter, which makes
+/// it recursive), periods T0 to T1 and gains g0 to g1 across `overlap` samples, then T1 and g1.
+fn combFilter(buf: SliceMut<f32>, y: usize, x: usize, t00: i32, t10: i32, n: usize, g0: f32, g1: f32, tap0: i32, tap1: i32,
+    overlap0: usize) {
+    if (g0 == 0.0 && g1 == 0.0) {
+        if (x != y) {
+            for (i in 0usize..n) {
+                buf[y + i] = buf[x + i];
+            }
+        }
+        return;
+    }
+    let t0 = truncate<usize>(celtImax(t00, COMBFILTER_MINPERIOD));
+    let t1 = truncate<usize>(celtImax(t10, COMBFILTER_MINPERIOD));
+    let a0 = truncate<usize>(tap0) * 3;
+    let a1 = truncate<usize>(tap1) * 3;
+    let g00 = g0 * COMB_GAINS[a0];
+    let g01 = g0 * COMB_GAINS[a0 + 1];
+    let g02 = g0 * COMB_GAINS[a0 + 2];
+    let g10 = g1 * COMB_GAINS[a1];
+    let g11 = g1 * COMB_GAINS[a1 + 1];
+    let g12 = g1 * COMB_GAINS[a1 + 2];
+    var x1 = buf[x + 1 - t1];
+    var x2 = buf[x - t1];
+    var x3 = buf[x - t1 - 1];
+    var x4 = buf[x - t1 - 2];
+    var overlap = overlap0;
+    if (g0 == g1 && t0 == t1 && tap0 == tap1) {
+        overlap = 0;
+    }
+    var i: usize = 0;
+    while (i < overlap) {
+        let x0 = buf[x + i + 2 - t1];
+        let f = WINDOW120[i] * WINDOW120[i];
+        let nf = 1.0 - f;
+        buf[y + i] = buf[x + i]
+            + (nf * g00) * buf[x + i - t0]
+            + (nf * g01) * (buf[x + i + 1 - t0] + buf[x + i - t0 - 1])
+            + (nf * g02) * (buf[x + i + 2 - t0] + buf[x + i - t0 - 2])
+            + (f * g10) * x2
+            + (f * g11) * (x1 + x3)
+            + (f * g12) * (x0 + x4);
+        x4 = x3;
+        x3 = x2;
+        x2 = x1;
+        x1 = x0;
+        i += 1;
+    }
+    if (g1 == 0.0) {
+        if (x != y) {
+            for (k in overlap..n) {
+                buf[y + k] = buf[x + k];
+            }
+        }
+        return;
+    }
+    // comb_filter_const from i on.
+    let ys = y + i;
+    let xs = x + i;
+    var c4 = buf[xs - t1 - 2];
+    var c3 = buf[xs - t1 - 1];
+    var c2 = buf[xs - t1];
+    var c1 = buf[xs + 1 - t1];
+    for (k in 0usize..n - i) {
+        let c0 = buf[xs + k + 2 - t1];
+        buf[ys + k] = buf[xs + k] + g10 * c2 + g11 * (c1 + c3) + g12 * (c0 + c4);
+        c4 = c3;
+        c3 = c2;
+        c2 = c1;
+        c1 = c0;
+    }
+}
+
+/// libopus's celt_iir (not SMALL_FOOTPRINT), in place on `buf[at..at + n]`, its memory the 24 values before `at`;
+/// `work` holds n + 24 values. The sums run in libopus's order, which a recursive filter makes audible.
+fn celtIir(buf: SliceMut<f32>, at: usize, den: Slice<f32>, n: usize, work: SliceMut<f32>) {
+    let ord = CELT_LPC_ORDER;
+    // y[0..ord) = -mem[ord - i - 1], where mem[k] = buf[at - 1 - k]: y[i] = -buf[at - ord + i].
+    for (i in 0usize..ord) {
+        work[i] = -buf[at - ord + i];
+    }
+    for (i in ord..n + ord) {
+        work[i] = 0.0;
+    }
+    var i: usize = 0;
+    while (i + 3 < n) {
+        var s0 = buf[at + i];
+        var s1 = buf[at + i + 1];
+        var s2 = buf[at + i + 2];
+        var s3 = buf[at + i + 3];
+        // xcorr_kernel(rden, y + i, sum, ord): rden[j] = den[ord - 1 - j].
+        for (j in 0usize..ord) {
+            let r = den[ord - 1 - j];
+            s0 = s0 + r * work[i + j];
+            s1 = s1 + r * work[i + j + 1];
+            s2 = s2 + r * work[i + j + 2];
+            s3 = s3 + r * work[i + j + 3];
+        }
+        work[i + ord] = -s0;
+        buf[at + i] = s0;
+        s1 = s1 + work[i + ord] * den[0];
+        work[i + ord + 1] = -s1;
+        buf[at + i + 1] = s1;
+        s2 = s2 + work[i + ord + 1] * den[0];
+        s2 = s2 + work[i + ord] * den[1];
+        work[i + ord + 2] = -s2;
+        buf[at + i + 2] = s2;
+        s3 = s3 + work[i + ord + 2] * den[0];
+        s3 = s3 + work[i + ord + 1] * den[1];
+        s3 = s3 + work[i + ord] * den[2];
+        work[i + ord + 3] = -s3;
+        buf[at + i + 3] = s3;
+        i += 4;
+    }
+    while (i < n) {
+        var sum = buf[at + i];
+        for (j in 0usize..ord) {
+            sum -= den[ord - 1 - j] * work[i + j];
+        }
+        work[i + ord] = sum;
+        buf[at + i] = sum;
+        i += 1;
+    }
+}

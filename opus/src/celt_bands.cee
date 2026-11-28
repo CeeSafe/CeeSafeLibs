@@ -1,0 +1,721 @@
+// CELT's bands: their shapes decoded and denormalised (libopus 1.5.2 celt/bands.c, decoder side, float build; BSD).
+//
+// C's pointers into the coefficients, the folding memory and the scratch become offsets into one buffer, `buf`:
+// [X | Y | norm | norm2], the layout `BandLayout` gives. A missing pointer is null.
+
+const SPREAD_AGGRESSIVE: i32 = 3;
+const EXP2_TABLE8: [i32; 8] = [16384, 17866, 19483, 21247, 23170, 25267, 27554, 30048];
+const BIT_INTERLEAVE_TABLE: [u32; 16] = [0, 1, 1, 1, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3];
+const BIT_DEINTERLEAVE_TABLE: [u32; 16] = [0x00, 0x03, 0x0C, 0x0F, 0x30, 0x33, 0x3C, 0x3F, 0xC0, 0xC3, 0xCC, 0xCF, 0xF0,
+    0xF3, 0xFC, 0xFF];
+/// The widest band: 22 bins at LM 3.
+const MAX_BAND: usize = 176;
+
+/// A band edge, in bins at LM 0.
+fn ebu(i: usize) -> usize => truncate<usize>(EBAND5MS[i]);
+
+fn celtLcgRand(seed: u32) -> u32 => seed.wrappingMul(1664525).wrappingAdd(1013904223);
+
+/// FRAC_MUL16: (16384 + (int16)a * (int16)b) >> 15.
+fn fracMul16(a: i32, b: i32) -> i32 {
+    let x = (truncate<i16>(a) as i32) * (truncate<i16>(b) as i32);
+    return celtShr(16384 + x, 15);
+}
+
+fn bitexactCos(x: i32) -> i32 {
+    let tmp = celtShr(4096 + x * x, 13);
+    var x2 = tmp;
+    x2 = (32767 - x2) + fracMul16(x2, -7651 + fracMul16(x2, 8277 + fracMul16(-626, x2)));
+    return 1 + (truncate<i16>(x2) as i32);
+}
+
+fn bitexactLog2tan(isin0: i32, icos0: i32) -> i32 {
+    let lc = truncate<i32>(ilog(truncate<u32>(icos0)));
+    let ls = truncate<i32>(ilog(truncate<u32>(isin0)));
+    let icos = celtShl(icos0, 15 - lc);
+    let isin = celtShl(isin0, 15 - ls);
+    return (ls - lc) * 2048 + fracMul16(isin, fracMul16(isin, -2597) + 7932) - fracMul16(icos, fracMul16(icos, -2597) + 7932);
+}
+
+/// Band energies (log2, without the means) back on the normalised shapes: `x` into `freq`.
+fn denormaliseBands(x: Slice<f32>, freq: SliceMut<f32>, logE: Slice<f32>, start0: usize, end0: usize, m: usize,
+    downsample: usize, silence: bool) {
+    let n = m * 120;
+    var bound = m * ebu(end0);
+    var start = start0;
+    var end = end0;
+    if (downsample != 1) {
+        let limit = n / downsample;
+        if (limit < bound) {
+            bound = limit;
+        }
+    }
+    if (silence) {
+        bound = 0;
+        start = 0;
+        end = 0;
+    }
+    let first = m * ebu(start);
+    for (i in 0usize..first) {
+        freq[i] = 0.0;
+    }
+    var at = first;
+    for (i in start..end) {
+        let bandEnd = m * ebu(i + 1);
+        let lg = logE[i] + E_MEANS[i];
+        let g = celtExp2(celtFmin(32.0, lg));
+        while (at < bandEnd) {
+            freq[at] = x[at] * g;
+            at += 1;
+        }
+    }
+    for (i in bound..n) {
+        freq[i] = 0.0;
+    }
+}
+
+/// Fills bands whose shapes collapsed to nothing in a transient with noise (libopus's anti_collapse). `x` holds the
+/// channels' coefficients `size` apart.
+fn antiCollapse(x: SliceMut<f32>, masks: Slice<u8>, lm: usize, c: usize, size: usize, start: usize, end: usize,
+    logE: Slice<f32>, prev1: Slice<f32>, prev2: Slice<f32>, pulses: borrow [i32; 21], seed0: u32) -> u32 {
+    var seed = seed0;
+    for (i in start..end) {
+        let n0 = (ebu(i + 1) - ebu(i));
+        let depth = celtShr((1 + pulses[i]) / truncate<i32>(n0), truncate<i32>(lm));
+        let thresh = 0.5 * celtExp2(-0.125 * round<f32>(depth));
+        let sqrt1 = celtRsqrt(round<f32>(truncate<i32>(n0 << lm)));
+        for (ch in 0usize..c) {
+            var p1 = prev1[ch * NB_EBANDS + i];
+            var p2 = prev2[ch * NB_EBANDS + i];
+            if (c == 1) {
+                p1 = celtFmax(p1, prev1[NB_EBANDS + i]);
+                p2 = celtFmax(p2, prev2[NB_EBANDS + i]);
+            }
+            var ediff = logE[ch * NB_EBANDS + i] - celtFmin(p1, p2);
+            ediff = celtFmax(0.0, ediff);
+            var r = 2.0 * celtExp2(-ediff);
+            if (lm == 3) {
+                r *= 1.41421356;
+            }
+            r = celtFmin(thresh, r);
+            r = r * sqrt1;
+            let base = ch * size + (ebu(i) << lm);
+            var renormalize = false;
+            for (k in 0usize..(1usize << lm)) {
+                if (((masks[i * c + ch] as u32) & (1u32 << truncate<u32>(k))) == 0) {
+                    for (j in 0usize..n0) {
+                        seed = celtLcgRand(seed);
+                        x[base + (j << lm) + k] = if ((seed & 0x8000) != 0) r else -r;
+                    }
+                    renormalize = true;
+                }
+            }
+            if (renormalize) {
+                renormaliseVector(mut x[base..], n0 << lm, 1.0);
+            }
+        }
+    }
+    return seed;
+}
+
+fn stereoMerge(buf: SliceMut<f32>, xa: usize, ya: usize, mid: f32, n: usize) {
+    var xp: f32 = 0.0;
+    var side: f32 = 0.0;
+    for (j in 0usize..n) {
+        xp += buf[ya + j] * buf[xa + j];
+        side += buf[ya + j] * buf[ya + j];
+    }
+    xp = mid * xp;
+    let mid2 = mid;
+    let el = mid2 * mid2 + side - 2.0 * xp;
+    let er = mid2 * mid2 + side + 2.0 * xp;
+    if (er < 6e-4 || el < 6e-4) {
+        for (j in 0usize..n) {
+            buf[ya + j] = buf[xa + j];
+        }
+        return;
+    }
+    let lgain = celtRsqrt(el);
+    let rgain = celtRsqrt(er);
+    for (j in 0usize..n) {
+        let l = mid * buf[xa + j];
+        let r = buf[ya + j];
+        buf[xa + j] = lgain * (l - r);
+        buf[ya + j] = rgain * (l + r);
+    }
+}
+
+fn deinterleaveHadamard(buf: SliceMut<f32>, xa: usize, n0: usize, stride: usize, hadamard: bool) {
+    var tmp = [0.0f32; MAX_BAND];
+    let n = n0 * stride;
+    for (i in 0usize..stride) {
+        let row = if (hadamard) truncate<usize>(ORDERY_TABLE[stride - 2 + i]) else i;
+        for (j in 0usize..n0) {
+            tmp[row * n0 + j] = buf[xa + j * stride + i];
+        }
+    }
+    for (j in 0usize..n) {
+        buf[xa + j] = tmp[j];
+    }
+}
+
+fn interleaveHadamard(buf: SliceMut<f32>, xa: usize, n0: usize, stride: usize, hadamard: bool) {
+    var tmp = [0.0f32; MAX_BAND];
+    let n = n0 * stride;
+    for (i in 0usize..stride) {
+        let row = if (hadamard) truncate<usize>(ORDERY_TABLE[stride - 2 + i]) else i;
+        for (j in 0usize..n0) {
+            tmp[j * stride + i] = buf[xa + row * n0 + j];
+        }
+    }
+    for (j in 0usize..n) {
+        buf[xa + j] = tmp[j];
+    }
+}
+
+fn haar1(buf: SliceMut<f32>, xa: usize, n0: usize, stride: usize) {
+    let half = n0 >> 1;
+    for (i in 0usize..stride) {
+        for (j in 0usize..half) {
+            let tmp1 = 0.70710678 * buf[xa + stride * 2 * j + i];
+            let tmp2 = 0.70710678 * buf[xa + stride * (2 * j + 1) + i];
+            buf[xa + stride * 2 * j + i] = tmp1 + tmp2;
+            buf[xa + stride * (2 * j + 1) + i] = tmp1 - tmp2;
+        }
+    }
+}
+
+fn computeQn(n: i32, b: i32, offset: i32, pulseCap: i32, stereo: bool) -> i32 {
+    var n2 = 2 * n - 1;
+    if (stereo && n == 2) {
+        n2 -= 1;
+    }
+    var qb = celtSdiv(b + n2 * offset, n2);
+    qb = celtImin(b - pulseCap - 32, qb);
+    qb = celtImin(64, qb);
+    if (qb < 4) {
+        return 1;
+    }
+    var qn = celtShr(EXP2_TABLE8[truncate<usize>(qb % 8)], 14 - celtShr(qb, 3));
+    qn = celtShl(celtShr(qn + 1, 1), 1);
+    return qn;
+}
+
+/// What a band's decoding carries from band to band (libopus's band_ctx, decoder side).
+struct BandCtx {
+    i: usize;
+    intensity: i32;
+    spread: i32;
+    tfChange: i32;
+    remainingBits: i32;
+    seed: u32;
+    disableInv: bool;
+    avoidSplitNoise: bool;
+}
+
+struct Split {
+    inv: bool;
+    imid: i32;
+    iside: i32;
+    delta: i32;
+    itheta: i32;
+    qalloc: i32;
+    b: i32;
+    fill: u32;
+}
+
+fn computeTheta<region r>(ctx: borrow mut BandCtx, ec: borrow mut RangeDecoder<r>, n: i32, b0: i32, bb: i32, b0Blocks: i32,
+    lm: i32, stereo: bool, fill0: u32) -> Split {
+    var b = b0;
+    var fill = fill0;
+    let i = ctx.i;
+    let pulseCap = (LOGN400[i] as i32) + lm * 8;
+    let offset = celtShr(pulseCap, 1) - (if (stereo && n == 2) QTHETA_OFFSET_TWOPHASE else QTHETA_OFFSET);
+    var qn = computeQn(n, b, offset, pulseCap, stereo);
+    if (stereo && truncate<i32>(i) >= ctx.intensity) {
+        qn = 1;
+    }
+    var itheta: i32 = 0;
+    var inv = false;
+    let tell = truncate<i32>(ec.tellFrac());
+    if (qn != 1) {
+        if (stereo && n > 2) {
+            let p0: i32 = 3;
+            let x0 = qn / 2;
+            let ft = p0 * (x0 + 1) + x0;
+            let fs = truncate<i32>(ec.decode(truncate<u32>(ft)));
+            let x = if (fs < (x0 + 1) * p0) fs / p0 else x0 + 1 + (fs - (x0 + 1) * p0);
+            let fl = if (x <= x0) p0 * x else (x - 1 - x0) + (x0 + 1) * p0;
+            let fh = if (x <= x0) p0 * (x + 1) else (x - x0) + (x0 + 1) * p0;
+            ec.update(truncate<u32>(fl), truncate<u32>(fh), truncate<u32>(ft));
+            itheta = x;
+        } else if (b0Blocks > 1 || stereo) {
+            itheta = truncate<i32>(ec.uint(truncate<u32>(qn + 1)));
+        } else {
+            let half = celtShr(qn, 1);
+            let ft = (half + 1) * (half + 1);
+            let fm = truncate<i32>(ec.decode(truncate<u32>(ft)));
+            var fs: i32 = 0;
+            var fl: i32 = 0;
+            if (fm < celtShr(half * (half + 1), 1)) {
+                itheta = celtShr(truncate<i32>(celtIsqrt32(8 * truncate<u32>(fm) + 1)) - 1, 1);
+                fs = itheta + 1;
+                fl = celtShr(itheta * (itheta + 1), 1);
+            } else {
+                itheta = celtShr(2 * (qn + 1) - truncate<i32>(celtIsqrt32(8 * truncate<u32>(ft - fm - 1) + 1)), 1);
+                fs = qn + 1 - itheta;
+                fl = ft - celtShr((qn + 1 - itheta) * (qn + 2 - itheta), 1);
+            }
+            ec.update(truncate<u32>(fl), truncate<u32>(fl + fs), truncate<u32>(ft));
+        }
+        itheta = (itheta * 16384) / qn;
+    } else if (stereo) {
+        if (b > 16 && ctx.remainingBits > 16) {
+            inv = ec.bitLogp(2);
+        } else {
+            inv = false;
+        }
+        if (ctx.disableInv) {
+            inv = false;
+        }
+        itheta = 0;
+    }
+    let qalloc = truncate<i32>(ec.tellFrac()) - tell;
+    b -= qalloc;
+    var imid: i32 = 0;
+    var iside: i32 = 0;
+    var delta: i32 = 0;
+    let mask = (1u32 << truncate<u32>(bb)) - 1;
+    if (itheta == 0) {
+        imid = 32767;
+        iside = 0;
+        fill = fill & mask;
+        delta = -16384;
+    } else if (itheta == 16384) {
+        imid = 0;
+        iside = 32767;
+        fill = fill & (mask << truncate<u32>(bb));
+        delta = 16384;
+    } else {
+        imid = bitexactCos(itheta);
+        iside = bitexactCos(16384 - itheta);
+        delta = fracMul16(celtShl(n - 1, 7), bitexactLog2tan(iside, imid));
+    }
+    return Split { inv: inv, imid: imid, iside: iside, delta: delta, itheta: itheta, qalloc: qalloc, b: b, fill: fill };
+}
+
+fn quantBandN1<region r>(ctx: borrow mut BandCtx, ec: borrow mut RangeDecoder<r>, buf: SliceMut<f32>, xa: usize, ya: usize?,
+    lowbandOut: usize?) -> u32 {
+    var at = xa;
+    let channels: usize = if (ya != null) 2 else 1;
+    for (c in 0usize..channels) {
+        var sign: u32 = 0;
+        if (ctx.remainingBits >= 8) {
+            sign = ec.bits(1);
+            ctx.remainingBits -= 8;
+        }
+        buf[at] = if (sign != 0) -1.0 else 1.0;
+        if (ya is Some(y)) {
+            at = y;
+        }
+    }
+    if (lowbandOut is Some(o)) {
+        buf[o] = buf[xa];
+    }
+    return 1;
+}
+
+fn quantPartition<region r>(ctx: borrow mut BandCtx, ec: borrow mut RangeDecoder<r>, buf: SliceMut<f32>, xa: usize, n0: i32,
+    b0: i32, bb0: i32, lowband: usize?, lm0: i32, gain: f32, fill0: u32) -> u32 {
+    var n = n0;
+    var b = b0;
+    var bb = bb0;
+    var lm = lm0;
+    var fill = fill0;
+    let blocks0 = bb;
+    let i = ctx.i;
+    var cm: u32 = 0;
+    let cache = cacheAt(i, lm);
+    let top = CACHE_BITS50[cache + (CACHE_BITS50[cache] as usize)] as i32;
+    if (lm != -1 && b > top + 12 && n > 2) {
+        n = celtShr(n, 1);
+        let ya = xa + truncate<usize>(n);
+        lm -= 1;
+        if (bb == 1) {
+            fill = (fill & 1) | (fill << 1);
+        }
+        bb = celtShr(bb + 1, 1);
+        let s = computeTheta(mut ctx, mut ec, n, b, bb, blocks0, lm, false, fill);
+        b = s.b;
+        fill = s.fill;
+        var delta = s.delta;
+        let itheta = s.itheta;
+        let mid = (1.0 / 32768.0) * round<f32>(s.imid);
+        let side = (1.0 / 32768.0) * round<f32>(s.iside);
+        if (blocks0 > 1 && (itheta % 16384) != 0) {
+            if (itheta > 8192) {
+                delta -= celtShr(delta, 4 - lm);
+            } else {
+                delta = celtImin(0, delta + celtShr(celtShl(n, 3), 5 - lm));
+            }
+        }
+        var mbits = celtImax(0, celtImin(b, (b - delta) / 2));
+        var sbits = b - mbits;
+        ctx.remainingBits -= s.qalloc;
+        var next2: usize? = null;
+        if (lowband is Some(l)) {
+            next2 = Some(l + truncate<usize>(n));
+        }
+        var rebalance = ctx.remainingBits;
+        let shift = truncate<u32>(celtShr(blocks0, 1));
+        if (mbits >= sbits) {
+            cm = quantPartition(mut ctx, mut ec, mut buf[..], xa, n, mbits, bb, lowband, lm, gain * mid, fill);
+            rebalance = mbits - (rebalance - ctx.remainingBits);
+            if (rebalance > 24 && itheta != 0) {
+                sbits += rebalance - 24;
+            }
+            cm = cm | (quantPartition(mut ctx, mut ec, mut buf[..], ya, n, sbits, bb, next2, lm, gain * side,
+                fill >> truncate<u32>(bb)) << shift);
+        } else {
+            cm = quantPartition(mut ctx, mut ec, mut buf[..], ya, n, sbits, bb, next2, lm, gain * side,
+                fill >> truncate<u32>(bb)) << shift;
+            rebalance = sbits - (rebalance - ctx.remainingBits);
+            if (rebalance > 24 && itheta != 16384) {
+                mbits += rebalance - 24;
+            }
+            cm = cm | quantPartition(mut ctx, mut ec, mut buf[..], xa, n, mbits, bb, lowband, lm, gain * mid, fill);
+        }
+        return cm;
+    }
+    var q = bits2pulses(i, lm, b);
+    var currBits = pulses2bits(i, lm, q);
+    ctx.remainingBits -= currBits;
+    while (ctx.remainingBits < 0 && q > 0) {
+        ctx.remainingBits += currBits;
+        q -= 1;
+        currBits = pulses2bits(i, lm, q);
+        ctx.remainingBits -= currBits;
+    }
+    let nu = truncate<usize>(n);
+    if (q != 0) {
+        let k = getPulses(q);
+        return algUnquant(mut buf[xa..], nu, k, ctx.spread, truncate<usize>(bb), mut ec, gain);
+    }
+    let cmMask = (1u32 << truncate<u32>(bb)) - 1;
+    fill = fill & cmMask;
+    if (fill == 0) {
+        for (j in 0usize..nu) {
+            buf[xa + j] = 0.0;
+        }
+        return 0;
+    }
+    match (lowband) {
+        null => {
+            for (j in 0usize..nu) {
+                ctx.seed = celtLcgRand(ctx.seed);
+                buf[xa + j] = round<f32>(celtShr(truncate<i32>(ctx.seed), 20));
+            }
+            cm = cmMask;
+        },
+        Some(l) => {
+            for (j in 0usize..nu) {
+                ctx.seed = celtLcgRand(ctx.seed);
+                let tmp: f32 = if ((ctx.seed & 0x8000) != 0) 1.0 / 256.0 else -1.0 / 256.0;
+                buf[xa + j] = buf[l + j] + tmp;
+            }
+            cm = fill;
+        },
+    }
+    renormaliseVector(mut buf[xa..], nu, gain);
+    return cm;
+}
+
+fn quantBand<region r>(ctx: borrow mut BandCtx, ec: borrow mut RangeDecoder<r>, buf: SliceMut<f32>, xa: usize, n: i32, b: i32,
+    bb0: i32, lowband0: usize?, lm: i32, lowbandOut: usize?, gain: f32, scratch: usize?, fill0: u32) -> u32 {
+    let n0 = n;
+    var nb = n;
+    var bb = bb0;
+    var fill = fill0;
+    var lowband = lowband0;
+    var timeDivide: i32 = 0;
+    var recombine: i32 = 0;
+    let longBlocks = bb0 == 1;
+    var tfChange = ctx.tfChange;
+    nb = nb / bb;
+    if (n == 1) {
+        return quantBandN1(mut ctx, mut ec, mut buf[..], xa, null, lowbandOut);
+    }
+    if (tfChange > 0) {
+        recombine = tfChange;
+    }
+    if (scratch is Some(s) && lowband is Some(l) && (recombine != 0 || (nb % 2 == 0 && tfChange < 0) || bb0 > 1)) {
+        for (j in 0usize..truncate<usize>(n)) {
+            buf[s + j] = buf[l + j];
+        }
+        lowband = Some(s);
+    }
+    for (k in 0..recombine) {
+        if (lowband is Some(l)) {
+            haar1(mut buf[..], l, truncate<usize>(celtShr(n, k)), truncate<usize>(celtShl(1, k)));
+        }
+        fill = BIT_INTERLEAVE_TABLE[(fill & 0xF) as usize] | (BIT_INTERLEAVE_TABLE[(fill >> 4) as usize] << 2);
+    }
+    bb = celtShr(bb, recombine);
+    nb = celtShl(nb, recombine);
+    while (nb % 2 == 0 && tfChange < 0) {
+        if (lowband is Some(l)) {
+            haar1(mut buf[..], l, truncate<usize>(nb), truncate<usize>(bb));
+        }
+        fill = fill | (fill << truncate<u32>(bb));
+        bb = celtShl(bb, 1);
+        nb = celtShr(nb, 1);
+        timeDivide += 1;
+        tfChange += 1;
+    }
+    let blocks0 = bb;
+    let nb0 = nb;
+    if (blocks0 > 1) {
+        if (lowband is Some(l)) {
+            deinterleaveHadamard(mut buf[..], l, truncate<usize>(celtShr(nb, recombine)), truncate<usize>(celtShl(blocks0, recombine)), longBlocks);
+        }
+    }
+    var cm = quantPartition(mut ctx, mut ec, mut buf[..], xa, n, b, bb, lowband, lm, gain, fill);
+    if (blocks0 > 1) {
+        interleaveHadamard(mut buf[..], xa, truncate<usize>(celtShr(nb, recombine)), truncate<usize>(celtShl(blocks0, recombine)), longBlocks);
+    }
+    nb = nb0;
+    bb = blocks0;
+    for (k in 0..timeDivide) {
+        bb = celtShr(bb, 1);
+        nb = celtShl(nb, 1);
+        cm = cm | (cm >> truncate<u32>(bb));
+        haar1(mut buf[..], xa, truncate<usize>(nb), truncate<usize>(bb));
+    }
+    for (k in 0..recombine) {
+        cm = BIT_DEINTERLEAVE_TABLE[(cm & 0xF) as usize];
+        haar1(mut buf[..], xa, truncate<usize>(celtShr(n0, k)), truncate<usize>(celtShl(1, k)));
+    }
+    bb = celtShl(bb, recombine);
+    if (lowbandOut is Some(o)) {
+        let scale = round<f32>(n0).sqrt();
+        for (j in 0usize..truncate<usize>(n0)) {
+            buf[o + j] = scale * buf[xa + j];
+        }
+    }
+    cm = cm & ((1u32 << truncate<u32>(bb)) - 1);
+    return cm;
+}
+
+fn quantBandStereo<region r>(ctx: borrow mut BandCtx, ec: borrow mut RangeDecoder<r>, buf: SliceMut<f32>, xa: usize, ya: usize,
+    n: i32, b0: i32, bb: i32, lowband: usize?, lm: i32, lowbandOut: usize?, scratch: usize?, fill0: u32) -> u32 {
+    if (n == 1) {
+        return quantBandN1(mut ctx, mut ec, mut buf[..], xa, Some(ya), lowbandOut);
+    }
+    let origFill = fill0;
+    let s = computeTheta(mut ctx, mut ec, n, b0, bb, bb, lm, true, fill0);
+    let b = s.b;
+    let fill = s.fill;
+    let itheta = s.itheta;
+    let mid = (1.0 / 32768.0) * round<f32>(s.imid);
+    let side = (1.0 / 32768.0) * round<f32>(s.iside);
+    var cm: u32 = 0;
+    if (n == 2) {
+        var mbits = b;
+        var sbits: i32 = 0;
+        if (itheta != 0 && itheta != 16384) {
+            sbits = 8;
+        }
+        mbits -= sbits;
+        let swap = itheta > 8192;
+        ctx.remainingBits -= s.qalloc + sbits;
+        let x2 = if (swap) ya else xa;
+        let y2 = if (swap) xa else ya;
+        var sign: i32 = 0;
+        if (sbits != 0) {
+            sign = truncate<i32>(ec.bits(1));
+        }
+        sign = 1 - 2 * sign;
+        cm = quantBand(mut ctx, mut ec, mut buf[..], x2, n, mbits, bb, lowband, lm, lowbandOut, 1.0, scratch, origFill);
+        let fs = round<f32>(sign);
+        buf[y2] = -fs * buf[x2 + 1];
+        buf[y2 + 1] = fs * buf[x2];
+        buf[xa] = mid * buf[xa];
+        buf[xa + 1] = mid * buf[xa + 1];
+        buf[ya] = side * buf[ya];
+        buf[ya + 1] = side * buf[ya + 1];
+        var tmp = buf[xa];
+        buf[xa] = tmp - buf[ya];
+        buf[ya] = tmp + buf[ya];
+        tmp = buf[xa + 1];
+        buf[xa + 1] = tmp - buf[ya + 1];
+        buf[ya + 1] = tmp + buf[ya + 1];
+    } else {
+        var mbits = celtImax(0, celtImin(b, (b - s.delta) / 2));
+        var sbits = b - mbits;
+        ctx.remainingBits -= s.qalloc;
+        var rebalance = ctx.remainingBits;
+        let shifted = fill >> truncate<u32>(bb);
+        if (mbits >= sbits) {
+            cm = quantBand(mut ctx, mut ec, mut buf[..], xa, n, mbits, bb, lowband, lm, lowbandOut, 1.0, scratch, fill);
+            rebalance = mbits - (rebalance - ctx.remainingBits);
+            if (rebalance > 24 && itheta != 0) {
+                sbits += rebalance - 24;
+            }
+            cm = cm | quantBand(mut ctx, mut ec, mut buf[..], ya, n, sbits, bb, null, lm, null, side, null, shifted);
+        } else {
+            cm = quantBand(mut ctx, mut ec, mut buf[..], ya, n, sbits, bb, null, lm, null, side, null, shifted);
+            rebalance = sbits - (rebalance - ctx.remainingBits);
+            if (rebalance > 24 && itheta != 16384) {
+                mbits += rebalance - 24;
+            }
+            cm = cm | quantBand(mut ctx, mut ec, mut buf[..], xa, n, mbits, bb, lowband, lm, lowbandOut, 1.0, scratch, fill);
+        }
+    }
+    if (n != 2) {
+        stereoMerge(mut buf[..], xa, ya, mid, truncate<usize>(n));
+    }
+    if (s.inv) {
+        for (j in 0usize..truncate<usize>(n)) {
+            buf[ya + j] = -buf[ya + j];
+        }
+    }
+    return cm;
+}
+
+/// Where the parts of `buf` are: X at 0, Y at `y`, the folding memory at `norm` and `norm2`.
+struct BandLayout {
+    y: usize;
+    norm: usize;
+    norm2: usize;
+}
+
+/// The band decoder's scratch length for `lm` and `c` channels: X and Y, then two folding memories.
+fn bandBufferLength() -> usize => 2 * 960 + 2 * 8 * 100;
+
+/// Decodes every band's shape (libopus's quant_all_bands, decoding). `buf` is laid out as `layout` says, X being the
+/// first channel's coefficients and Y the second's (when `c` is 2). Gives the seed after.
+fn quantAllBands<region r>(start: usize, end: usize, buf: SliceMut<f32>, layout: BandLayout, c: usize, masks: SliceMut<u8>,
+    pulses: borrow [i32; 21], shortBlocks: bool, spread: i32, dualStereo0: bool, intensity: i32, tfRes: borrow [i32; 21],
+    totalBits: i32, balance0: i32, ec: borrow mut RangeDecoder<r>, lm: usize, codedBands: i32, seed: u32, disableInv: bool)
+    -> u32 {
+    let m = 1usize << lm;
+    let bb: i32 = if (shortBlocks) truncate<i32>(m) else 1;
+    let normOffset = m * ebu(start);
+    let norm = layout.norm;
+    let norm2 = layout.norm2;
+    var scratch: usize? = Some(m * ebu(NB_EBANDS - 1));
+    var lowbandOffset: usize = 0;
+    var updateLowband = true;
+    var dualStereo = dualStereo0;
+    var balance = balance0;
+    var ctx = BandCtx {
+        i: 0,
+        intensity: intensity,
+        spread: spread,
+        tfChange: 0,
+        remainingBits: 0,
+        seed: seed,
+        disableInv: disableInv,
+        avoidSplitNoise: bb > 1,
+    };
+    for (i in start..end) {
+        ctx.i = i;
+        let last = i == end - 1;
+        let xa = m * ebu(i);
+        let ya = layout.y + m * ebu(i);
+        let n = truncate<i32>(m * (ebu(i + 1) - ebu(i)));
+        let tell = truncate<i32>(ec.tellFrac());
+        if (i != start) {
+            balance -= tell;
+        }
+        let remaining = totalBits - tell - 1;
+        ctx.remainingBits = remaining;
+        var b: i32 = 0;
+        if (truncate<i32>(i) <= codedBands - 1) {
+            let currBalance = celtSdiv(balance, celtImin(3, codedBands - truncate<i32>(i)));
+            b = celtImax(0, celtImin(16383, celtImin(remaining + 1, pulses[i] + currBalance)));
+        }
+        let bandStart = m * ebu(i);
+        if ((bandStart >= truncate<usize>(n) && bandStart - truncate<usize>(n) >= m * ebu(start) || i == start + 1)
+            && (updateLowband || lowbandOffset == 0)) {
+            lowbandOffset = i;
+        }
+        if (i == start + 1) {
+            let n1 = m * (ebu(start + 1) - ebu(start));
+            let n2 = m * (ebu(start + 2) - ebu(start + 1));
+            for (j in 0usize..n2 - n1) {
+                buf[norm + n1 + j] = buf[norm + 2 * n1 - n2 + j];
+                if (dualStereo) {
+                    buf[norm2 + n1 + j] = buf[norm2 + 2 * n1 - n2 + j];
+                }
+            }
+        }
+        let tfChange = tfRes[i];
+        ctx.tfChange = tfChange;
+        if (last) {
+            scratch = null;
+        }
+        var effectiveLowband: i64 = -1;
+        var xcm: u32 = 0;
+        var ycm: u32 = 0;
+        if (lowbandOffset != 0 && (spread != SPREAD_AGGRESSIVE || bb > 1 || tfChange < 0)) {
+            let e = celtImax(0, truncate<i32>(m * ebu(lowbandOffset)) - truncate<i32>(normOffset) - n);
+            effectiveLowband = e as i64;
+            let eu = truncate<usize>(e);
+            var foldStart = lowbandOffset;
+            loop {
+                foldStart -= 1;
+                if (m * ebu(foldStart) <= eu + normOffset) {
+                    break;
+                }
+            }
+            var foldEnd = lowbandOffset - 1;
+            loop {
+                foldEnd += 1;
+                if (!(foldEnd < i && m * ebu(foldEnd) < eu + normOffset + truncate<usize>(n))) {
+                    break;
+                }
+            }
+            var foldI = foldStart;
+            loop {
+                xcm = xcm | (masks[foldI * c] as u32);
+                ycm = ycm | (masks[foldI * c + c - 1] as u32);
+                foldI += 1;
+                if (foldI >= foldEnd) {
+                    break;
+                }
+            }
+        } else {
+            xcm = (1u32 << truncate<u32>(bb)) - 1;
+            ycm = xcm;
+        }
+        if (dualStereo && truncate<i32>(i) == intensity) {
+            dualStereo = false;
+            for (j in 0usize..bandStart - normOffset) {
+                buf[norm + j] = 0.5 * (buf[norm + j] + buf[norm2 + j]);
+            }
+        }
+        let lowOut: usize? = if (last) null else Some(norm + bandStart - normOffset);
+        let lowOut2: usize? = if (last) null else Some(norm2 + bandStart - normOffset);
+        let low: usize? = if (effectiveLowband >= 0) Some(norm + truncate<usize>(effectiveLowband)) else null;
+        let low2: usize? = if (effectiveLowband >= 0) Some(norm2 + truncate<usize>(effectiveLowband)) else null;
+        if (dualStereo) {
+            xcm = quantBand(mut ctx, mut ec, mut buf[..], xa, n, b / 2, bb, low, truncate<i32>(lm), lowOut, 1.0, scratch, xcm);
+            ycm = quantBand(mut ctx, mut ec, mut buf[..], ya, n, b / 2, bb, low2, truncate<i32>(lm), lowOut2, 1.0, scratch, ycm);
+        } else {
+            if (c == 2) {
+                xcm = quantBandStereo(mut ctx, mut ec, mut buf[..], xa, ya, n, b, bb, low, truncate<i32>(lm), lowOut, scratch,
+                    xcm | ycm);
+            } else {
+                xcm = quantBand(mut ctx, mut ec, mut buf[..], xa, n, b, bb, low, truncate<i32>(lm), lowOut, 1.0, scratch, xcm | ycm);
+            }
+            ycm = xcm;
+        }
+        masks[i * c] = truncate<u8>(xcm);
+        masks[i * c + c - 1] = truncate<u8>(ycm);
+        balance += pulses[i] + tell;
+        updateLowband = b > celtShl(n, 3);
+        ctx.avoidSplitNoise = false;
+    }
+    return ctx.seed;
+}

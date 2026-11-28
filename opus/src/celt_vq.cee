@@ -1,0 +1,114 @@
+// CELT's vector unquantisation (libopus 1.5.2 celt/vq.c, decoder side, float build; BSD).
+
+const SPREAD_NONE: i32 = 0;
+
+fn expRotation1(x: SliceMut<f32>, len: usize, stride: usize, c: f32, s: f32) {
+    let ms = -s;
+    if (len > stride) {
+        for (i in 0usize..len - stride) {
+            let x1 = x[i];
+            let x2 = x[i + stride];
+            x[i + stride] = c * x2 + s * x1;
+            x[i] = c * x1 + ms * x2;
+        }
+    }
+    if (len < 2 * stride + 1) {
+        return;
+    }
+    var i = len - 2 * stride - 1;
+    loop {
+        let x1 = x[i];
+        let x2 = x[i + stride];
+        x[i + stride] = c * x2 + s * x1;
+        x[i] = c * x1 + ms * x2;
+        if (i == 0) {
+            break;
+        }
+        i -= 1;
+    }
+}
+
+fn expRotation(x: SliceMut<f32>, len0: usize, dir: i32, stride: usize, k: i32, spread: i32) {
+    let factors: [i32; 3] = [15, 10, 5];
+    if (2 * k >= truncate<i32>(len0) || spread == SPREAD_NONE) {
+        return;
+    }
+    let factor = factors[truncate<usize>(spread - 1)];
+    let gain = round<f32>(truncate<i32>(len0)) / round<f32>(truncate<i32>(len0) + factor * k);
+    let theta = 0.5 * (gain * gain);
+    let c = celtCosNorm(theta);
+    let s = celtCosNorm(1.0 - theta);
+    var stride2: usize = 0;
+    if (len0 >= 8 * stride) {
+        stride2 = 1;
+        while ((stride2 * stride2 + stride2) * stride + (stride >> 2) < len0) {
+            stride2 += 1;
+        }
+    }
+    let len = len0 / stride;
+    for (i in 0usize..stride) {
+        if (dir < 0) {
+            if (stride2 != 0) {
+                expRotation1(mut x[i * len..], len, stride2, s, c);
+            }
+            expRotation1(mut x[i * len..], len, 1, c, s);
+        } else {
+            expRotation1(mut x[i * len..], len, 1, c, -s);
+            if (stride2 != 0) {
+                expRotation1(mut x[i * len..], len, stride2, s, -c);
+            }
+        }
+    }
+}
+
+fn normaliseResidual(iy: Slice<i32>, x: SliceMut<f32>, n: usize, ryy: f32, gain: f32) {
+    let g = celtRsqrt(ryy) * gain;
+    for (i in 0usize..n) {
+        x[i] = g * round<f32>(iy[i]);
+    }
+}
+
+fn extractCollapseMask(iy: Slice<i32>, n: usize, b: usize) -> u32 {
+    if (b <= 1) {
+        return 1;
+    }
+    let n0 = n / b;
+    var mask: u32 = 0;
+    for (i in 0usize..b) {
+        var any = false;
+        for (j in 0usize..n0) {
+            if (iy[i * n0 + j] != 0) {
+                any = true;
+            }
+        }
+        if (any) {
+            mask = mask | (1u32 << truncate<u32>(i));
+        }
+    }
+    return mask;
+}
+
+/// Decodes a band's shape: `k` pulses over `n` values, spread and normalised to `gain`; gives the collapse mask.
+fn algUnquant<region r>(x: SliceMut<f32>, n: usize, k: i32, spread: i32, b: usize, dec: borrow mut RangeDecoder<r>, gain: f32) -> u32 {
+    var iy = [0i32; 176];
+    let ryy = decodePulses(mut iy[..], truncate<i32>(n), k, dec);
+    normaliseResidual(iy[..], mut x[..], n, ryy, gain);
+    expRotation(mut x[..], n, -1, b, k, spread);
+    return extractCollapseMask(iy[..], n, b);
+}
+
+fn innerProd(a: Slice<f32>, b: Slice<f32>, n: usize) -> f32 {
+    var sum: f32 = 0.0;
+    for (i in 0usize..n) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+fn renormaliseVector(x: SliceMut<f32>, n: usize, gain: f32) {
+    let e = CELT_EPSILON + innerProd(x[..], x[..], n);
+    let g = celtRsqrt(e) * gain;
+    for (i in 0usize..n) {
+        x[i] = g * x[i];
+    }
+}

@@ -1,0 +1,1344 @@
+// SILK's decoder (RFC 6716 §4.2), ported bit-exactly from libopus 1.5.2: silk/dec_API.c, init_decoder.c,
+// decoder_set_fs.c, decode_frame.c, decode_indices.c, decode_pulses.c, shell_coder.c, code_signs.c, gain_quant.c,
+// decode_parameters.c, decode_pitch.c, decode_core.c, PLC.c, CNG.c, stereo_decode_pred.c and stereo_MS_to_LR.c. SILK
+// is fixed-point in every libopus build, so the output matches libopus's sample for sample.
+
+const SILK_MAX_FRAME_LENGTH: usize = 320;
+const SILK_MAX_SUB_FRAME_LENGTH: usize = 80;
+const SILK_MAX_NB_SUBFR: usize = 4;
+const SILK_LTP_ORDER: usize = 5;
+const SILK_TYPE_NO_VOICE_ACTIVITY: i32 = 0;
+const SILK_TYPE_VOICED: i32 = 2;
+const SILK_CODE_INDEPENDENTLY: i32 = 0;
+const SILK_CODE_INDEPENDENTLY_NO_LTP_SCALING: i32 = 1;
+const SILK_CODE_CONDITIONALLY: i32 = 2;
+const SILK_FLAG_DECODE_NORMAL: u32 = 0;
+const SILK_FLAG_PACKET_LOST: u32 = 1;
+const SILK_FLAG_DECODE_LBRR: u32 = 2;
+
+public enum SilkError {
+    /// The control's payload length is not 10, 20, 40 or 60 ms.
+    InvalidFrameSize,
+    /// The internal rate is not 8, 12 or 16 kHz, or the API rate is one this port does not silkResample to.
+    InvalidSamplingRate,
+    /// The output has too little room.
+    OutputTooSmall,
+}
+
+/// What the Opus layer tells SILK about a frame, and what it learns back (silk_DecControlStruct).
+public struct SilkControl {
+    public apiChannels: usize;
+    public internalChannels: usize;
+    public apiRate: u32;
+    public internalRate: u32;
+    public payloadMs: u32;
+    public prevPitchLag: i32;
+
+    public fn create() -> SilkControl => SilkControl {
+        apiChannels: 2,
+        internalChannels: 1,
+        apiRate: 48000,
+        internalRate: 16000,
+        payloadMs: 20,
+        prevPitchLag: 0,
+    };
+}
+
+struct SilkIndices {
+    gains: [i32; 4];
+    ltpIndex: [i32; 4];
+    nlsf: [i32; 17];
+    lagIndex: i32;
+    contourIndex: i32;
+    signalType: i32;
+    quantOffsetType: i32;
+    nlsfInterpCoefQ2: i32;
+    perIndex: i32;
+    ltpScaleIndex: i32;
+    seed: i32;
+}
+
+fn silkNewIndices() -> SilkIndices => SilkIndices {
+    gains: [0i32; 4],
+    ltpIndex: [0i32; 4],
+    nlsf: [0i32; 17],
+    lagIndex: 0,
+    contourIndex: 0,
+    signalType: 0,
+    quantOffsetType: 0,
+    nlsfInterpCoefQ2: 0,
+    perIndex: 0,
+    ltpScaleIndex: 0,
+    seed: 0,
+};
+
+struct SilkPlc {
+    pitchLQ8: i32;
+    ltpCoefQ14: [i16; 5];
+    prevLpcQ12: [i16; 16];
+    lastFrameLost: bool;
+    randSeed: i32;
+    randScaleQ14: i32;
+    concEnergy: i32;
+    concEnergyShift: i32;
+    prevLtpScaleQ14: i32;
+    prevGainQ16: [i32; 2];
+    fsKhz: i32;
+    nbSubfr: i32;
+    subfrLength: i32;
+}
+
+struct SilkCng {
+    excBufQ14: [i32; 320];
+    smthNlsfQ15: [i16; 16];
+    synthState: [i32; 16];
+    smthGainQ16: i32;
+    randSeed: i32;
+    fsKhz: i32;
+}
+
+/// silk_decoder_state: one channel's decoder.
+struct SilkChannelState {
+    prevGainQ16: i32;
+    excQ14: [i32; 320];
+    sLpcQ14: [i32; 16];
+    outBuf: [i16; 480];
+    lagPrev: i32;
+    lastGainIndex: i32;
+    fsKhz: i32;
+    fsApiHz: i32;
+    nbSubfr: i32;
+    frameLength: i32;
+    subfrLength: i32;
+    ltpMemLength: i32;
+    lpcOrder: i32;
+    prevNlsfQ15: [i16; 16];
+    firstFrameAfterReset: bool;
+    framesDecoded: i32;
+    framesPerPacket: i32;
+    ecPrevSignalType: i32;
+    ecPrevLagIndex: i32;
+    vadFlags: [bool; 3];
+    lbrrFlag: bool;
+    lbrrFlags: [bool; 3];
+    resampler: SilkResampler;
+    wideCodebook: bool;
+    indices: SilkIndices;
+    cng: SilkCng;
+    lossCnt: i32;
+    prevSignalType: i32;
+    plc: SilkPlc;
+}
+
+/// silk_decoder_control.
+struct SilkDecoderControl {
+    pitchL: [i32; 4];
+    gainsQ16: [i32; 4];
+    predCoefQ12: [[i16; 16]; 2];
+    ltpCoefQ14: [i16; 20];
+    ltpScaleQ14: i32;
+}
+
+fn silkNewControl() -> SilkDecoderControl => SilkDecoderControl {
+    pitchL: [0i32; 4],
+    gainsQ16: [0i32; 4],
+    predCoefQ12: [[0i16; 16]; 2],
+    ltpCoefQ14: [0i16; 20],
+    ltpScaleQ14: 0,
+};
+
+fn silkNewChannel() -> SilkChannelState {
+    var st = SilkChannelState {
+        prevGainQ16: 0,
+        excQ14: [0i32; 320],
+        sLpcQ14: [0i32; 16],
+        outBuf: [0i16; 480],
+        lagPrev: 0,
+        lastGainIndex: 0,
+        fsKhz: 0,
+        fsApiHz: 0,
+        nbSubfr: 0,
+        frameLength: 0,
+        subfrLength: 0,
+        ltpMemLength: 0,
+        lpcOrder: 0,
+        prevNlsfQ15: [0i16; 16],
+        firstFrameAfterReset: false,
+        framesDecoded: 0,
+        framesPerPacket: 0,
+        ecPrevSignalType: 0,
+        ecPrevLagIndex: 0,
+        vadFlags: [false; 3],
+        lbrrFlag: false,
+        lbrrFlags: [false; 3],
+        resampler: silkNewResampler(),
+        wideCodebook: false,
+        indices: silkNewIndices(),
+        cng: SilkCng { excBufQ14: [0i32; 320], smthNlsfQ15: [0i16; 16], synthState: [0i32; 16], smthGainQ16: 0, randSeed: 0, fsKhz: 0 },
+        lossCnt: 0,
+        prevSignalType: 0,
+        plc: SilkPlc {
+            pitchLQ8: 0,
+            ltpCoefQ14: [0i16; 5],
+            prevLpcQ12: [0i16; 16],
+            lastFrameLost: false,
+            randSeed: 0,
+            randScaleQ14: 0,
+            concEnergy: 0,
+            concEnergyShift: 0,
+            prevLtpScaleQ14: 0,
+            prevGainQ16: [0i32; 2],
+            fsKhz: 0,
+            nbSubfr: 0,
+            subfrLength: 0,
+        },
+    };
+    silkResetChannel(mut st);
+    return st;
+}
+
+/// silk_reset_decoder: everything from prev_gain_Q16 on cleared (what comes before it, nothing, is kept).
+fn silkResetChannel(st: borrow mut SilkChannelState) {
+    st.prevGainQ16 = 65536;
+    st.excQ14 = [0i32; 320];
+    st.sLpcQ14 = [0i32; 16];
+    st.outBuf = [0i16; 480];
+    st.lagPrev = 0;
+    st.lastGainIndex = 0;
+    st.fsKhz = 0;
+    st.fsApiHz = 0;
+    st.nbSubfr = 0;
+    st.frameLength = 0;
+    st.subfrLength = 0;
+    st.ltpMemLength = 0;
+    st.lpcOrder = 0;
+    st.prevNlsfQ15 = [0i16; 16];
+    st.firstFrameAfterReset = true;
+    st.framesDecoded = 0;
+    st.framesPerPacket = 0;
+    st.ecPrevSignalType = 0;
+    st.ecPrevLagIndex = 0;
+    st.vadFlags = [false; 3];
+    st.lbrrFlag = false;
+    st.lbrrFlags = [false; 3];
+    st.resampler = silkNewResampler();
+    st.wideCodebook = false;
+    st.indices = silkNewIndices();
+    st.cng.excBufQ14 = [0i32; 320];
+    st.cng.synthState = [0i32; 16];
+    st.cng.fsKhz = 0;
+    st.lossCnt = 0;
+    st.prevSignalType = 0;
+    st.plc.ltpCoefQ14 = [0i16; 5];
+    st.plc.prevLpcQ12 = [0i16; 16];
+    st.plc.lastFrameLost = false;
+    st.plc.randSeed = 0;
+    st.plc.randScaleQ14 = 0;
+    st.plc.concEnergy = 0;
+    st.plc.concEnergyShift = 0;
+    st.plc.prevLtpScaleQ14 = 0;
+    st.plc.fsKhz = 0;
+    silkCngReset(st);
+    silkPlcReset(st);
+}
+
+/// silk_decoder_set_fs.
+fn silkSetFs(st: borrow mut SilkChannelState, fsKhz: i32, fsApiHz: i32) -> bool {
+    var ok = true;
+    st.subfrLength = silkSmulbb(5, fsKhz);
+    let frameLength = silkSmulbb(st.nbSubfr, st.subfrLength);
+    if (st.fsKhz != fsKhz || st.fsApiHz != fsApiHz) {
+        ok = silkResamplerInit(mut st.resampler, silkSmulbb(fsKhz, 1000), fsApiHz);
+        st.fsApiHz = fsApiHz;
+    }
+    if (st.fsKhz != fsKhz || frameLength != st.frameLength) {
+        if (st.fsKhz != fsKhz) {
+            st.ltpMemLength = silkSmulbb(20, fsKhz);
+            if (fsKhz == 8 || fsKhz == 12) {
+                st.lpcOrder = 10;
+                st.wideCodebook = false;
+            } else {
+                st.lpcOrder = 16;
+                st.wideCodebook = true;
+            }
+            st.firstFrameAfterReset = true;
+            st.lagPrev = 100;
+            st.lastGainIndex = 10;
+            st.prevSignalType = SILK_TYPE_NO_VOICE_ACTIVITY;
+            st.outBuf = [0i16; 480];
+            st.sLpcQ14 = [0i32; 16];
+        }
+        st.fsKhz = fsKhz;
+        st.frameLength = frameLength;
+    }
+    return ok;
+}
+
+fn silkPitchContourIcdf(st: borrow SilkChannelState) -> Slice<static, u8> {
+    if (st.fsKhz == 8) {
+        return if (st.nbSubfr == 4) silk_pitch_contour_NB_iCDF[..] else silk_pitch_contour_10_ms_NB_iCDF[..];
+    }
+    return if (st.nbSubfr == 4) silk_pitch_contour_iCDF[..] else silk_pitch_contour_10_ms_iCDF[..];
+}
+
+fn silkPitchLagLowBitsIcdf(st: borrow SilkChannelState) -> Slice<static, u8> =>
+    if (st.fsKhz == 16) silk_uniform8_iCDF[..] else if (st.fsKhz == 12) silk_uniform6_iCDF[..] else silk_uniform4_iCDF[..];
+
+fn silkLtpGainIcdf(per: i32) -> Slice<static, u8> =>
+    if (per == 0) silk_LTP_gain_iCDF_0[..] else if (per == 1) silk_LTP_gain_iCDF_1[..] else silk_LTP_gain_iCDF_2[..];
+
+fn silkLtpVq(per: i32, i: usize) -> i32 =>
+    if (per == 0) silk_LTP_gain_vq_0[i] as i32 else if (per == 1) silk_LTP_gain_vq_1[i] as i32 else silk_LTP_gain_vq_2[i] as i32;
+
+fn silkIcdf8<region r>(ec: borrow mut RangeDecoder<r>, table: Slice<u8>) -> i32 => truncate<i32>(ec.icdf(table, 8));
+
+/// silk_decode_indices.
+fn silkDecodeIndices<region r>(st: borrow mut SilkChannelState, ec: borrow mut RangeDecoder<r>, frameIndex: usize, decodeLbrr: bool, condCoding: i32) {
+    var ix: i32 = 0;
+    if (decodeLbrr || st.vadFlags[frameIndex]) {
+        ix = silkIcdf8(ec, silk_type_offset_VAD_iCDF[..]) + 2;
+    } else {
+        ix = silkIcdf8(ec, silk_type_offset_no_VAD_iCDF[..]);
+    }
+    st.indices.signalType = silkRsh(ix, 1);
+    st.indices.quantOffsetType = truncate<i32>(truncate<u32>(ix) & 1);
+    if (condCoding == SILK_CODE_CONDITIONALLY) {
+        st.indices.gains[0] = silkIcdf8(ec, silk_delta_gain_iCDF[..]);
+    } else {
+        let row = truncate<usize>(st.indices.signalType) * 8;
+        st.indices.gains[0] = silkLsh(silkIcdf8(ec, silk_gain_iCDF[row..row + 8]), 3);
+        st.indices.gains[0] += silkIcdf8(ec, silk_uniform8_iCDF[..]);
+    }
+    for (i in 1usize..truncate<usize>(st.nbSubfr)) {
+        st.indices.gains[i] = silkIcdf8(ec, silk_delta_gain_iCDF[..]);
+    }
+    let cb = SilkNlsfCodebook { wide: st.wideCodebook };
+    let base = truncate<usize>(silkRsh(st.indices.signalType, 1) * cb.nVectors());
+    st.indices.nlsf[0] = silkIcdf8(ec, cb.cb1Icdf()[base..]);
+    var ecIx = [0i32; 16];
+    var predQ8 = [0i32; 16];
+    silkNlsfUnpack(mut ecIx, mut predQ8, borrow cb, st.indices.nlsf[0]);
+    for (i in 0usize..truncate<usize>(cb.order())) {
+        var v = silkIcdf8(ec, cb.ecIcdf()[truncate<usize>(ecIx[i])..]);
+        if (v == 0) {
+            v -= silkIcdf8(ec, silk_NLSF_EXT_iCDF[..]);
+        } else if (v == 2 * SILK_NLSF_QUANT_MAX_AMPLITUDE) {
+            v += silkIcdf8(ec, silk_NLSF_EXT_iCDF[..]);
+        }
+        st.indices.nlsf[i + 1] = v - SILK_NLSF_QUANT_MAX_AMPLITUDE;
+    }
+    if (st.nbSubfr == 4) {
+        st.indices.nlsfInterpCoefQ2 = silkIcdf8(ec, silk_NLSF_interpolation_factor_iCDF[..]);
+    } else {
+        st.indices.nlsfInterpCoefQ2 = 4;
+    }
+    if (st.indices.signalType == SILK_TYPE_VOICED) {
+        var absolute = true;
+        if (condCoding == SILK_CODE_CONDITIONALLY && st.ecPrevSignalType == SILK_TYPE_VOICED) {
+            var delta = silkIcdf8(ec, silk_pitch_delta_iCDF[..]);
+            if (delta > 0) {
+                delta = delta - 9;
+                st.indices.lagIndex = silkS16(st.ecPrevLagIndex + delta);
+                absolute = false;
+            }
+        }
+        if (absolute) {
+            st.indices.lagIndex = silkS16(silkIcdf8(ec, silk_pitch_lag_iCDF[..]) * silkRsh(st.fsKhz, 1));
+            let low = silkIcdf8(ec, silkPitchLagLowBitsIcdf(st));
+            st.indices.lagIndex = silkS16(st.indices.lagIndex + low);
+        }
+        st.ecPrevLagIndex = st.indices.lagIndex;
+        st.indices.contourIndex = silkIcdf8(ec, silkPitchContourIcdf(st));
+        st.indices.perIndex = silkIcdf8(ec, silk_LTP_per_index_iCDF[..]);
+        for (k in 0usize..truncate<usize>(st.nbSubfr)) {
+            st.indices.ltpIndex[k] = silkIcdf8(ec, silkLtpGainIcdf(st.indices.perIndex));
+        }
+        if (condCoding == SILK_CODE_INDEPENDENTLY) {
+            st.indices.ltpScaleIndex = silkIcdf8(ec, silk_LTPscale_iCDF[..]);
+        } else {
+            st.indices.ltpScaleIndex = 0;
+        }
+    }
+    st.ecPrevSignalType = st.indices.signalType;
+    st.indices.seed = silkIcdf8(ec, silk_uniform4_iCDF[..]);
+}
+
+/// decode_split, of shell_coder.c.
+fn silkDecodeSplit<region r>(ec: borrow mut RangeDecoder<r>, p: i32, table: Slice<u8>, child: borrow mut [i32; 2]) {
+    if (p > 0) {
+        child[0] = silkIcdf8(ec, table[silk_shell_code_table_offsets[truncate<usize>(p)] as usize..]);
+        child[1] = p - child[0];
+    } else {
+        child[0] = 0;
+        child[1] = 0;
+    }
+}
+
+/// silk_shell_decoder: 16 pulse counts summing to `pulses4`, into pulses[at..at + 16].
+fn silkShellDecoder<region r>(pulses: borrow mut [i32; 336], at: usize, ec: borrow mut RangeDecoder<r>, pulses4: i32) {
+    var c = [0i32; 2];
+    var p3 = [0i32; 2];
+    var p2 = [0i32; 4];
+    var p1 = [0i32; 8];
+    silkDecodeSplit(ec, pulses4, silk_shell_code_table3[..], mut c);
+    p3[0] = c[0];
+    p3[1] = c[1];
+    for (a in 0usize..2) {
+        silkDecodeSplit(ec, p3[a], silk_shell_code_table2[..], mut c);
+        p2[2 * a] = c[0];
+        p2[2 * a + 1] = c[1];
+        for (b in 0usize..2) {
+            silkDecodeSplit(ec, p2[2 * a + b], silk_shell_code_table1[..], mut c);
+            p1[4 * a + 2 * b] = c[0];
+            p1[4 * a + 2 * b + 1] = c[1];
+            for (e in 0usize..2) {
+                silkDecodeSplit(ec, p1[4 * a + 2 * b + e], silk_shell_code_table0[..], mut c);
+                let o = at + 8 * a + 4 * b + 2 * e;
+                pulses[o] = c[0];
+                pulses[o + 1] = c[1];
+            }
+        }
+    }
+}
+
+/// silk_decode_pulses, with silk_decode_signs.
+fn silkDecodePulses<region r>(ec: borrow mut RangeDecoder<r>, pulses: borrow mut [i32; 336], signalType: i32, quantOffsetType: i32, frameLength: i32) {
+    let rateLevel = truncate<usize>(silkIcdf8(ec, silk_rate_levels_iCDF[truncate<usize>(silkRsh(signalType, 1)) * 9..]));
+    var iter = truncate<usize>(silkRsh(frameLength, 4));
+    if (iter * 16 < truncate<usize>(frameLength)) {
+        iter += 1;
+    }
+    var sumPulses = [0i32; 21];
+    var nLshifts = [0i32; 21];
+    for (i in 0usize..iter) {
+        nLshifts[i] = 0;
+        sumPulses[i] = silkIcdf8(ec, silk_pulses_per_block_iCDF[rateLevel * 18..]);
+        while (sumPulses[i] == 17) {
+            nLshifts[i] += 1;
+            let extra: usize = if (nLshifts[i] == 10) 1 else 0;
+            sumPulses[i] = silkIcdf8(ec, silk_pulses_per_block_iCDF[9 * 18 + extra..]);
+        }
+    }
+    for (i in 0usize..iter) {
+        if (sumPulses[i] > 0) {
+            silkShellDecoder(mut pulses, i * 16, ec, sumPulses[i]);
+        } else {
+            for (k in 0usize..16) {
+                pulses[i * 16 + k] = 0;
+            }
+        }
+    }
+    for (i in 0usize..iter) {
+        if (nLshifts[i] > 0) {
+            let nls = nLshifts[i];
+            for (k in 0usize..16) {
+                var absQ = pulses[i * 16 + k];
+                for (j in 0..nls) {
+                    absQ = silkLsh(absQ, 1);
+                    absQ += silkIcdf8(ec, silk_lsb_iCDF[..]);
+                }
+                pulses[i * 16 + k] = absQ;
+            }
+            sumPulses[i] = truncate<i32>(truncate<u32>(sumPulses[i]) | truncate<u32>(silkLsh(nls, 5)));
+        }
+    }
+    // silk_decode_signs
+    let base = truncate<usize>(silkSmulbb(7, quantOffsetType + silkLsh(signalType, 1)));
+    let blocks = truncate<usize>(silkRsh(frameLength + 8, 4));
+    var icdf = [0u8; 2];
+    for (i in 0usize..blocks) {
+        let p = sumPulses[i];
+        if (p > 0) {
+            icdf[0] = silk_sign_iCDF[base + truncate<usize>(silkMin32(truncate<i32>(truncate<u32>(p) & 0x1F), 6))];
+            for (j in 0usize..16) {
+                let at = i * 16 + j;
+                if (pulses[at] > 0) {
+                    // The first of the two reads only decides the sign (silk_dec_map of a one-bit symbol: -1 or 1).
+                    let sign = silkIcdf8(ec, icdf[..]);
+                    pulses[at] = pulses[at] * (silkLsh(sign, 1) - 1);
+                }
+            }
+        }
+    }
+}
+
+/// silk_gains_dequant.
+fn silkGainsDequant(gainQ16: borrow mut [i32; 4], ind: borrow [i32; 4], prev: borrow mut i32, conditional: bool, nbSubfr: usize) {
+    for (k in 0usize..nbSubfr) {
+        if (k == 0 && !conditional) {
+            prev = silkS8(silkMax32(ind[k], prev - 16));
+        } else {
+            let indTmp = ind[k] - 4;
+            let threshold = 2 * 36 - 64 + prev;
+            if (indTmp > threshold) {
+                prev = silkS8(prev + silkLsh(indTmp, 1) - threshold);
+            } else {
+                prev = silkS8(prev + indTmp);
+            }
+        }
+        prev = silkLimit(prev, 0, 63);
+        gainQ16[k] = silkLog2lin(silkMin32(silkSmulwb(1907825, prev) + 2090, 3967));
+    }
+}
+
+fn silkS8(x: i32) -> i32 => truncate<i8>(x) as i32;
+
+/// silk_decode_pitch.
+fn silkDecodePitch(lagIndex: i32, contourIndex: i32, pitchLags: borrow mut [i32; 4], fsKhz: i32, nbSubfr: i32) {
+    let minLag = silkSmulbb(2, fsKhz);
+    let maxLag = silkSmulbb(18, fsKhz);
+    let lag = minLag + lagIndex;
+    for (k in 0usize..truncate<usize>(nbSubfr)) {
+        var entry: i32 = 0;
+        let c = truncate<usize>(contourIndex);
+        if (fsKhz == 8) {
+            entry = if (nbSubfr == 4) silk_CB_lags_stage2[k * 11 + c] as i32 else silk_CB_lags_stage2_10_ms[k * 3 + c] as i32;
+        } else {
+            entry = if (nbSubfr == 4) silk_CB_lags_stage3[k * 34 + c] as i32 else silk_CB_lags_stage3_10_ms[k * 12 + c] as i32;
+        }
+        pitchLags[k] = silkLimit(lag + entry, minLag, maxLag);
+    }
+}
+
+/// silk_decode_parameters.
+fn silkDecodeParameters(st: borrow mut SilkChannelState, ctrl: borrow mut SilkDecoderControl, condCoding: i32) {
+    var lastGain = st.lastGainIndex;
+    silkGainsDequant(mut ctrl.gainsQ16, borrow st.indices.gains, mut lastGain, condCoding == SILK_CODE_CONDITIONALLY, truncate<usize>(st.nbSubfr));
+    st.lastGainIndex = lastGain;
+    let cb = SilkNlsfCodebook { wide: st.wideCodebook };
+    var nlsf = [0i16; 16];
+    silkNlsfDecode(mut nlsf, borrow st.indices.nlsf, borrow cb);
+    let order = truncate<usize>(st.lpcOrder);
+    silkNlsf2a(mut ctrl.predCoefQ12[1], borrow nlsf, order);
+    if (st.firstFrameAfterReset) {
+        st.indices.nlsfInterpCoefQ2 = 4;
+    }
+    if (st.indices.nlsfInterpCoefQ2 < 4) {
+        var nlsf0 = [0i16; 16];
+        for (i in 0usize..order) {
+            let prev = st.prevNlsfQ15[i] as i32;
+            nlsf0[i] = truncate<i16>(prev + silkRsh(silkMul32(st.indices.nlsfInterpCoefQ2, (nlsf[i] as i32) - prev), 2));
+        }
+        silkNlsf2a(mut ctrl.predCoefQ12[0], borrow nlsf0, order);
+    } else {
+        for (i in 0usize..order) {
+            ctrl.predCoefQ12[0][i] = ctrl.predCoefQ12[1][i];
+        }
+    }
+    for (i in 0usize..order) {
+        st.prevNlsfQ15[i] = nlsf[i];
+    }
+    if (st.lossCnt != 0) {
+        silkBwexpander(mut ctrl.predCoefQ12[0], order, 63570);
+        silkBwexpander(mut ctrl.predCoefQ12[1], order, 63570);
+    }
+    if (st.indices.signalType == SILK_TYPE_VOICED) {
+        silkDecodePitch(st.indices.lagIndex, st.indices.contourIndex, mut ctrl.pitchL, st.fsKhz, st.nbSubfr);
+        for (k in 0usize..truncate<usize>(st.nbSubfr)) {
+            let ix = truncate<usize>(st.indices.ltpIndex[k]);
+            for (i in 0usize..SILK_LTP_ORDER) {
+                ctrl.ltpCoefQ14[k * SILK_LTP_ORDER + i] = truncate<i16>(silkLsh(silkLtpVq(st.indices.perIndex, ix * SILK_LTP_ORDER + i), 7));
+            }
+        }
+        ctrl.ltpScaleQ14 = silk_LTPScales_table_Q14[truncate<usize>(st.indices.ltpScaleIndex)] as i32;
+    } else {
+        for (k in 0usize..truncate<usize>(st.nbSubfr)) {
+            ctrl.pitchL[k] = 0;
+        }
+        for (k in 0usize..SILK_LTP_ORDER * truncate<usize>(st.nbSubfr)) {
+            ctrl.ltpCoefQ14[k] = 0;
+        }
+        st.indices.perIndex = 0;
+        ctrl.ltpScaleQ14 = 0;
+    }
+}
+
+/// The LPC synthesis of one sample: `sig[at - 1]` back to `sig[at - order]` weighted by `a`.
+fn silkLpcPredQ10(sig: borrow [i32; 336], at: usize, a: borrow [i16; 16], order: usize) -> i32 {
+    var pred = silkRsh(truncate<i32>(order), 1);
+    for (j in 0usize..order) {
+        pred = silkSmlawb(pred, sig[at - j - 1], a[j] as i32);
+    }
+    return pred;
+}
+
+/// silk_decode_core: the excitation, LTP and LPC synthesis of one frame into xq.
+fn silkDecodeCore(st: borrow mut SilkChannelState, ctrl: borrow mut SilkDecoderControl, xq: borrow mut [i16; 320], pulses: borrow [i32; 336]) {
+    var sLtp = [0i16; 320];
+    var sLtpQ15 = [0i32; 640];
+    var resQ14 = [0i32; 80];
+    var sLpcQ14 = [0i32; 336];
+    let offsetQ10 = silk_Quantization_Offsets_Q10[truncate<usize>(silkRsh(st.indices.signalType, 1) * 2 + st.indices.quantOffsetType)] as i32;
+    let interpolation = st.indices.nlsfInterpCoefQ2 < 4;
+    var randSeed = st.indices.seed;
+    let frameLength = truncate<usize>(st.frameLength);
+    let subfrLength = truncate<usize>(st.subfrLength);
+    let ltpMem = truncate<usize>(st.ltpMemLength);
+    let order = truncate<usize>(st.lpcOrder);
+    for (i in 0usize..frameLength) {
+        randSeed = silkSilkRand(randSeed);
+        var e = silkLsh(pulses[i], 14);
+        if (e > 0) {
+            e -= 1280;
+        } else if (e < 0) {
+            e += 1280;
+        }
+        e += silkLsh(offsetQ10, 4);
+        if (randSeed < 0) {
+            e = 0 - e;
+        }
+        st.excQ14[i] = e;
+        randSeed = randSeed.wrappingAdd(pulses[i]);
+    }
+    for (i in 0usize..16) {
+        sLpcQ14[i] = st.sLpcQ14[i];
+    }
+    var excAt: usize = 0;
+    var xqAt: usize = 0;
+    var sLtpBufIdx = ltpMem;
+    var lag: i32 = 0;
+    for (k in 0usize..truncate<usize>(st.nbSubfr)) {
+        let aQ12 = ctrl.predCoefQ12[k >> 1];
+        var bQ14 = [0i32; 5];
+        for (i in 0usize..SILK_LTP_ORDER) {
+            bQ14[i] = ctrl.ltpCoefQ14[k * SILK_LTP_ORDER + i] as i32;
+        }
+        var signalType = st.indices.signalType;
+        let gainQ10 = silkRsh(ctrl.gainsQ16[k], 6);
+        var invGainQ31 = silkInverse32varQ(ctrl.gainsQ16[k], 47);
+        var gainAdjQ16: i32 = 65536;
+        if (ctrl.gainsQ16[k] != st.prevGainQ16) {
+            gainAdjQ16 = silkDiv32varQ(st.prevGainQ16, ctrl.gainsQ16[k], 16);
+            for (i in 0usize..16) {
+                sLpcQ14[i] = silkSmulww(gainAdjQ16, sLpcQ14[i]);
+            }
+        }
+        st.prevGainQ16 = ctrl.gainsQ16[k];
+        if (st.lossCnt != 0 && st.prevSignalType == SILK_TYPE_VOICED && st.indices.signalType != SILK_TYPE_VOICED && k < 2) {
+            bQ14 = [0i32; 5];
+            bQ14[2] = 4096;
+            for (i in 0usize..SILK_LTP_ORDER) {
+                ctrl.ltpCoefQ14[k * SILK_LTP_ORDER + i] = truncate<i16>(bQ14[i]);
+            }
+            signalType = SILK_TYPE_VOICED;
+            ctrl.pitchL[k] = st.lagPrev;
+        }
+        if (signalType == SILK_TYPE_VOICED) {
+            lag = ctrl.pitchL[k];
+            if (k == 0 || (k == 2 && interpolation)) {
+                let startIdx = truncate<usize>(st.ltpMemLength - lag - st.lpcOrder - 2);
+                if (k == 2) {
+                    for (i in 0usize..2 * subfrLength) {
+                        st.outBuf[ltpMem + i] = xq[i];
+                    }
+                }
+                silkLpcAnalysisFilter(mut sLtp[..], startIdx, st.outBuf[..], startIdx + k * subfrLength, borrow aQ12, ltpMem - startIdx, order);
+                if (k == 0) {
+                    invGainQ31 = silkLsh(silkSmulwb(invGainQ31, ctrl.ltpScaleQ14), 2);
+                }
+                for (i in 0usize..truncate<usize>(lag) + 2) {
+                    sLtpQ15[sLtpBufIdx - i - 1] = silkSmulwb(invGainQ31, sLtp[ltpMem - i - 1] as i32);
+                }
+            } else if (gainAdjQ16 != 65536) {
+                for (i in 0usize..truncate<usize>(lag) + 2) {
+                    sLtpQ15[sLtpBufIdx - i - 1] = silkSmulww(gainAdjQ16, sLtpQ15[sLtpBufIdx - i - 1]);
+                }
+            }
+        }
+        if (signalType == SILK_TYPE_VOICED) {
+            var predAt = sLtpBufIdx + 2 - truncate<usize>(lag);
+            for (i in 0usize..subfrLength) {
+                var ltp: i32 = 2;
+                ltp = silkSmlawb(ltp, sLtpQ15[predAt], bQ14[0]);
+                ltp = silkSmlawb(ltp, sLtpQ15[predAt - 1], bQ14[1]);
+                ltp = silkSmlawb(ltp, sLtpQ15[predAt - 2], bQ14[2]);
+                ltp = silkSmlawb(ltp, sLtpQ15[predAt - 3], bQ14[3]);
+                ltp = silkSmlawb(ltp, sLtpQ15[predAt - 4], bQ14[4]);
+                predAt += 1;
+                resQ14[i] = st.excQ14[excAt + i].wrappingAdd(silkLsh(ltp, 1));
+                sLtpQ15[sLtpBufIdx] = silkLsh(resQ14[i], 1);
+                sLtpBufIdx += 1;
+            }
+        } else {
+            for (i in 0usize..subfrLength) {
+                resQ14[i] = st.excQ14[excAt + i];
+            }
+        }
+        for (i in 0usize..subfrLength) {
+            let pred = silkLpcPredQ10(borrow sLpcQ14, 16 + i, borrow aQ12, order);
+            sLpcQ14[16 + i] = silkAddSat32(resQ14[i], silkLshiftSat32(pred, 4));
+            xq[xqAt + i] = truncate<i16>(silkSat16(silkRshiftRound(silkSmulww(sLpcQ14[16 + i], gainQ10), 8)));
+        }
+        for (i in 0usize..16) {
+            sLpcQ14[i] = sLpcQ14[subfrLength + i];
+        }
+        excAt += subfrLength;
+        xqAt += subfrLength;
+    }
+    for (i in 0usize..16) {
+        st.sLpcQ14[i] = sLpcQ14[i];
+    }
+}
+
+// ---- PLC (silk/PLC.c) ----
+
+const SILK_HARM_ATT_Q15: [i32; 2] = [32440, 31130];
+const SILK_PLC_RAND_ATTENUATE_V_Q15: [i32; 2] = [31130, 26214];
+const SILK_PLC_RAND_ATTENUATE_UV_Q15: [i32; 2] = [32440, 29491];
+
+fn silkPlcReset(st: borrow mut SilkChannelState) {
+    st.plc.pitchLQ8 = silkLsh(st.frameLength, 7);
+    st.plc.prevGainQ16[0] = 65536;
+    st.plc.prevGainQ16[1] = 65536;
+    st.plc.subfrLength = 20;
+    st.plc.nbSubfr = 2;
+}
+
+fn silkPlc(st: borrow mut SilkChannelState, ctrl: borrow mut SilkDecoderControl, frame: borrow mut [i16; 320], lost: bool) {
+    if (st.fsKhz != st.plc.fsKhz) {
+        silkPlcReset(st);
+        st.plc.fsKhz = st.fsKhz;
+    }
+    if (lost) {
+        silkPlcConceal(st, ctrl, frame);
+        st.lossCnt += 1;
+    } else {
+        silkPlcUpdate(st, ctrl);
+    }
+}
+
+fn silkPlcUpdate(st: borrow mut SilkChannelState, ctrl: borrow SilkDecoderControl) {
+    st.prevSignalType = st.indices.signalType;
+    var ltpGain: i32 = 0;
+    let nb = truncate<usize>(st.nbSubfr);
+    if (st.indices.signalType == SILK_TYPE_VOICED) {
+        var j: usize = 0;
+        while (truncate<i32>(j) * st.subfrLength < ctrl.pitchL[nb - 1]) {
+            if (j == nb) {
+                break;
+            }
+            var temp: i32 = 0;
+            for (i in 0usize..SILK_LTP_ORDER) {
+                temp += ctrl.ltpCoefQ14[(nb - 1 - j) * SILK_LTP_ORDER + i] as i32;
+            }
+            if (temp > ltpGain) {
+                ltpGain = temp;
+                for (i in 0usize..SILK_LTP_ORDER) {
+                    st.plc.ltpCoefQ14[i] = ctrl.ltpCoefQ14[(nb - 1 - j) * SILK_LTP_ORDER + i];
+                }
+                st.plc.pitchLQ8 = silkLsh(ctrl.pitchL[nb - 1 - j], 8);
+            }
+            j += 1;
+        }
+        st.plc.ltpCoefQ14 = [0i16; 5];
+        st.plc.ltpCoefQ14[2] = truncate<i16>(ltpGain);
+        if (ltpGain < 11469) {
+            let scale = silkLsh(11469, 10) / silkMax32(ltpGain, 1);
+            for (i in 0usize..SILK_LTP_ORDER) {
+                st.plc.ltpCoefQ14[i] = truncate<i16>(silkRsh(silkSmulbb(st.plc.ltpCoefQ14[i] as i32, scale), 10));
+            }
+        } else if (ltpGain > 15565) {
+            let scale = silkLsh(15565, 14) / silkMax32(ltpGain, 1);
+            for (i in 0usize..SILK_LTP_ORDER) {
+                st.plc.ltpCoefQ14[i] = truncate<i16>(silkRsh(silkSmulbb(st.plc.ltpCoefQ14[i] as i32, scale), 14));
+            }
+        }
+    } else {
+        st.plc.pitchLQ8 = silkLsh(silkSmulbb(st.fsKhz, 18), 8);
+        st.plc.ltpCoefQ14 = [0i16; 5];
+    }
+    for (i in 0usize..truncate<usize>(st.lpcOrder)) {
+        st.plc.prevLpcQ12[i] = ctrl.predCoefQ12[1][i];
+    }
+    st.plc.prevLtpScaleQ14 = ctrl.ltpScaleQ14;
+    st.plc.prevGainQ16[0] = ctrl.gainsQ16[nb - 2];
+    st.plc.prevGainQ16[1] = ctrl.gainsQ16[nb - 1];
+    st.plc.subfrLength = st.subfrLength;
+    st.plc.nbSubfr = st.nbSubfr;
+}
+
+fn silkPlcConceal(st: borrow mut SilkChannelState, ctrl: borrow mut SilkDecoderControl, frame: borrow mut [i16; 320]) {
+    let ltpMem = truncate<usize>(st.ltpMemLength);
+    let frameLength = truncate<usize>(st.frameLength);
+    let subfrLength = truncate<usize>(st.subfrLength);
+    let order = truncate<usize>(st.lpcOrder);
+    var sLtpQ14 = [0i32; 640];
+    var sLtp = [0i16; 320];
+    var prevGainQ10 = [silkRsh(st.plc.prevGainQ16[0], 6), silkRsh(st.plc.prevGainQ16[1], 6)];
+    if (st.firstFrameAfterReset) {
+        st.plc.prevLpcQ12 = [0i16; 16];
+    }
+    // silk_PLC_energy
+    var excBuf = [0i16; 160];
+    for (k in 0usize..2) {
+        for (i in 0usize..subfrLength) {
+            let x = st.excQ14[i + (k + truncate<usize>(st.nbSubfr) - 2) * subfrLength];
+            excBuf[k * subfrLength + i] = truncate<i16>(silkSat16(silkRsh(silkSmulww(x, prevGainQ10[k]), 8)));
+        }
+    }
+    let e1 = silkSumSqrShift(excBuf[0..subfrLength]);
+    let e2 = silkSumSqrShift(excBuf[subfrLength..2 * subfrLength]);
+    var randAt: usize = 0;
+    if (silkRsh(e1.energy, e2.shift) < silkRsh(e2.energy, e1.shift)) {
+        randAt = truncate<usize>(silkMax32(0, (st.plc.nbSubfr - 1) * st.plc.subfrLength - 128));
+    } else {
+        randAt = truncate<usize>(silkMax32(0, st.plc.nbSubfr * st.plc.subfrLength - 128));
+    }
+    var bQ14 = [0i32; 5];
+    for (i in 0usize..SILK_LTP_ORDER) {
+        bQ14[i] = st.plc.ltpCoefQ14[i] as i32;
+    }
+    var randScaleQ14 = st.plc.randScaleQ14;
+    let att = truncate<usize>(silkMin32(1, st.lossCnt));
+    let harmGainQ15 = SILK_HARM_ATT_Q15[att];
+    var randGainQ15 = if (st.prevSignalType == SILK_TYPE_VOICED) SILK_PLC_RAND_ATTENUATE_V_Q15[att] else SILK_PLC_RAND_ATTENUATE_UV_Q15[att];
+    silkBwexpander(mut st.plc.prevLpcQ12, order, 64881);
+    let aQ12 = st.plc.prevLpcQ12;
+    if (st.lossCnt == 0) {
+        randScaleQ14 = 16384;
+        if (st.prevSignalType == SILK_TYPE_VOICED) {
+            for (i in 0usize..SILK_LTP_ORDER) {
+                randScaleQ14 -= bQ14[i];
+            }
+            randScaleQ14 = silkS16(silkMax32(3277, silkS16(randScaleQ14)));
+            randScaleQ14 = silkS16(silkRsh(silkSmulbb(randScaleQ14, st.plc.prevLtpScaleQ14), 14));
+        } else {
+            let invGain = silkLpcInversePredGain(borrow st.plc.prevLpcQ12, order);
+            var down = silkMin32(silkRsh(1073741824, 3), invGain);
+            down = silkMax32(silkRsh(1073741824, 8), down);
+            down = silkLsh(down, 3);
+            randGainQ15 = silkRsh(silkSmulwb(down, randGainQ15), 14);
+        }
+    }
+    var randSeed = st.plc.randSeed;
+    var lag = silkRshiftRound(st.plc.pitchLQ8, 8);
+    var sLtpBufIdx = ltpMem;
+    let idx = truncate<usize>(st.ltpMemLength - lag - st.lpcOrder - 2);
+    silkLpcAnalysisFilter(mut sLtp[..], idx, st.outBuf[..], idx, borrow aQ12, ltpMem - idx, order);
+    var invGainQ30 = silkInverse32varQ(st.plc.prevGainQ16[1], 46);
+    invGainQ30 = silkMin32(invGainQ30, 1073741823);
+    for (i in idx + order..ltpMem) {
+        sLtpQ14[i] = silkSmulwb(invGainQ30, sLtp[i] as i32);
+    }
+    for (k in 0usize..truncate<usize>(st.nbSubfr)) {
+        var predAt = sLtpBufIdx + 2 - truncate<usize>(lag);
+        for (i in 0usize..subfrLength) {
+            var ltp: i32 = 2;
+            ltp = silkSmlawb(ltp, sLtpQ14[predAt], bQ14[0]);
+            ltp = silkSmlawb(ltp, sLtpQ14[predAt - 1], bQ14[1]);
+            ltp = silkSmlawb(ltp, sLtpQ14[predAt - 2], bQ14[2]);
+            ltp = silkSmlawb(ltp, sLtpQ14[predAt - 3], bQ14[3]);
+            ltp = silkSmlawb(ltp, sLtpQ14[predAt - 4], bQ14[4]);
+            predAt += 1;
+            randSeed = silkSilkRand(randSeed);
+            let r = truncate<usize>(truncate<u32>(silkRsh(randSeed, 25)) & 127);
+            sLtpQ14[sLtpBufIdx] = silkLsh(silkSmlawb(ltp, st.excQ14[randAt + r], randScaleQ14), 2);
+            sLtpBufIdx += 1;
+        }
+        for (j in 0usize..SILK_LTP_ORDER) {
+            bQ14[j] = silkS16(silkRsh(silkSmulbb(harmGainQ15, bQ14[j]), 15));
+        }
+        randScaleQ14 = silkS16(silkRsh(silkSmulbb(randScaleQ14, randGainQ15), 15));
+        st.plc.pitchLQ8 = silkSmlawb(st.plc.pitchLQ8, st.plc.pitchLQ8, 655);
+        st.plc.pitchLQ8 = silkMin32(st.plc.pitchLQ8, silkLsh(silkSmulbb(18, st.fsKhz), 8));
+        lag = silkRshiftRound(st.plc.pitchLQ8, 8);
+    }
+    for (i in 0usize..SILK_LTP_ORDER) {
+        st.plc.ltpCoefQ14[i] = truncate<i16>(bQ14[i]);
+    }
+    let lpcAt = ltpMem - 16;
+    for (i in 0usize..16) {
+        sLtpQ14[lpcAt + i] = st.sLpcQ14[i];
+    }
+    for (i in 0usize..frameLength) {
+        var pred = silkRsh(truncate<i32>(order), 1);
+        for (j in 0usize..order) {
+            pred = silkSmlawb(pred, sLtpQ14[lpcAt + 16 + i - j - 1], aQ12[j] as i32);
+        }
+        sLtpQ14[lpcAt + 16 + i] = silkAddSat32(sLtpQ14[lpcAt + 16 + i], silkLshiftSat32(pred, 4));
+        frame[i] = truncate<i16>(silkSat16(silkRshiftRound(silkSmulww(sLtpQ14[lpcAt + 16 + i], prevGainQ10[1]), 8)));
+    }
+    for (i in 0usize..16) {
+        st.sLpcQ14[i] = sLtpQ14[lpcAt + frameLength + i];
+    }
+    st.plc.randSeed = randSeed;
+    st.plc.randScaleQ14 = randScaleQ14;
+    for (i in 0usize..4) {
+        ctrl.pitchL[i] = lag;
+    }
+}
+
+fn silkPlcGlueFrames(st: borrow mut SilkChannelState, frame: borrow mut [i16; 320], length: usize) {
+    if (st.lossCnt != 0) {
+        let e = silkSumSqrShift(frame[0..length]);
+        st.plc.concEnergy = e.energy;
+        st.plc.concEnergyShift = e.shift;
+        st.plc.lastFrameLost = true;
+        return;
+    }
+    if (st.plc.lastFrameLost) {
+        let e = silkSumSqrShift(frame[0..length]);
+        var energy = e.energy;
+        if (e.shift > st.plc.concEnergyShift) {
+            st.plc.concEnergy = silkRsh(st.plc.concEnergy, e.shift - st.plc.concEnergyShift);
+        } else if (e.shift < st.plc.concEnergyShift) {
+            energy = silkRsh(energy, st.plc.concEnergyShift - e.shift);
+        }
+        if (energy > st.plc.concEnergy) {
+            let lz = silkClz32(st.plc.concEnergy) - 1;
+            st.plc.concEnergy = silkLsh(st.plc.concEnergy, lz);
+            energy = silkRsh(energy, silkMax32(24 - lz, 0));
+            let frac = st.plc.concEnergy / silkMax32(energy, 1);
+            var gainQ16 = silkLsh(silkSqrtApprox(frac), 4);
+            var slopeQ16 = ((65536) - gainQ16) / truncate<i32>(length);
+            slopeQ16 = silkLsh(slopeQ16, 2);
+            for (i in 0usize..length) {
+                frame[i] = truncate<i16>(silkSmulwb(gainQ16, frame[i] as i32));
+                gainQ16 += slopeQ16;
+                if (gainQ16 > 65536) {
+                    break;
+                }
+            }
+        }
+    }
+    st.plc.lastFrameLost = false;
+}
+
+// ---- CNG (silk/CNG.c) ----
+
+fn silkCngReset(st: borrow mut SilkChannelState) {
+    let step = 32767 / (st.lpcOrder + 1);
+    var acc: i32 = 0;
+    for (i in 0usize..truncate<usize>(st.lpcOrder)) {
+        acc += step;
+        st.cng.smthNlsfQ15[i] = truncate<i16>(acc);
+    }
+    st.cng.smthGainQ16 = 0;
+    st.cng.randSeed = 3176576;
+}
+
+fn silkCng(st: borrow mut SilkChannelState, ctrl: borrow SilkDecoderControl, frame: borrow mut [i16; 320], length: usize) {
+    if (st.fsKhz != st.cng.fsKhz) {
+        silkCngReset(st);
+        st.cng.fsKhz = st.fsKhz;
+    }
+    let order = truncate<usize>(st.lpcOrder);
+    let subfrLength = truncate<usize>(st.subfrLength);
+    let nb = truncate<usize>(st.nbSubfr);
+    if (st.lossCnt == 0 && st.prevSignalType == SILK_TYPE_NO_VOICE_ACTIVITY) {
+        for (i in 0usize..order) {
+            let cur = st.cng.smthNlsfQ15[i] as i32;
+            st.cng.smthNlsfQ15[i] = truncate<i16>(cur + silkSmulwb((st.prevNlsfQ15[i] as i32) - cur, 16348));
+        }
+        var maxGain: i32 = 0;
+        var subfr: usize = 0;
+        for (i in 0usize..nb) {
+            if (ctrl.gainsQ16[i] > maxGain) {
+                maxGain = ctrl.gainsQ16[i];
+                subfr = i;
+            }
+        }
+        // memmove the buffer up by one subframe, then the loudest subframe's excitation first.
+        var i = (nb - 1) * subfrLength;
+        while (i > 0) {
+            i -= 1;
+            st.cng.excBufQ14[subfrLength + i] = st.cng.excBufQ14[i];
+        }
+        for (k in 0usize..subfrLength) {
+            st.cng.excBufQ14[k] = st.excQ14[subfr * subfrLength + k];
+        }
+        for (k in 0usize..nb) {
+            st.cng.smthGainQ16 = st.cng.smthGainQ16.wrappingAdd(silkSmulwb(ctrl.gainsQ16[k].wrappingSub(st.cng.smthGainQ16), 4634));
+            if (silkSmulww(st.cng.smthGainQ16, 46396) > ctrl.gainsQ16[k]) {
+                st.cng.smthGainQ16 = ctrl.gainsQ16[k];
+            }
+        }
+    }
+    if (st.lossCnt != 0) {
+        var sig = [0i32; 336];
+        var gainQ16 = silkSmulww(st.plc.randScaleQ14, st.plc.prevGainQ16[1]);
+        if (gainQ16 >= (2097152) || st.cng.smthGainQ16 > (8388608)) {
+            gainQ16 = silkSmultt(gainQ16, gainQ16);
+            gainQ16 = silkSmultt(st.cng.smthGainQ16, st.cng.smthGainQ16).wrappingSub(silkLsh(gainQ16, 5));
+            gainQ16 = silkLsh(silkSqrtApprox(gainQ16), 16);
+        } else {
+            gainQ16 = silkSmulww(gainQ16, gainQ16);
+            gainQ16 = silkSmulww(st.cng.smthGainQ16, st.cng.smthGainQ16).wrappingSub(silkLsh(gainQ16, 5));
+            gainQ16 = silkLsh(silkSqrtApprox(gainQ16), 8);
+        }
+        let gainQ10 = silkRsh(gainQ16, 6);
+        // silk_CNG_exc
+        var mask: i32 = 255;
+        while (mask > truncate<i32>(length)) {
+            mask = silkRsh(mask, 1);
+        }
+        var seed = st.cng.randSeed;
+        for (i in 0usize..length) {
+            seed = silkSilkRand(seed);
+            let at = truncate<usize>(truncate<u32>(silkRsh(seed, 24)) & truncate<u32>(mask));
+            sig[16 + i] = st.cng.excBufQ14[at];
+        }
+        st.cng.randSeed = seed;
+        var aQ12 = [0i16; 16];
+        silkNlsf2a(mut aQ12, borrow st.cng.smthNlsfQ15, order);
+        for (i in 0usize..16) {
+            sig[i] = st.cng.synthState[i];
+        }
+        for (i in 0usize..length) {
+            let pred = silkLpcPredQ10(borrow sig, 16 + i, borrow aQ12, order);
+            sig[16 + i] = silkAddSat32(sig[16 + i], silkLshiftSat32(pred, 4));
+            let add = silkSat16(silkRshiftRound(silkSmulww(sig[16 + i], gainQ10), 8));
+            frame[i] = truncate<i16>(silkSat16((frame[i] as i32) + add));
+        }
+        for (i in 0usize..16) {
+            st.cng.synthState[i] = sig[length + i];
+        }
+    } else {
+        for (i in 0usize..order) {
+            st.cng.synthState[i] = 0;
+        }
+    }
+}
+
+/// silk_decode_frame: one frame of `frame_length` samples into out.
+fn silkDecodeFrame<region r>(st: borrow mut SilkChannelState, ec: borrow mut RangeDecoder<r>, out: borrow mut [i16; 320], lostFlag: u32, condCoding: i32) -> usize {
+    var ctrl = silkNewControl();
+    let length = truncate<usize>(st.frameLength);
+    let frameIndex = truncate<usize>(st.framesDecoded);
+    if (lostFlag == SILK_FLAG_DECODE_NORMAL || (lostFlag == SILK_FLAG_DECODE_LBRR && st.lbrrFlags[frameIndex])) {
+        var pulses = [0i32; 336];
+        silkDecodeIndices(st, ec, frameIndex, lostFlag == SILK_FLAG_DECODE_LBRR, condCoding);
+        silkDecodePulses(ec, mut pulses, st.indices.signalType, st.indices.quantOffsetType, st.frameLength);
+        silkDecodeParameters(st, mut ctrl, condCoding);
+        silkDecodeCore(st, mut ctrl, mut out, borrow pulses);
+        silkMoveOutBuf(st, out);
+        silkPlc(st, mut ctrl, mut out, false);
+        st.lossCnt = 0;
+        st.prevSignalType = st.indices.signalType;
+        st.firstFrameAfterReset = false;
+    } else {
+        silkPlc(st, mut ctrl, mut out, true);
+        silkMoveOutBuf(st, out);
+    }
+    silkCng(st, borrow ctrl, mut out, length);
+    silkPlcGlueFrames(st, mut out, length);
+    st.lagPrev = ctrl.pitchL[truncate<usize>(st.nbSubfr) - 1];
+    return length;
+}
+
+fn silkMoveOutBuf(st: borrow mut SilkChannelState, out: borrow [i16; 320]) {
+    let frameLength = truncate<usize>(st.frameLength);
+    let mvLen = truncate<usize>(st.ltpMemLength - st.frameLength);
+    for (i in 0usize..mvLen) {
+        st.outBuf[i] = st.outBuf[frameLength + i];
+    }
+    for (i in 0usize..frameLength) {
+        st.outBuf[mvLen + i] = out[i];
+    }
+}
+
+/// silk_stereo_decode_pred.
+fn silkStereoDecodePred<region r>(ec: borrow mut RangeDecoder<r>, predQ13: borrow mut [i32; 2]) {
+    var n = silkIcdf8(ec, silk_stereo_pred_joint_iCDF[..]);
+    var ix = [0i32; 6];
+    ix[2] = n / 5;
+    ix[5] = n - 5 * ix[2];
+    for (c in 0usize..2) {
+        ix[c * 3] = silkIcdf8(ec, silk_uniform3_iCDF[..]);
+        ix[c * 3 + 1] = silkIcdf8(ec, silk_uniform5_iCDF[..]);
+    }
+    for (c in 0usize..2) {
+        ix[c * 3] += 3 * ix[c * 3 + 2];
+        let low = silk_stereo_pred_quant_Q13[truncate<usize>(ix[c * 3])] as i32;
+        let step = silkSmulwb((silk_stereo_pred_quant_Q13[truncate<usize>(ix[c * 3]) + 1] as i32) - low, 6554);
+        predQ13[c] = silkSmlabb(low, step, 2 * ix[c * 3 + 1] + 1);
+    }
+    n = 0;
+    predQ13[0] -= predQ13[1];
+}
+
+struct SilkStereo {
+    predPrevQ13: [i16; 2];
+    sMid: [i16; 2];
+    sSide: [i16; 2];
+}
+
+/// silk_stereo_MS_to_LR: mid and side (x1, x2: history in [0..2], the frame from [2..]) to left and right.
+fn silkStereoMsToLr(state: borrow mut SilkStereo, x1: borrow mut [i16; 322], x2: borrow mut [i16; 322], predQ13: borrow [i32; 2], fsKhz: i32, frameLength: usize) {
+    x1[0] = state.sMid[0];
+    x1[1] = state.sMid[1];
+    x2[0] = state.sSide[0];
+    x2[1] = state.sSide[1];
+    state.sMid[0] = x1[frameLength];
+    state.sMid[1] = x1[frameLength + 1];
+    state.sSide[0] = x2[frameLength];
+    state.sSide[1] = x2[frameLength + 1];
+    var pred0 = state.predPrevQ13[0] as i32;
+    var pred1 = state.predPrevQ13[1] as i32;
+    let denomQ16 = (65536) / (8 * fsKhz);
+    let delta0 = silkRshiftRound(silkSmulbb(predQ13[0] - (state.predPrevQ13[0] as i32), denomQ16), 16);
+    let delta1 = silkRshiftRound(silkSmulbb(predQ13[1] - (state.predPrevQ13[1] as i32), denomQ16), 16);
+    let interp = truncate<usize>(8 * fsKhz);
+    for (n in 0usize..interp) {
+        pred0 += delta0;
+        pred1 += delta1;
+        var sum = silkLsh(((x1[n] as i32) + (x1[n + 2] as i32)).wrappingAdd(silkLsh(x1[n + 1] as i32, 1)), 9);
+        sum = silkSmlawb(silkLsh(x2[n + 1] as i32, 8), sum, pred0);
+        sum = silkSmlawb(sum, silkLsh(x1[n + 1] as i32, 11), pred1);
+        x2[n + 1] = truncate<i16>(silkSat16(silkRshiftRound(sum, 8)));
+    }
+    pred0 = predQ13[0];
+    pred1 = predQ13[1];
+    for (n in interp..frameLength) {
+        var sum = silkLsh(((x1[n] as i32) + (x1[n + 2] as i32)).wrappingAdd(silkLsh(x1[n + 1] as i32, 1)), 9);
+        sum = silkSmlawb(silkLsh(x2[n + 1] as i32, 8), sum, pred0);
+        sum = silkSmlawb(sum, silkLsh(x1[n + 1] as i32, 11), pred1);
+        x2[n + 1] = truncate<i16>(silkSat16(silkRshiftRound(sum, 8)));
+    }
+    state.predPrevQ13[0] = truncate<i16>(predQ13[0]);
+    state.predPrevQ13[1] = truncate<i16>(predQ13[1]);
+    for (n in 0usize..frameLength) {
+        let sum = (x1[n + 1] as i32) + (x2[n + 1] as i32);
+        let diff = (x1[n + 1] as i32) - (x2[n + 1] as i32);
+        x1[n + 1] = truncate<i16>(silkSat16(sum));
+        x2[n + 1] = truncate<i16>(silkSat16(diff));
+    }
+}
+
+/// SILK's decoder for up to two channels (silk_decoder).
+public struct SilkDecoder {
+    channels: Vector<SilkChannelState>;
+    stereo: SilkStereo;
+    apiChannels: usize;
+    internalChannels: usize;
+    prevDecodeOnlyMiddle: bool;
+    frame: [[i16; 322]; 2];
+    resampled: [i16; 960];
+
+    /// silk_InitDecoder.
+    public fn create() -> SilkDecoder {
+        var channels = Vector<SilkChannelState>.create();
+        let _ = channels.push(silkNewChannel());
+        let _ = channels.push(silkNewChannel());
+        return SilkDecoder {
+            channels: channels,
+            stereo: SilkStereo { predPrevQ13: [0i16; 2], sMid: [0i16; 2], sSide: [0i16; 2] },
+            apiChannels: 0,
+            internalChannels: 0,
+            prevDecodeOnlyMiddle: false,
+            frame: [[0i16; 322]; 2],
+            resampled: [0i16; 960],
+        };
+    }
+
+    /// silk_ResetDecoder.
+    public fn reset(borrow mut this) {
+        silkResetChannel(mut this.channels[0]);
+        silkResetChannel(mut this.channels[1]);
+        this.stereo = SilkStereo { predPrevQ13: [0i16; 2], sMid: [0i16; 2], sSide: [0i16; 2] };
+        this.prevDecodeOnlyMiddle = false;
+    }
+
+    /// silk_Decode: one 10 or 20 ms frame (a packet's first call reads its header bits); 16-bit samples
+    /// interleaved for `control.apiChannels` at `control.apiRate` into `out`; the samples per channel written.
+    public fn decode<region r>(borrow mut this, control: borrow mut SilkControl, lostFlag: u32, newPacket: bool, ec: borrow mut RangeDecoder<r>, out: SliceMut<i16>) -> Result<usize, SilkError> {
+        let nInternal = control.internalChannels;
+        if (newPacket) {
+            for (n in 0usize..nInternal) {
+                this.channels[n].framesDecoded = 0;
+            }
+        }
+        if (nInternal > this.internalChannels) {
+            this.channels[1] = silkNewChannel();
+        }
+        let stereoToMono = nInternal == 1 && this.internalChannels == 2 && control.internalRate == truncate<u32>(1000 * this.channels[0].fsKhz);
+        if (this.channels[0].framesDecoded == 0) {
+            for (n in 0usize..nInternal) {
+                if (control.payloadMs == 0 || control.payloadMs == 10) {
+                    this.channels[n].framesPerPacket = 1;
+                    this.channels[n].nbSubfr = 2;
+                } else if (control.payloadMs == 20) {
+                    this.channels[n].framesPerPacket = 1;
+                    this.channels[n].nbSubfr = 4;
+                } else if (control.payloadMs == 40) {
+                    this.channels[n].framesPerPacket = 2;
+                    this.channels[n].nbSubfr = 4;
+                } else if (control.payloadMs == 60) {
+                    this.channels[n].framesPerPacket = 3;
+                    this.channels[n].nbSubfr = 4;
+                } else {
+                    return Err(SilkError.InvalidFrameSize);
+                }
+                let fsKhzDec = truncate<i32>(control.internalRate >> 10) + 1;
+                if (fsKhzDec != 8 && fsKhzDec != 12 && fsKhzDec != 16) {
+                    return Err(SilkError.InvalidSamplingRate);
+                }
+                if (!silkSetFs(mut this.channels[n], fsKhzDec, truncate<i32>(control.apiRate))) {
+                    return Err(SilkError.InvalidSamplingRate);
+                }
+            }
+        }
+        if (control.apiChannels == 2 && nInternal == 2 && (this.apiChannels == 1 || this.internalChannels == 1)) {
+            this.stereo.predPrevQ13 = [0i16; 2];
+            this.stereo.sSide = [0i16; 2];
+            this.channels[1].resampler = this.channels[0].resampler;
+        }
+        this.apiChannels = control.apiChannels;
+        this.internalChannels = nInternal;
+        if (control.apiRate > 48000 || control.apiRate < 8000) {
+            return Err(SilkError.InvalidSamplingRate);
+        }
+        var msPredQ13 = [0i32; 2];
+        var decodeOnlyMiddle = false;
+        if (lostFlag != SILK_FLAG_PACKET_LOST && this.channels[0].framesDecoded == 0) {
+            for (n in 0usize..nInternal) {
+                for (i in 0usize..truncate<usize>(this.channels[n].framesPerPacket)) {
+                    this.channels[n].vadFlags[i] = ec.bitLogp(1);
+                }
+                this.channels[n].lbrrFlag = ec.bitLogp(1);
+            }
+            for (n in 0usize..nInternal) {
+                this.channels[n].lbrrFlags = [false; 3];
+                if (this.channels[n].lbrrFlag) {
+                    if (this.channels[n].framesPerPacket == 1) {
+                        this.channels[n].lbrrFlags[0] = true;
+                    } else {
+                        let table = if (this.channels[n].framesPerPacket == 2) silk_LBRR_flags_2_iCDF[..] else silk_LBRR_flags_3_iCDF[..];
+                        let symbol = silkIcdf8(ec, table) + 1;
+                        for (i in 0usize..truncate<usize>(this.channels[n].framesPerPacket)) {
+                            this.channels[n].lbrrFlags[i] = (truncate<u32>(silkRsh(symbol, truncate<i32>(i))) & 1) != 0;
+                        }
+                    }
+                }
+            }
+            if (lostFlag == SILK_FLAG_DECODE_NORMAL) {
+                // Skip the LBRR data: read and drop it.
+                for (i in 0usize..truncate<usize>(this.channels[0].framesPerPacket)) {
+                    for (n in 0usize..nInternal) {
+                        if (this.channels[n].lbrrFlags[i]) {
+                            var pulses = [0i32; 336];
+                            if (nInternal == 2 && n == 0) {
+                                silkStereoDecodePred(ec, mut msPredQ13);
+                                if (!this.channels[1].lbrrFlags[i]) {
+                                    decodeOnlyMiddle = silkIcdf8(ec, silk_stereo_only_code_mid_iCDF[..]) != 0;
+                                }
+                            }
+                            let condCoding = if (i > 0 && this.channels[n].lbrrFlags[i - 1]) SILK_CODE_CONDITIONALLY else SILK_CODE_INDEPENDENTLY;
+                            silkDecodeIndices(mut this.channels[n], ec, i, true, condCoding);
+                            let st = borrow this.channels[n];
+                            let signalType = st.indices.signalType;
+                            let quantOffsetType = st.indices.quantOffsetType;
+                            let frameLength = st.frameLength;
+                            silkDecodePulses(ec, mut pulses, signalType, quantOffsetType, frameLength);
+                        }
+                    }
+                }
+            }
+        }
+        if (nInternal == 2) {
+            let fd = truncate<usize>(this.channels[0].framesDecoded);
+            if (lostFlag == SILK_FLAG_DECODE_NORMAL || (lostFlag == SILK_FLAG_DECODE_LBRR && this.channels[0].lbrrFlags[fd])) {
+                silkStereoDecodePred(ec, mut msPredQ13);
+                if ((lostFlag == SILK_FLAG_DECODE_NORMAL && !this.channels[1].vadFlags[fd]) || (lostFlag == SILK_FLAG_DECODE_LBRR && !this.channels[1].lbrrFlags[fd])) {
+                    decodeOnlyMiddle = silkIcdf8(ec, silk_stereo_only_code_mid_iCDF[..]) != 0;
+                } else {
+                    decodeOnlyMiddle = false;
+                }
+            } else {
+                msPredQ13[0] = this.stereo.predPrevQ13[0] as i32;
+                msPredQ13[1] = this.stereo.predPrevQ13[1] as i32;
+            }
+        }
+        if (nInternal == 2 && !decodeOnlyMiddle && this.prevDecodeOnlyMiddle) {
+            this.channels[1].outBuf = [0i16; 480];
+            this.channels[1].sLpcQ14 = [0i32; 16];
+            this.channels[1].lagPrev = 100;
+            this.channels[1].lastGainIndex = 10;
+            this.channels[1].prevSignalType = SILK_TYPE_NO_VOICE_ACTIVITY;
+            this.channels[1].firstFrameAfterReset = true;
+        }
+        var hasSide = false;
+        if (lostFlag == SILK_FLAG_DECODE_NORMAL) {
+            hasSide = !decodeOnlyMiddle;
+        } else {
+            hasSide = !this.prevDecodeOnlyMiddle
+                || (nInternal == 2 && lostFlag == SILK_FLAG_DECODE_LBRR && this.channels[1].lbrrFlags[truncate<usize>(this.channels[1].framesDecoded)]);
+        }
+        var nSamplesDec: usize = 0;
+        var decoded = [0i16; 320];
+        for (n in 0usize..nInternal) {
+            if (n == 0 || hasSide) {
+                let frameIndex = this.channels[0].framesDecoded - truncate<i32>(n);
+                var condCoding = SILK_CODE_CONDITIONALLY;
+                if (frameIndex <= 0) {
+                    condCoding = SILK_CODE_INDEPENDENTLY;
+                } else if (lostFlag == SILK_FLAG_DECODE_LBRR) {
+                    condCoding = if (this.channels[n].lbrrFlags[truncate<usize>(frameIndex - 1)]) SILK_CODE_CONDITIONALLY else SILK_CODE_INDEPENDENTLY;
+                } else if (n > 0 && this.prevDecodeOnlyMiddle) {
+                    condCoding = SILK_CODE_INDEPENDENTLY_NO_LTP_SCALING;
+                }
+                nSamplesDec = silkDecodeFrame(mut this.channels[n], ec, mut decoded, lostFlag, condCoding);
+                for (i in 0usize..nSamplesDec) {
+                    this.frame[n][2 + i] = decoded[i];
+                }
+            } else {
+                for (i in 0usize..nSamplesDec) {
+                    this.frame[n][2 + i] = 0;
+                }
+            }
+            this.channels[n].framesDecoded += 1;
+        }
+        if (control.apiChannels == 2 && nInternal == 2) {
+            var x1 = this.frame[0];
+            var x2 = this.frame[1];
+            silkStereoMsToLr(mut this.stereo, mut x1, mut x2, borrow msPredQ13, this.channels[0].fsKhz, nSamplesDec);
+            this.frame[0] = x1;
+            this.frame[1] = x2;
+        } else {
+            this.frame[0][0] = this.stereo.sMid[0];
+            this.frame[0][1] = this.stereo.sMid[1];
+            this.stereo.sMid[0] = this.frame[0][nSamplesDec];
+            this.stereo.sMid[1] = this.frame[0][nSamplesDec + 1];
+        }
+        let nOut = truncate<usize>(truncate<i32>(nSamplesDec) * truncate<i32>(control.apiRate) / silkSmulbb(this.channels[0].fsKhz, 1000));
+        let apiCh = control.apiChannels;
+        if (out.length < nOut * apiCh) {
+            return Err(SilkError.OutputTooSmall);
+        }
+        let channelsOut = if (apiCh < nInternal) apiCh else nInternal;
+        for (n in 0usize..channelsOut) {
+            let input = this.frame[n];
+            silkResample(mut this.channels[n].resampler, mut this.resampled[..], 0, input[..], 1, nSamplesDec);
+            for (i in 0usize..nOut) {
+                out[n + apiCh * i] = this.resampled[i];
+            }
+        }
+        if (apiCh == 2 && nInternal == 1) {
+            if (stereoToMono) {
+                let input = this.frame[0];
+                silkResample(mut this.channels[1].resampler, mut this.resampled[..], 0, input[..], 1, nSamplesDec);
+                for (i in 0usize..nOut) {
+                    out[1 + 2 * i] = this.resampled[i];
+                }
+            } else {
+                for (i in 0usize..nOut) {
+                    out[1 + 2 * i] = out[2 * i];
+                }
+            }
+        }
+        if (this.channels[0].prevSignalType == SILK_TYPE_VOICED) {
+            let mult: [i32; 3] = [6, 4, 3];
+            control.prevPitchLag = this.channels[0].lagPrev * mult[truncate<usize>(silkRsh(this.channels[0].fsKhz - 8, 2))];
+        } else {
+            control.prevPitchLag = 0;
+        }
+        if (lostFlag == SILK_FLAG_PACKET_LOST) {
+            for (i in 0usize..this.internalChannels) {
+                this.channels[i].lastGainIndex = 10;
+            }
+        } else {
+            this.prevDecodeOnlyMiddle = decodeOnlyMiddle;
+        }
+        return Ok(nOut);
+    }
+}

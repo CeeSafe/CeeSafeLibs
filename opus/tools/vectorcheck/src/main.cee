@@ -1,0 +1,97 @@
+// vectorcheck: decodes an opus_demo .bit file (RFC 6716's and RFC 8251's test vectors) with this package's decoder,
+// checks every packet's final range against the file's, and writes 16-bit little-endian PCM at 48 kHz.
+//
+//   vectorcheck <in.bit> <out.pcm> <channels>
+
+import opus;
+
+fn main() -> i32 {
+    let input = Process.argument(1) ?? "";
+    let output = Process.argument(2) ?? "";
+    let channels = NumberParsing.parseUsize((Process.argument(3) ?? "2").bytes()) ?? 2;
+    let bytes = match (readAll(input)) {
+        Ok(b) => b,
+        Err(e) => {
+            Console.writeLine(e.message());
+            return 2;
+        },
+    };
+    var decoder = OpusDecoder.create(channels);
+    var pcm = Vector<i16>.create();
+    let _ = pcm.resize(MAX_FRAME * channels, 0);
+    var out = Vector<u8>.create();
+    var at: usize = 0;
+    var packets: u64 = 0;
+    var mismatches: u64 = 0;
+    var errors: u64 = 0;
+    while (at + 8 <= bytes.length) {
+        let length = be32(bytes.view(), at) as usize;
+        let range = be32(bytes.view(), at + 4);
+        at += 8;
+        if (at + length > bytes.length) {
+            break;
+        }
+        let packet = bytes.view()[at..at + length];
+        at += length;
+        let result = if (length == 0) decoder.decode(null, mut pcm[..], MAX_FRAME, false)
+            else decoder.decode(Some(packet), mut pcm[..], MAX_FRAME, false);
+        match (result) {
+            Ok(n) => {
+                for (i in 0usize..n * channels) {
+                    let v = truncate<u16>(pcm[i] as i32);
+                    let _ = out.push(truncate<u8>(v));
+                    let _ = out.push(truncate<u8>(v >> 8));
+                }
+            },
+            Err(_) => {
+                errors += 1;
+            },
+        }
+        if (length > 0 && decoder.finalRange != range) {
+            if (mismatches < 5) {
+                var s = String.create();
+                let _ = s.append("range mismatch at packet ");
+                let _ = s.appendNumber(truncate<i64>(packets));
+                Console.writeLine(s.view());
+            }
+            mismatches += 1;
+        }
+        packets += 1;
+    }
+    match (File.create(output)) {
+        Ok(var f) => {
+            let _ = f.write(out.view());
+        },
+        Err(e) => {
+            Console.writeLine(e.message());
+            return 2;
+        },
+    }
+    var s = String.create();
+    let _ = s.appendNumber(truncate<i64>(packets));
+    let _ = s.append(" packets, ");
+    let _ = s.appendNumber(truncate<i64>(mismatches));
+    let _ = s.append(" range mismatches, ");
+    let _ = s.appendNumber(truncate<i64>(errors));
+    let _ = s.append(" errors");
+    Console.writeLine(s.view());
+    return if (mismatches == 0 && errors == 0) 0 else 1;
+}
+
+fn be32(b: Slice<u8>, at: usize) -> u32 =>
+    ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | (b[at + 3] as u32);
+
+fn readAll(path: StringView) -> Result<Vector<u8>, IoError> {
+    var file = File.open(path)?;
+    var bytes = Vector<u8>.create();
+    var buffer = [0u8; 65536];
+    loop {
+        let n = file.read(mut buffer[..])?;
+        if (n == 0) {
+            return Ok(bytes);
+        }
+        if (bytes.extend(buffer[0..n]) is Err(_)) {
+            return Err(IoError.OutOfMemory);
+        }
+    }
+}

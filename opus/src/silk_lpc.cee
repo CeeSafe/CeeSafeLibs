@@ -1,0 +1,358 @@
+// SILK's NLSF and LPC routines, ported bit-exactly from libopus 1.5.2: silk/NLSF_decode.c, NLSF_unpack.c,
+// NLSF_stabilize.c, NLSF2A.c, LPC_fit.c, LPC_inv_pred_gain.c, silkBwexpander.c, bwexpander_32.c, LPC_analysis_filter.c,
+// sum_sqr_shift.c and sort.c's insertion sort.
+
+const SILK_MAX_LPC_ORDER: usize = 16;
+const SILK_NLSF_QUANT_MAX_AMPLITUDE: i32 = 4;
+
+/// One of SILK's two NLSF codebooks: narrow and medium band (order 10), or wide (order 16).
+struct SilkNlsfCodebook {
+    wide: bool;
+}
+
+impl SilkNlsfCodebook {
+    fn nVectors(borrow this) -> i32 => 32;
+    fn order(borrow this) -> i32 => if (this.wide) 16 else 10;
+    fn quantStepSizeQ16(borrow this) -> i32 => if (this.wide) 9830 else 11796;
+    fn cb1Q8(borrow this, i: usize) -> i32 => if (this.wide) silk_NLSF_CB1_WB_Q8[i] as i32 else silk_NLSF_CB1_NB_MB_Q8[i] as i32;
+    fn cb1WghtQ9(borrow this, i: usize) -> i32 =>
+        if (this.wide) silk_NLSF_CB1_WB_Wght_Q9[i] as i32 else silk_NLSF_CB1_Wght_Q9[i] as i32;
+    fn cb1Icdf(borrow this) -> Slice<static, u8> => if (this.wide) silk_NLSF_CB1_iCDF_WB[..] else silk_NLSF_CB1_iCDF_NB_MB[..];
+    fn predQ8(borrow this, i: usize) -> i32 => if (this.wide) silk_NLSF_PRED_WB_Q8[i] as i32 else silk_NLSF_PRED_NB_MB_Q8[i] as i32;
+    fn ecSel(borrow this, i: usize) -> u32 =>
+        if (this.wide) silk_NLSF_CB2_SELECT_WB[i] as u32 else silk_NLSF_CB2_SELECT_NB_MB[i] as u32;
+    fn ecIcdf(borrow this) -> Slice<static, u8> => if (this.wide) silk_NLSF_CB2_iCDF_WB[..] else silk_NLSF_CB2_iCDF_NB_MB[..];
+    fn deltaMinQ15(borrow this, i: usize) -> i32 =>
+        if (this.wide) silk_NLSF_DELTA_MIN_WB_Q15[i] as i32 else silk_NLSF_DELTA_MIN_NB_MB_Q15[i] as i32;
+}
+
+/// silk_NLSF_unpack: the entropy table offsets and predictors of codebook vector `cb1`.
+fn silkNlsfUnpack(ecIx: borrow mut [i32; 16], predQ8: borrow mut [i32; 16], cb: borrow SilkNlsfCodebook, cb1: i32) {
+    let order = cb.order();
+    var sel = truncate<usize>(cb1 * order / 2);
+    var i: i32 = 0;
+    while (i < order) {
+        let entry = cb.ecSel(sel);
+        sel += 1;
+        let k = truncate<usize>(i);
+        ecIx[k] = silkSmulbb(truncate<i32>((entry >> 1) & 7), 2 * SILK_NLSF_QUANT_MAX_AMPLITUDE + 1);
+        predQ8[k] = cb.predQ8(truncate<usize>(i + truncate<i32>(entry & 1) * (order - 1)));
+        ecIx[k + 1] = silkSmulbb(truncate<i32>((entry >> 5) & 7), 2 * SILK_NLSF_QUANT_MAX_AMPLITUDE + 1);
+        predQ8[k + 1] = cb.predQ8(truncate<usize>(i + truncate<i32>((entry >> 4) & 1) * (order - 1) + 1));
+        i += 2;
+    }
+}
+
+/// silk_NLSF_decode: indices[0] is the first stage's vector, indices[1..] the residuals.
+fn silkNlsfDecode(nlsfQ15: borrow mut [i16; 16], indices: borrow [i32; 17], cb: borrow SilkNlsfCodebook) {
+    var ecIx = [0i32; 16];
+    var predQ8 = [0i32; 16];
+    silkNlsfUnpack(mut ecIx, mut predQ8, cb, indices[0]);
+    let order = cb.order();
+    // silk_NLSF_residual_dequant
+    var resQ10 = [0i32; 16];
+    var out: i32 = 0;
+    var i = order - 1;
+    while (i >= 0) {
+        let k = truncate<usize>(i);
+        let pred = silkRsh(silkSmulbb(out, predQ8[k]), 8);
+        out = silkLsh(indices[k + 1], 10);
+        if (out > 0) {
+            out = out - 102;
+        } else if (out < 0) {
+            out = out + 102;
+        }
+        out = silkSmlawb(pred, out, cb.quantStepSizeQ16());
+        resQ10[k] = silkS16(out);
+        i -= 1;
+    }
+    let base = truncate<usize>(indices[0] * order);
+    for (k in 0usize..truncate<usize>(order)) {
+        let w = cb.cb1WghtQ9(base + k);
+        let tmp = silkAdd32(silkLsh(resQ10[k], 14) / w, silkLsh(silkS16(cb.cb1Q8(base + k)), 7));
+        nlsfQ15[k] = truncate<i16>(silkLimit(tmp, 0, 32767));
+    }
+    silkNlsfStabilize(mut nlsfQ15, cb, order);
+}
+
+/// silk_NLSF_stabilize.
+fn silkNlsfStabilize(nlsf: borrow mut [i16; 16], cb: borrow SilkNlsfCodebook, l: i32) {
+    let n = truncate<usize>(l);
+    var loops: i32 = 0;
+    while (loops < 20) {
+        var minDiff = (nlsf[0] as i32) - cb.deltaMinQ15(0);
+        var at: usize = 0;
+        for (i in 1usize..n) {
+            let diff = (nlsf[i] as i32) - ((nlsf[i - 1] as i32) + cb.deltaMinQ15(i));
+            if (diff < minDiff) {
+                minDiff = diff;
+                at = i;
+            }
+        }
+        let last = 32768 - ((nlsf[n - 1] as i32) + cb.deltaMinQ15(n));
+        if (last < minDiff) {
+            minDiff = last;
+            at = n;
+        }
+        if (minDiff >= 0) {
+            return;
+        }
+        if (at == 0) {
+            nlsf[0] = truncate<i16>(cb.deltaMinQ15(0));
+        } else if (at == n) {
+            nlsf[n - 1] = truncate<i16>(32768 - cb.deltaMinQ15(n));
+        } else {
+            var minCenter: i32 = 0;
+            for (k in 0usize..at) {
+                minCenter += cb.deltaMinQ15(k);
+            }
+            minCenter += silkRsh(cb.deltaMinQ15(at), 1);
+            var maxCenter: i32 = 32768;
+            var k = n;
+            while (k > at) {
+                maxCenter -= cb.deltaMinQ15(k);
+                k -= 1;
+            }
+            maxCenter -= silkRsh(cb.deltaMinQ15(at), 1);
+            let center = truncate<i16>(silkLimit(silkRshiftRound((nlsf[at - 1] as i32) + (nlsf[at] as i32), 1), minCenter, maxCenter));
+            nlsf[at - 1] = truncate<i16>((center as i32) - silkRsh(cb.deltaMinQ15(at), 1));
+            nlsf[at] = truncate<i16>((nlsf[at - 1] as i32) + cb.deltaMinQ15(at));
+        }
+        loops += 1;
+    }
+    // Fallback: sort, then push apart.
+    for (i in 1usize..n) {
+        let value = nlsf[i];
+        var j = i;
+        while (j > 0 && value < nlsf[j - 1]) {
+            nlsf[j] = nlsf[j - 1];
+            j -= 1;
+        }
+        nlsf[j] = value;
+    }
+    nlsf[0] = truncate<i16>(silkMax32(nlsf[0] as i32, cb.deltaMinQ15(0)));
+    for (i in 1usize..n) {
+        nlsf[i] = truncate<i16>(silkMax32(nlsf[i] as i32, silkSat16((nlsf[i - 1] as i32) + cb.deltaMinQ15(i))));
+    }
+    nlsf[n - 1] = truncate<i16>(silkMin32(nlsf[n - 1] as i32, 32768 - cb.deltaMinQ15(n)));
+    var i = n - 1;
+    while (i > 0) {
+        i -= 1;
+        nlsf[i] = truncate<i16>(silkMin32(nlsf[i] as i32, (nlsf[i + 1] as i32) - cb.deltaMinQ15(i + 1)));
+    }
+}
+
+fn silkNlsf2aFindPoly(out: borrow mut [i32; 9], cLsf: borrow [i32; 16], start: usize, dd: usize) {
+    out[0] = 65536;
+    out[1] = 0 - cLsf[start];
+    for (k in 1usize..dd) {
+        let ftmp = cLsf[start + 2 * k];
+        out[k + 1] = silkLsh(out[k - 1], 1).wrappingSub(truncate<i32>(silkRshiftRound64(silkSmull(ftmp, out[k]), 16)));
+        var n = k;
+        while (n > 1) {
+            out[n] = out[n].wrappingAdd(out[n - 2].wrappingSub(truncate<i32>(silkRshiftRound64(silkSmull(ftmp, out[n - 1]), 16))));
+            n -= 1;
+        }
+        out[1] = out[1].wrappingSub(ftmp);
+    }
+}
+
+const SILK_ORDERING16: [u8; 16] = [0, 15, 8, 7, 4, 11, 12, 3, 2, 13, 10, 5, 6, 9, 14, 1];
+const SILK_ORDERING10: [u8; 10] = [0, 9, 6, 3, 4, 5, 8, 1, 2, 7];
+
+/// silk_NLSF2A: LPC coefficients in Q12 from NLSFs in Q15.
+fn silkNlsf2a(aQ12: borrow mut [i16; 16], nlsf: borrow [i16; 16], d: usize) {
+    var cosLsf = [0i32; 16];
+    for (k in 0usize..d) {
+        let f = nlsf[k] as i32;
+        let fInt = silkRsh(f, 8);
+        let fFrac = f - silkLsh(fInt, 8);
+        let cosVal = silk_LSFCosTab_FIX_Q12[truncate<usize>(fInt)] as i32;
+        let delta = (silk_LSFCosTab_FIX_Q12[truncate<usize>(fInt) + 1] as i32) - cosVal;
+        let at = if (d == 16) SILK_ORDERING16[k] as usize else SILK_ORDERING10[k] as usize;
+        cosLsf[at] = silkRshiftRound(silkLsh(cosVal, 8).wrappingAdd(silkMul32(delta, fFrac)), 4);
+    }
+    let dd = d / 2;
+    var p = [0i32; 9];
+    var q = [0i32; 9];
+    silkNlsf2aFindPoly(mut p, borrow cosLsf, 0, dd);
+    silkNlsf2aFindPoly(mut q, borrow cosLsf, 1, dd);
+    var a32 = [0i32; 16];
+    for (k in 0usize..dd) {
+        let ptmp = p[k + 1].wrappingAdd(p[k]);
+        let qtmp = q[k + 1].wrappingSub(q[k]);
+        a32[k] = (0i32.wrappingSub(qtmp)).wrappingSub(ptmp);
+        a32[d - k - 1] = qtmp.wrappingSub(ptmp);
+    }
+    silkLpcFit(mut aQ12, mut a32, 12, 17, d);
+    var i: i32 = 0;
+    while (silkLpcInversePredGain(aQ12, d) == 0 && i < 16) {
+        silkBwexpander32(mut a32, d, 65536 - silkLsh(2, i));
+        for (k in 0usize..d) {
+            aQ12[k] = truncate<i16>(silkRshiftRound(a32[k], 5));
+        }
+        i += 1;
+    }
+}
+
+/// silk_LPC_fit: `aIn` (Q`qin`) into 16-bit `aOut` (Q`qout`), bandwidth-expanded until it fits.
+fn silkLpcFit(aOut: borrow mut [i16; 16], aIn: borrow mut [i32; 16], qout: i32, qin: i32, d: usize) {
+    var i: i32 = 0;
+    var idx: usize = 0;
+    while (i < 10) {
+        var maxabs: i32 = 0;
+        for (k in 0usize..d) {
+            let absval = silkAbs32(aIn[k]);
+            if (absval > maxabs) {
+                maxabs = absval;
+                idx = k;
+            }
+        }
+        maxabs = silkRshiftRound(maxabs, qin - qout);
+        if (maxabs > SILK_I16_MAX) {
+            maxabs = silkMin32(maxabs, 163838);
+            let chirp = 65470 - silkLsh(maxabs - SILK_I16_MAX, 14) / silkRsh(silkMul32(maxabs, truncate<i32>(idx) + 1), 2);
+            silkBwexpander32(mut aIn, d, chirp);
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if (i == 10) {
+        for (k in 0usize..d) {
+            aOut[k] = truncate<i16>(silkSat16(silkRshiftRound(aIn[k], qin - qout)));
+            aIn[k] = silkLsh(aOut[k] as i32, qin - qout);
+        }
+    } else {
+        for (k in 0usize..d) {
+            aOut[k] = truncate<i16>(silkRshiftRound(aIn[k], qin - qout));
+        }
+    }
+}
+
+fn silkMul32FracQ(a: i32, b: i32, q: i32) -> i32 => truncate<i32>(silkRshiftRound64(silkSmull(a, b), q));
+
+/// silk_LPC_inverse_pred_gain: the inverse prediction gain in Q30, or 0 if the filter is unstable.
+fn silkLpcInversePredGain(aQ12: borrow [i16; 16], order: usize) -> i32 {
+    var a = [0i32; 16];
+    var dc: i32 = 0;
+    for (k in 0usize..order) {
+        dc += aQ12[k] as i32;
+        a[k] = silkLsh(aQ12[k] as i32, 12);
+    }
+    if (dc >= 4096) {
+        return 0;
+    }
+    let aLimit: i32 = 16773022;
+    var invGain: i32 = 1073741824;
+    var k = order - 1;
+    while (k > 0) {
+        if (a[k] > aLimit || a[k] < -aLimit) {
+            return 0;
+        }
+        let rc = 0i32.wrappingSub(silkLsh(a[k], 7));
+        let rcMult1 = (1073741824).wrappingSub(silkSmmul(rc, rc));
+        invGain = silkLsh(silkSmmul(invGain, rcMult1), 2);
+        if (invGain < 107374) {
+            return 0;
+        }
+        let mult2Q = 32 - silkClz32(silkAbs32(rcMult1));
+        let rcMult2 = silkInverse32varQ(rcMult1, mult2Q + 30);
+        for (n in 0usize..(k + 1) / 2) {
+            let tmp1 = a[n];
+            let tmp2 = a[k - n - 1];
+            let t1 = silkRshiftRound64(silkSmull(silkSubSat32(tmp1, silkMul32FracQ(tmp2, rc, 31)), rcMult2), mult2Q);
+            if (t1 > (SILK_I32_MAX as i64) || t1 < (SILK_I32_MIN as i64)) {
+                return 0;
+            }
+            a[n] = truncate<i32>(t1);
+            let t2 = silkRshiftRound64(silkSmull(silkSubSat32(tmp2, silkMul32FracQ(tmp1, rc, 31)), rcMult2), mult2Q);
+            if (t2 > (SILK_I32_MAX as i64) || t2 < (SILK_I32_MIN as i64)) {
+                return 0;
+            }
+            a[k - n - 1] = truncate<i32>(t2);
+        }
+        k -= 1;
+    }
+    if (a[0] > aLimit || a[0] < -aLimit) {
+        return 0;
+    }
+    let rc = 0i32.wrappingSub(silkLsh(a[0], 7));
+    let rcMult1 = (1073741824).wrappingSub(silkSmmul(rc, rc));
+    invGain = silkLsh(silkSmmul(invGain, rcMult1), 2);
+    if (invGain < 107374) {
+        return 0;
+    }
+    return invGain;
+}
+
+/// silk_bwexpander: chirp the 16-bit coefficients.
+fn silkBwexpander(ar: borrow mut [i16; 16], d: usize, chirpQ16: i32) {
+    var chirp = chirpQ16;
+    let minusOne = chirp - 65536;
+    for (i in 0usize..d - 1) {
+        ar[i] = truncate<i16>(silkRshiftRound(silkMul32(chirp, ar[i] as i32), 16));
+        chirp = chirp.wrappingAdd(silkRshiftRound(silkMul32(chirp, minusOne), 16));
+    }
+    ar[d - 1] = truncate<i16>(silkRshiftRound(silkMul32(chirp, ar[d - 1] as i32), 16));
+}
+
+/// silk_bwexpander_32.
+fn silkBwexpander32(ar: borrow mut [i32; 16], d: usize, chirpQ16: i32) {
+    var chirp = chirpQ16;
+    let minusOne = chirp - 65536;
+    for (i in 0usize..d - 1) {
+        ar[i] = silkSmulww(chirp, ar[i]);
+        chirp = chirp.wrappingAdd(silkRshiftRound(silkMul32(chirp, minusOne), 16));
+    }
+    ar[d - 1] = silkSmulww(chirp, ar[d - 1]);
+}
+
+/// silk_LPC_analysis_filter: out[at + ix] for ix in d..len from input[inAt..], the first d outputs zero.
+fn silkLpcAnalysisFilter(out: SliceMut<i16>, outAt: usize, input: Slice<i16>, inAt: usize, b: borrow [i16; 16], len: usize, d: usize) {
+    for (ix in d..len) {
+        let p = inAt + ix - 1;
+        var acc = silkSmulbb(input[p] as i32, b[0] as i32);
+        for (j in 1usize..d) {
+            acc = acc.wrappingAdd(silkSmulbb(input[p - j] as i32, b[j] as i32));
+        }
+        acc = silkLsh(input[p + 1] as i32, 12).wrappingSub(acc);
+        out[outAt + ix] = truncate<i16>(silkSat16(silkRshiftRound(acc, 12)));
+    }
+    for (j in 0usize..d) {
+        out[outAt + j] = 0;
+    }
+}
+
+/// silk_sum_sqr_shift: the energy of `x` and the shift that keeps it in 31 bits.
+struct SilkEnergy {
+    energy: i32;
+    shift: i32;
+}
+
+fn silkSumSqrShift(x: Slice<i16>) -> SilkEnergy {
+    let len = x.length;
+    var shft = 31 - silkClz32(truncate<i32>(len));
+    var nrg = truncate<u32>(len);
+    var i: usize = 0;
+    while (i + 1 < len) {
+        let t = truncate<u32>(silkSmulbb(x[i] as i32, x[i] as i32)).wrappingAdd(truncate<u32>(silkSmulbb(x[i + 1] as i32, x[i + 1] as i32)));
+        nrg = nrg.wrappingAdd(t >> truncate<u32>(shft));
+        i += 2;
+    }
+    if (i < len) {
+        nrg = nrg.wrappingAdd(truncate<u32>(silkSmulbb(x[i] as i32, x[i] as i32)) >> truncate<u32>(shft));
+    }
+    shft = silkMax32(0, shft + 3 - silkClz32(truncate<i32>(nrg)));
+    nrg = 0;
+    i = 0;
+    while (i + 1 < len) {
+        let t = truncate<u32>(silkSmulbb(x[i] as i32, x[i] as i32)).wrappingAdd(truncate<u32>(silkSmulbb(x[i + 1] as i32, x[i + 1] as i32)));
+        nrg = nrg.wrappingAdd(t >> truncate<u32>(shft));
+        i += 2;
+    }
+    if (i < len) {
+        nrg = nrg.wrappingAdd(truncate<u32>(silkSmulbb(x[i] as i32, x[i] as i32)) >> truncate<u32>(shft));
+    }
+    return SilkEnergy { energy: truncate<i32>(nrg), shift: shft };
+}

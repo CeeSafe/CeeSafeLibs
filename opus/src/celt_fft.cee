@@ -1,0 +1,322 @@
+// CELT's FFT and inverse MDCT (libopus 1.5.2 celt/kiss_fft.c opus_fft_impl and celt/mdct.c clt_mdct_backward_c, float
+// build; BSD). The FFT works in place on interleaved complex values (re, im) at `base` in a buffer.
+
+/// The four FFT sizes of the 48 kHz mode (480, 240, 120, 60): their radix factors (p, m pairs).
+const FFT_FACTORS: [i32; 40] = [
+    5, 96, 3, 32, 4, 8, 2, 4, 4, 1,
+    5, 48, 3, 16, 4, 4, 4, 1, 0, 0,
+    5, 24, 3, 8, 2, 4, 4, 1, 0, 0,
+    5, 12, 3, 4, 4, 1, 0, 0, 0, 0,
+];
+
+fn twr(k: usize) -> f32 => FFT_TWIDDLES[2 * k];
+
+fn twi(k: usize) -> f32 => FFT_TWIDDLES[2 * k + 1];
+
+fn bfly2(f: SliceMut<f32>, base: usize, n: usize) {
+    let tw: f32 = 0.7071067812;
+    var at = base;
+    for (i in 0usize..n) {
+        let o = at + 8;
+        // Fout2[0]
+        var tr = f[o];
+        var ti = f[o + 1];
+        f[o] = f[at] - tr;
+        f[o + 1] = f[at + 1] - ti;
+        f[at] += tr;
+        f[at + 1] += ti;
+        // Fout2[1]
+        tr = (f[o + 2] + f[o + 3]) * tw;
+        ti = (f[o + 3] - f[o + 2]) * tw;
+        f[o + 2] = f[at + 2] - tr;
+        f[o + 3] = f[at + 3] - ti;
+        f[at + 2] += tr;
+        f[at + 3] += ti;
+        // Fout2[2]
+        tr = f[o + 5];
+        ti = -f[o + 4];
+        f[o + 4] = f[at + 4] - tr;
+        f[o + 5] = f[at + 5] - ti;
+        f[at + 4] += tr;
+        f[at + 5] += ti;
+        // Fout2[3]
+        tr = (f[o + 7] - f[o + 6]) * tw;
+        ti = -(f[o + 7] + f[o + 6]) * tw;
+        f[o + 6] = f[at + 6] - tr;
+        f[o + 7] = f[at + 7] - ti;
+        f[at + 6] += tr;
+        f[at + 7] += ti;
+        at += 16;
+    }
+}
+
+fn bfly4(f: SliceMut<f32>, base: usize, fstride: usize, m: usize, n: usize, mm: usize) {
+    if (m == 1) {
+        var at = base;
+        for (i in 0usize..n) {
+            let s0r = f[at] - f[at + 4];
+            let s0i = f[at + 1] - f[at + 5];
+            f[at] += f[at + 4];
+            f[at + 1] += f[at + 5];
+            var s1r = f[at + 2] + f[at + 6];
+            var s1i = f[at + 3] + f[at + 7];
+            f[at + 4] = f[at] - s1r;
+            f[at + 5] = f[at + 1] - s1i;
+            f[at] += s1r;
+            f[at + 1] += s1i;
+            s1r = f[at + 2] - f[at + 6];
+            s1i = f[at + 3] - f[at + 7];
+            f[at + 2] = s0r + s1i;
+            f[at + 3] = s0i - s1r;
+            f[at + 6] = s0r - s1i;
+            f[at + 7] = s0i + s1r;
+            at += 8;
+        }
+        return;
+    }
+    for (i in 0usize..n) {
+        var at = base + 2 * i * mm;
+        var t1: usize = 0;
+        var t2: usize = 0;
+        var t3: usize = 0;
+        for (j in 0usize..m) {
+            let a1 = at + 2 * m;
+            let a2 = at + 4 * m;
+            let a3 = at + 6 * m;
+            let s0r = f[a1] * twr(t1) - f[a1 + 1] * twi(t1);
+            let s0i = f[a1] * twi(t1) + f[a1 + 1] * twr(t1);
+            let s1r = f[a2] * twr(t2) - f[a2 + 1] * twi(t2);
+            let s1i = f[a2] * twi(t2) + f[a2 + 1] * twr(t2);
+            let s2r = f[a3] * twr(t3) - f[a3 + 1] * twi(t3);
+            let s2i = f[a3] * twi(t3) + f[a3 + 1] * twr(t3);
+            let s5r = f[at] - s1r;
+            let s5i = f[at + 1] - s1i;
+            f[at] += s1r;
+            f[at + 1] += s1i;
+            let s3r = s0r + s2r;
+            let s3i = s0i + s2i;
+            let s4r = s0r - s2r;
+            let s4i = s0i - s2i;
+            f[a2] = f[at] - s3r;
+            f[a2 + 1] = f[at + 1] - s3i;
+            t1 += fstride;
+            t2 += fstride * 2;
+            t3 += fstride * 3;
+            f[at] += s3r;
+            f[at + 1] += s3i;
+            f[a1] = s5r + s4i;
+            f[a1 + 1] = s5i - s4r;
+            f[a3] = s5r - s4i;
+            f[a3 + 1] = s5i + s4r;
+            at += 2;
+        }
+    }
+}
+
+fn bfly3(f: SliceMut<f32>, base: usize, fstride: usize, m: usize, n: usize, mm: usize) {
+    let epi3i = twi(fstride * m);
+    for (i in 0usize..n) {
+        var at = base + 2 * i * mm;
+        var t1: usize = 0;
+        var t2: usize = 0;
+        for (k in 0usize..m) {
+            let a1 = at + 2 * m;
+            let a2 = at + 4 * m;
+            let s1r = f[a1] * twr(t1) - f[a1 + 1] * twi(t1);
+            let s1i = f[a1] * twi(t1) + f[a1 + 1] * twr(t1);
+            let s2r = f[a2] * twr(t2) - f[a2 + 1] * twi(t2);
+            let s2i = f[a2] * twi(t2) + f[a2 + 1] * twr(t2);
+            let s3r = s1r + s2r;
+            let s3i = s1i + s2i;
+            var s0r = s1r - s2r;
+            var s0i = s1i - s2i;
+            t1 += fstride;
+            t2 += fstride * 2;
+            f[a1] = f[at] - s3r * 0.5;
+            f[a1 + 1] = f[at + 1] - s3i * 0.5;
+            s0r *= epi3i;
+            s0i *= epi3i;
+            f[at] += s3r;
+            f[at + 1] += s3i;
+            f[a2] = f[a1] + s0i;
+            f[a2 + 1] = f[a1 + 1] - s0r;
+            f[a1] = f[a1] - s0i;
+            f[a1 + 1] = f[a1 + 1] + s0r;
+            at += 2;
+        }
+    }
+}
+
+fn bfly5(f: SliceMut<f32>, base: usize, fstride: usize, m: usize, n: usize, mm: usize) {
+    let yar = twr(fstride * m);
+    let yai = twi(fstride * m);
+    let ybr = twr(fstride * 2 * m);
+    let ybi = twi(fstride * 2 * m);
+    for (i in 0usize..n) {
+        let start = base + 2 * i * mm;
+        for (u in 0usize..m) {
+            let a0 = start + 2 * u;
+            let a1 = a0 + 2 * m;
+            let a2 = a0 + 4 * m;
+            let a3 = a0 + 6 * m;
+            let a4 = a0 + 8 * m;
+            let s0r = f[a0];
+            let s0i = f[a0 + 1];
+            let k1 = u * fstride;
+            let k2 = 2 * u * fstride;
+            let k3 = 3 * u * fstride;
+            let k4 = 4 * u * fstride;
+            let s1r = f[a1] * twr(k1) - f[a1 + 1] * twi(k1);
+            let s1i = f[a1] * twi(k1) + f[a1 + 1] * twr(k1);
+            let s2r = f[a2] * twr(k2) - f[a2 + 1] * twi(k2);
+            let s2i = f[a2] * twi(k2) + f[a2 + 1] * twr(k2);
+            let s3r = f[a3] * twr(k3) - f[a3 + 1] * twi(k3);
+            let s3i = f[a3] * twi(k3) + f[a3 + 1] * twr(k3);
+            let s4r = f[a4] * twr(k4) - f[a4 + 1] * twi(k4);
+            let s4i = f[a4] * twi(k4) + f[a4 + 1] * twr(k4);
+            let s7r = s1r + s4r;
+            let s7i = s1i + s4i;
+            let s10r = s1r - s4r;
+            let s10i = s1i - s4i;
+            let s8r = s2r + s3r;
+            let s8i = s2i + s3i;
+            let s9r = s2r - s3r;
+            let s9i = s2i - s3i;
+            f[a0] = f[a0] + (s7r + s8r);
+            f[a0 + 1] = f[a0 + 1] + (s7i + s8i);
+            let s5r = s0r + (s7r * yar + s8r * ybr);
+            let s5i = s0i + (s7i * yar + s8i * ybr);
+            let s6r = s10i * yai + s9i * ybi;
+            let s6i = -(s10r * yai + s9r * ybi);
+            f[a1] = s5r - s6r;
+            f[a1 + 1] = s5i - s6i;
+            f[a4] = s5r + s6r;
+            f[a4 + 1] = s5i + s6i;
+            let s11r = s0r + (s7r * ybr + s8r * yar);
+            let s11i = s0i + (s7i * ybr + s8i * yar);
+            let s12r = s9i * yai - s10i * ybi;
+            let s12i = s10r * ybi - s9r * yai;
+            f[a2] = s11r + s12r;
+            f[a2 + 1] = s11i + s12i;
+            f[a3] = s11r - s12r;
+            f[a3 + 1] = s11i - s12i;
+        }
+    }
+}
+
+/// The FFT of size 480 >> `s`, in place on the complex values at `base`, without scaling or bit reversal.
+fn fftImpl(s: usize, f: SliceMut<f32>, base: usize) {
+    let factors = s * 10;
+    let shift = s;
+    var fstride = [0usize; 8];
+    fstride[0] = 1;
+    var l: usize = 0;
+    loop {
+        let p = truncate<usize>(FFT_FACTORS[factors + 2 * l]);
+        let m = FFT_FACTORS[factors + 2 * l + 1];
+        fstride[l + 1] = fstride[l] * p;
+        l += 1;
+        if (m == 1) {
+            break;
+        }
+    }
+    var m = truncate<usize>(FFT_FACTORS[factors + 2 * l - 1]);
+    var i = l;
+    while (i > 0) {
+        i -= 1;
+        let m2: usize = if (i != 0) truncate<usize>(FFT_FACTORS[factors + 2 * i - 1]) else 1;
+        let p = FFT_FACTORS[factors + 2 * i];
+        if (p == 2) {
+            bfly2(mut f[..], base, fstride[i]);
+        } else if (p == 4) {
+            bfly4(mut f[..], base, fstride[i] << shift, m, fstride[i], m2);
+        } else if (p == 3) {
+            bfly3(mut f[..], base, fstride[i] << shift, m, fstride[i], m2);
+        } else if (p == 5) {
+            bfly5(mut f[..], base, fstride[i] << shift, m, fstride[i], m2);
+        }
+        m = m2;
+    }
+}
+
+fn bitrev(s: usize, k: usize) -> usize {
+    if (s == 0) {
+        return truncate<usize>(FFT_BITREV480[k]);
+    } else if (s == 1) {
+        return truncate<usize>(FFT_BITREV240[k]);
+    } else if (s == 2) {
+        return truncate<usize>(FFT_BITREV120[k]);
+    }
+    return truncate<usize>(FFT_BITREV60[k]);
+}
+
+/// The inverse MDCT of `input[0], input[stride], ...` (N/2 values for N = 1920 >> shift) into `out` at `outAt`, its
+/// overlap windowed with `WINDOW120` (overlap 120): libopus's clt_mdct_backward.
+fn mdctBackward(input: Slice<f32>, inAt: usize, out: SliceMut<f32>, outAt: usize, shift: usize, stride: usize) {
+    let overlap: usize = 120;
+    var n: usize = 1920;
+    var trig: usize = 0;
+    for (i in 0usize..shift) {
+        n = n >> 1;
+        trig += n;
+    }
+    let n2 = n >> 1;
+    let n4 = n >> 2;
+    let yp = outAt + (overlap >> 1);
+    var xp1 = inAt;
+    var xp2 = inAt + stride * (n2 - 1);
+    for (i in 0usize..n4) {
+        let rev = bitrev(shift, i);
+        let t0 = MDCT_TWIDDLES960[trig + i];
+        let t1 = MDCT_TWIDDLES960[trig + n4 + i];
+        let yr = input[xp2] * t0 + input[xp1] * t1;
+        let yi = input[xp1] * t0 - input[xp2] * t1;
+        out[yp + 2 * rev + 1] = yr;
+        out[yp + 2 * rev] = yi;
+        xp1 += 2 * stride;
+        if (i + 1 < n4) {
+            xp2 -= 2 * stride;
+        }
+    }
+    fftImpl(shift, mut out[..], yp);
+    var y0 = yp;
+    var y1 = yp + n2 - 2;
+    for (i in 0usize..(n4 + 1) >> 1) {
+        var re = out[y0 + 1];
+        var im = out[y0];
+        var t0 = MDCT_TWIDDLES960[trig + i];
+        var t1 = MDCT_TWIDDLES960[trig + n4 + i];
+        var yr = re * t0 + im * t1;
+        var yi = re * t1 - im * t0;
+        re = out[y1 + 1];
+        im = out[y1];
+        out[y0] = yr;
+        out[y1 + 1] = yi;
+        t0 = MDCT_TWIDDLES960[trig + n4 - i - 1];
+        t1 = MDCT_TWIDDLES960[trig + n2 - i - 1];
+        yr = re * t0 + im * t1;
+        yi = re * t1 - im * t0;
+        out[y1] = yr;
+        out[y0 + 1] = yi;
+        y0 += 2;
+        if (y1 >= 2) {
+            y1 -= 2;
+        }
+    }
+    var x1 = outAt + overlap - 1;
+    var w1: usize = 0;
+    var w2: usize = overlap - 1;
+    var o = outAt;
+    for (i in 0usize..overlap / 2) {
+        let a = out[x1];
+        let b = out[o];
+        out[o] = WINDOW120[w2] * b - WINDOW120[w1] * a;
+        out[x1] = WINDOW120[w1] * b + WINDOW120[w2] * a;
+        o += 1;
+        x1 -= 1;
+        w1 += 1;
+        if (w2 > 0) {
+            w2 -= 1;
+        }
+    }
+}

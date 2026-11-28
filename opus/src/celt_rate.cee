@@ -1,0 +1,325 @@
+// CELT's bit allocation (libopus 1.5.2 celt/rate.c and rate.h, decoder side; BSD).
+
+const NB_EBANDS: usize = 21;
+const NB_ALLOC_VECTORS: i32 = 11;
+const ALLOC_STEPS: i32 = 6;
+const MAX_FINE_BITS: i32 = 8;
+const FINE_OFFSET: i32 = 21;
+const QTHETA_OFFSET: i32 = 4;
+const QTHETA_OFFSET_TWOPHASE: i32 = 16;
+const LOG_MAX_PSEUDO: i32 = 6;
+const BITRES_I: i32 = 3;
+
+fn eband(i: usize) -> i32 => EBAND5MS[i] as i32;
+
+fn getPulses(i: i32) -> i32 => if (i < 8) i else celtShl(8 + i % 8, (celtShr(i, 3)) - 1);
+
+fn cacheAt(band: usize, lm: i32) -> usize => truncate<usize>(CACHE_INDEX50[truncate<usize>(lm + 1) * NB_EBANDS + band] as i32);
+
+fn bits2pulses(band: usize, lm: i32, bits0: i32) -> i32 {
+    let c = cacheAt(band, lm);
+    var lo: i32 = 0;
+    var hi: i32 = CACHE_BITS50[c] as i32;
+    let bits = bits0 - 1;
+    for (i in 0..LOG_MAX_PSEUDO) {
+        let mid = celtShr((lo + hi + 1), 1);
+        if ((CACHE_BITS50[c + truncate<usize>(mid)] as i32) >= bits) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let low = if (lo == 0) -1 else CACHE_BITS50[c + truncate<usize>(lo)] as i32;
+    if (bits - low <= (CACHE_BITS50[c + truncate<usize>(hi)] as i32) - bits) {
+        return lo;
+    }
+    return hi;
+}
+
+fn pulses2bits(band: usize, lm: i32, pulses: i32) -> i32 {
+    if (pulses == 0) {
+        return 0;
+    }
+    let c = cacheAt(band, lm);
+    return (CACHE_BITS50[c + truncate<usize>(pulses)] as i32) + 1;
+}
+
+/// What the allocation gives a frame.
+struct Allocation {
+    pulses: [i32; 21];
+    ebits: [i32; 21];
+    finePriority: [i32; 21];
+    codedBands: i32;
+    intensity: i32;
+    dualStereo: i32;
+    balance: i32;
+}
+
+fn computeAllocation<region r>(start: i32, end: i32, offsets: borrow [i32; 21], cap: borrow [i32; 21], allocTrim: i32,
+    total0: i32, c: i32, lm: i32, ec: borrow mut RangeDecoder<r>) -> Allocation {
+    var total = celtImax(total0, 0);
+    let len = NB_EBANDS;
+    var skipStart = start;
+    let skipRsv = if (total >= 8) 8 else 0;
+    total -= skipRsv;
+    var intensityRsv: i32 = 0;
+    var dualStereoRsv: i32 = 0;
+    if (c == 2) {
+        intensityRsv = LOG2_FRAC_TABLE[truncate<usize>(end - start)] as i32;
+        if (intensityRsv > total) {
+            intensityRsv = 0;
+        } else {
+            total -= intensityRsv;
+            dualStereoRsv = if (total >= 8) 8 else 0;
+            total -= dualStereoRsv;
+        }
+    }
+    var bits1 = [0i32; 21];
+    var bits2 = [0i32; 21];
+    var thresh = [0i32; 21];
+    var trimOffset = [0i32; 21];
+    for (j in truncate<usize>(start)..truncate<usize>(end)) {
+        let n = eband(j + 1) - eband(j);
+        thresh[j] = celtImax(celtShl(c, 3), celtShr(celtShl(3 * n, lm + 3), 4));
+        trimOffset[j] = celtShr(c * n * (allocTrim - 5 - lm) * (end - truncate<i32>(j) - 1) * celtShl(1, lm + 3), 6);
+        if (celtShl(n, lm) == 1) {
+            trimOffset[j] -= celtShl(c, 3);
+        }
+    }
+    var lo: i32 = 1;
+    var hi: i32 = NB_ALLOC_VECTORS - 1;
+    loop {
+        var done = false;
+        var psum: i32 = 0;
+        let mid = celtShr((lo + hi), 1);
+        var j = end;
+        while (j > start) {
+            j -= 1;
+            let ju = truncate<usize>(j);
+            let n = eband(ju + 1) - eband(ju);
+            var bitsj = celtShr(celtShl(c * n * (BAND_ALLOCATION[truncate<usize>(mid) * len + ju] as i32), lm), 2);
+            if (bitsj > 0) {
+                bitsj = celtImax(0, bitsj + trimOffset[ju]);
+            }
+            bitsj += offsets[ju];
+            if (bitsj >= thresh[ju] || done) {
+                done = true;
+                psum += celtImin(bitsj, cap[ju]);
+            } else if (bitsj >= celtShl(c, 3)) {
+                psum += celtShl(c, 3);
+            }
+        }
+        if (psum > total) {
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+        if (lo > hi) {
+            break;
+        }
+    }
+    hi = lo;
+    lo -= 1;
+    for (j in truncate<usize>(start)..truncate<usize>(end)) {
+        let n = eband(j + 1) - eband(j);
+        var bits1j = celtShr(celtShl(c * n * (BAND_ALLOCATION[truncate<usize>(lo) * len + j] as i32), lm), 2);
+        var bits2j = if (hi >= NB_ALLOC_VECTORS) cap[j]
+            else celtShr(celtShl(c * n * (BAND_ALLOCATION[truncate<usize>(hi) * len + j] as i32), lm), 2);
+        if (bits1j > 0) {
+            bits1j = celtImax(0, bits1j + trimOffset[j]);
+        }
+        if (bits2j > 0) {
+            bits2j = celtImax(0, bits2j + trimOffset[j]);
+        }
+        if (lo > 0) {
+            bits1j += offsets[j];
+        }
+        bits2j += offsets[j];
+        if (offsets[j] > 0) {
+            skipStart = truncate<i32>(j);
+        }
+        bits2j = celtImax(0, bits2j - bits1j);
+        bits1[j] = bits1j;
+        bits2[j] = bits2j;
+    }
+    return interpBits2pulses(start, end, skipStart, borrow bits1, borrow bits2, borrow thresh, cap, total, skipRsv,
+        intensityRsv, dualStereoRsv, c, lm, ec);
+}
+
+fn interpBits2pulses<region r>(start: i32, end: i32, skipStart: i32, bits1: borrow [i32; 21], bits2: borrow [i32; 21],
+    thresh: borrow [i32; 21], cap: borrow [i32; 21], total0: i32, skipRsv: i32, intensityRsv0: i32,
+    dualStereoRsv0: i32, c: i32, lm: i32, ec: borrow mut RangeDecoder<r>) -> Allocation {
+    var a = Allocation {
+        pulses: [0i32; 21],
+        ebits: [0i32; 21],
+        finePriority: [0i32; 21],
+        codedBands: -1,
+        intensity: 0,
+        dualStereo: 0,
+        balance: 0,
+    };
+    var total = total0;
+    var intensityRsv = intensityRsv0;
+    var dualStereoRsv = dualStereoRsv0;
+    let allocFloor = celtShl(c, 3);
+    let stereo: i32 = if (c > 1) 1 else 0;
+    let logM = celtShl(lm, 3);
+    var lo: i32 = 0;
+    var hi: i32 = celtShl(1, 6);
+    for (i in 0..ALLOC_STEPS) {
+        let mid = celtShr((lo + hi), 1);
+        var psum: i32 = 0;
+        var done = false;
+        var j = end;
+        while (j > start) {
+            j -= 1;
+            let ju = truncate<usize>(j);
+            let tmp = bits1[ju] + (celtShr((mid * bits2[ju]), ALLOC_STEPS));
+            if (tmp >= thresh[ju] || done) {
+                done = true;
+                psum += celtImin(tmp, cap[ju]);
+            } else if (tmp >= allocFloor) {
+                psum += allocFloor;
+            }
+        }
+        if (psum > total) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    var psum: i32 = 0;
+    var done = false;
+    var j = end;
+    while (j > start) {
+        j -= 1;
+        let ju = truncate<usize>(j);
+        var tmp = bits1[ju] + (celtShr((lo * bits2[ju]), ALLOC_STEPS));
+        if (tmp < thresh[ju] && !done) {
+            tmp = if (tmp >= allocFloor) allocFloor else 0;
+        } else {
+            done = true;
+        }
+        tmp = celtImin(tmp, cap[ju]);
+        a.pulses[ju] = tmp;
+        psum += tmp;
+    }
+    var codedBands = end;
+    loop {
+        let jj = codedBands - 1;
+        if (jj <= skipStart) {
+            total += skipRsv;
+            break;
+        }
+        let ju = truncate<usize>(jj);
+        let cb = truncate<usize>(codedBands);
+        let st = truncate<usize>(start);
+        var left = total - psum;
+        let percoeff = celtSdiv(left, eband(cb) - eband(st));
+        left -= (eband(cb) - eband(st)) * percoeff;
+        let rem = celtImax(left - (eband(ju) - eband(st)), 0);
+        let bandWidth = eband(cb) - eband(ju);
+        var bandBits = a.pulses[ju] + percoeff * bandWidth + rem;
+        if (bandBits >= celtImax(thresh[ju], allocFloor + 8)) {
+            if (ec.bitLogp(1)) {
+                break;
+            }
+            psum += 8;
+            bandBits -= 8;
+        }
+        psum -= a.pulses[ju] + intensityRsv;
+        if (intensityRsv > 0) {
+            intensityRsv = LOG2_FRAC_TABLE[truncate<usize>(jj - start)] as i32;
+        }
+        psum += intensityRsv;
+        if (bandBits >= allocFloor) {
+            psum += allocFloor;
+            a.pulses[ju] = allocFloor;
+        } else {
+            a.pulses[ju] = 0;
+        }
+        codedBands -= 1;
+    }
+    if (intensityRsv > 0) {
+        a.intensity = start + truncate<i32>(ec.uint(truncate<u32>(codedBands + 1 - start)));
+    } else {
+        a.intensity = 0;
+    }
+    if (a.intensity <= start) {
+        total += dualStereoRsv;
+        dualStereoRsv = 0;
+    }
+    if (dualStereoRsv > 0) {
+        a.dualStereo = if (ec.bitLogp(1)) 1 else 0;
+    } else {
+        a.dualStereo = 0;
+    }
+    let cb = truncate<usize>(codedBands);
+    let st = truncate<usize>(start);
+    var left = total - psum;
+    let percoeff = celtSdiv(left, eband(cb) - eband(st));
+    left -= (eband(cb) - eband(st)) * percoeff;
+    for (k in st..cb) {
+        a.pulses[k] += percoeff * (eband(k + 1) - eband(k));
+    }
+    for (k in st..cb) {
+        let tmp = celtImin(left, eband(k + 1) - eband(k));
+        a.pulses[k] += tmp;
+        left -= tmp;
+    }
+    var balance: i32 = 0;
+    for (k in st..cb) {
+        let n0 = eband(k + 1) - eband(k);
+        let n = celtShl(n0, lm);
+        let bit = a.pulses[k] + balance;
+        var excess: i32 = 0;
+        if (n > 1) {
+            excess = celtImax(bit - cap[k], 0);
+            a.pulses[k] = bit - excess;
+            let den = c * n + (if (c == 2 && n > 2 && a.dualStereo == 0 && truncate<i32>(k) < a.intensity) 1 else 0);
+            let nclogn = den * ((LOGN400[k] as i32) + logM);
+            var offset = (celtShr(nclogn, 1)) - den * FINE_OFFSET;
+            if (n == 2) {
+                offset += celtShr((celtShl(den, 3)), 2);
+            }
+            if (a.pulses[k] + offset < celtShl((den * 2), 3)) {
+                offset += celtShr(nclogn, 2);
+            } else if (a.pulses[k] + offset < celtShl((den * 3), 3)) {
+                offset += celtShr(nclogn, 3);
+            }
+            var e = celtImax(0, a.pulses[k] + offset + (celtShl(den, 2)));
+            e = celtShr(celtSdiv(e, den), 3);
+            if (c * e > (celtShr(a.pulses[k], 3))) {
+                e = celtShr((celtShr(a.pulses[k], stereo)), 3);
+            }
+            e = celtImin(e, MAX_FINE_BITS);
+            a.ebits[k] = e;
+            a.finePriority[k] = if (e * (celtShl(den, 3)) >= a.pulses[k] + offset) 1 else 0;
+            a.pulses[k] -= celtShl((c * e), 3);
+        } else {
+            excess = celtImax(0, bit - (celtShl(c, 3)));
+            a.pulses[k] = bit - excess;
+            a.ebits[k] = 0;
+            a.finePriority[k] = 1;
+        }
+        if (excess > 0) {
+            let extraFine = celtImin(celtShr(excess, (stereo + 3)), MAX_FINE_BITS - a.ebits[k]);
+            a.ebits[k] += extraFine;
+            let extraBits = celtShl((extraFine * c), 3);
+            a.finePriority[k] = if (extraBits >= excess - balance) 1 else 0;
+            excess -= extraBits;
+        }
+        balance = excess;
+    }
+    a.balance = balance;
+    for (k in cb..truncate<usize>(end)) {
+        a.ebits[k] = celtShr((celtShr(a.pulses[k], stereo)), 3);
+        a.pulses[k] = 0;
+        a.finePriority[k] = if (a.ebits[k] < 1) 1 else 0;
+    }
+    a.codedBands = codedBands;
+    return a;
+}
+
+/// C's signed division of n by a positive d (toward zero).
+fn celtSdiv(n: i32, d: i32) -> i32 => n / d;

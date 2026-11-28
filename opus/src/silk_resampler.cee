@@ -1,0 +1,183 @@
+// SILK's decoder-side resampler from the internal rate (8, 12 or 16 kHz) up to the API rate, ported bit-exactly from
+// libopus 1.5.2 silk/resampler.c, resampler_private_up2_HQ.c and resampler_private_IIR_FIR.c. Down-sampling (an API
+// rate below the internal one) is not ported: `init` refuses it.
+
+const SILK_RESAMPLER_COPY: u32 = 0;
+const SILK_RESAMPLER_UP2: u32 = 1;
+const SILK_RESAMPLER_IIR_FIR: u32 = 2;
+const SILK_ORDER_FIR_12: usize = 8;
+const SILK_UP2_HQ_0: [i32; 3] = [1746, 14986, 39083 - 65536];
+const SILK_UP2_HQ_1: [i32; 3] = [6854, 25769, 55542 - 65536];
+const SILK_DELAY_DEC: [i32; 15] = [4, 0, 2, 0, 0, 0, 9, 4, 7, 4, 0, 3, 12, 7, 7];
+
+struct SilkResampler {
+    iir: [i32; 6];
+    fir: [i16; 8];
+    delayBuf: [i16; 48];
+    function: u32;
+    batchSize: i32;
+    invRatioQ16: i32;
+    fsInKhz: i32;
+    fsOutKhz: i32;
+    inputDelay: i32;
+}
+
+fn silkRateId(r: i32) -> i32 {
+    let a = silkRsh(r, 12) - (if (r > 16000) 1 else 0);
+    return silkRsh(a, if (r > 24000) 1 else 0) - 1;
+}
+
+fn silkNewResampler() -> SilkResampler => SilkResampler {
+    iir: [0i32; 6],
+    fir: [0i16; 8],
+    delayBuf: [0i16; 48],
+    function: SILK_RESAMPLER_COPY,
+    batchSize: 0,
+    invRatioQ16: 0,
+    fsInKhz: 0,
+    fsOutKhz: 0,
+    inputDelay: 0,
+};
+
+/// silk_resampler_init for decoding; false for rates it does not take.
+fn silkResamplerInit(s: borrow mut SilkResampler, fsIn: i32, fsOut: i32) -> bool {
+    s.iir = [0i32; 6];
+    s.fir = [0i16; 8];
+    s.delayBuf = [0i16; 48];
+    if ((fsIn != 8000 && fsIn != 12000 && fsIn != 16000) || (fsOut != 8000 && fsOut != 12000 && fsOut != 16000 && fsOut != 24000 && fsOut != 48000)) {
+        return false;
+    }
+    s.inputDelay = SILK_DELAY_DEC[truncate<usize>(silkRateId(fsIn) * 5 + silkRateId(fsOut))];
+    s.fsInKhz = fsIn / 1000;
+    s.fsOutKhz = fsOut / 1000;
+    s.batchSize = s.fsInKhz * 10;
+    var up2x: i32 = 0;
+    if (fsOut > fsIn) {
+        if (fsOut == fsIn * 2) {
+            s.function = SILK_RESAMPLER_UP2;
+        } else {
+            s.function = SILK_RESAMPLER_IIR_FIR;
+            up2x = 1;
+        }
+    } else if (fsOut < fsIn) {
+        return false;
+    } else {
+        s.function = SILK_RESAMPLER_COPY;
+    }
+    s.invRatioQ16 = silkLsh(silkLsh(fsIn, 14 + up2x) / fsOut, 2);
+    while (silkSmulww(s.invRatioQ16, fsOut) < silkLsh(fsIn, up2x)) {
+        s.invRatioQ16 += 1;
+    }
+    return true;
+}
+
+/// silk_resampler: `inLen` samples of input[inAt..] into out[outAt..].
+fn silkResample(s: borrow mut SilkResampler, out: SliceMut<i16>, outAt: usize, input: Slice<i16>, inAt: usize, inLen: usize) {
+    let fsIn = truncate<usize>(s.fsInKhz);
+    let delay = truncate<usize>(s.inputDelay);
+    let nSamples = fsIn - delay;
+    for (k in 0usize..nSamples) {
+        s.delayBuf[delay + k] = input[inAt + k];
+    }
+    var head = [0i16; 48];
+    for (k in 0usize..48) {
+        head[k] = s.delayBuf[k];
+    }
+    let fsOut = truncate<usize>(s.fsOutKhz);
+    if (s.function == SILK_RESAMPLER_UP2) {
+        silkUp2Hq(mut s.iir, out, outAt, head[..], 0, fsIn);
+        silkUp2Hq(mut s.iir, out, outAt + fsOut, input, inAt + nSamples, inLen - fsIn);
+    } else if (s.function == SILK_RESAMPLER_IIR_FIR) {
+        silkIirFir(s, out, outAt, head[..], 0, fsIn);
+        silkIirFir(s, out, outAt + fsOut, input, inAt + nSamples, inLen - fsIn);
+    } else {
+        for (k in 0usize..fsIn) {
+            out[outAt + k] = head[k];
+        }
+        for (k in 0usize..inLen - fsIn) {
+            out[outAt + fsOut + k] = input[inAt + nSamples + k];
+        }
+    }
+    for (k in 0usize..delay) {
+        s.delayBuf[k] = input[inAt + inLen - delay + k];
+    }
+}
+
+/// silk_resampler_private_up2_HQ: two samples out for each one in, through two all-pass chains.
+fn silkUp2Hq(st: borrow mut [i32; 6], out: SliceMut<i16>, outAt: usize, input: Slice<i16>, inAt: usize, len: usize) {
+    for (k in 0usize..len) {
+        let in32 = silkLsh(input[inAt + k] as i32, 10);
+        var y = in32.wrappingSub(st[0]);
+        var x = silkSmulwb(y, SILK_UP2_HQ_0[0]);
+        var out1 = st[0].wrappingAdd(x);
+        st[0] = in32.wrappingAdd(x);
+        y = out1.wrappingSub(st[1]);
+        x = silkSmulwb(y, SILK_UP2_HQ_0[1]);
+        var out2 = st[1].wrappingAdd(x);
+        st[1] = out1.wrappingAdd(x);
+        y = out2.wrappingSub(st[2]);
+        x = silkSmlawb(y, y, SILK_UP2_HQ_0[2]);
+        out1 = st[2].wrappingAdd(x);
+        st[2] = out2.wrappingAdd(x);
+        out[outAt + 2 * k] = truncate<i16>(silkSat16(silkRshiftRound(out1, 10)));
+        y = in32.wrappingSub(st[3]);
+        x = silkSmulwb(y, SILK_UP2_HQ_1[0]);
+        out1 = st[3].wrappingAdd(x);
+        st[3] = in32.wrappingAdd(x);
+        y = out1.wrappingSub(st[4]);
+        x = silkSmulwb(y, SILK_UP2_HQ_1[1]);
+        out2 = st[4].wrappingAdd(x);
+        st[4] = out1.wrappingAdd(x);
+        y = out2.wrappingSub(st[5]);
+        x = silkSmlawb(y, y, SILK_UP2_HQ_1[2]);
+        out1 = st[5].wrappingAdd(x);
+        st[5] = out2.wrappingAdd(x);
+        out[outAt + 2 * k + 1] = truncate<i16>(silkSat16(silkRshiftRound(out1, 10)));
+    }
+}
+
+/// silk_resampler_private_IIR_FIR: up two with silkUp2Hq, then a 12-phase 8-tap FIR at the fractional positions.
+fn silkIirFir(s: borrow mut SilkResampler, out: SliceMut<i16>, outAt: usize, input: Slice<i16>, inAt: usize, length: usize) {
+    var buf = [0i16; 968];
+    for (k in 0usize..SILK_ORDER_FIR_12) {
+        buf[k] = s.fir[k];
+    }
+    let increment = s.invRatioQ16;
+    var inLen = length;
+    var at = inAt;
+    var o = outAt;
+    var nIn: usize = 0;
+    loop {
+        nIn = if (inLen < truncate<usize>(s.batchSize)) inLen else truncate<usize>(s.batchSize);
+        silkUp2Hq(mut s.iir, mut buf[..], SILK_ORDER_FIR_12, input, at, nIn);
+        let maxIndex = silkLsh(truncate<i32>(nIn), 17);
+        var index: i32 = 0;
+        while (index < maxIndex) {
+            let tableIndex = truncate<usize>(silkSmulwb(truncate<i32>(truncate<u32>(index) & 0xFFFF), 12));
+            let p = truncate<usize>(silkRsh(index, 16));
+            var res = silkSmulbb(buf[p] as i32, silk_resampler_frac_FIR_12[tableIndex * 4] as i32);
+            res = silkSmlabb(res, buf[p + 1] as i32, silk_resampler_frac_FIR_12[tableIndex * 4 + 1] as i32);
+            res = silkSmlabb(res, buf[p + 2] as i32, silk_resampler_frac_FIR_12[tableIndex * 4 + 2] as i32);
+            res = silkSmlabb(res, buf[p + 3] as i32, silk_resampler_frac_FIR_12[tableIndex * 4 + 3] as i32);
+            res = silkSmlabb(res, buf[p + 4] as i32, silk_resampler_frac_FIR_12[(11 - tableIndex) * 4 + 3] as i32);
+            res = silkSmlabb(res, buf[p + 5] as i32, silk_resampler_frac_FIR_12[(11 - tableIndex) * 4 + 2] as i32);
+            res = silkSmlabb(res, buf[p + 6] as i32, silk_resampler_frac_FIR_12[(11 - tableIndex) * 4 + 1] as i32);
+            res = silkSmlabb(res, buf[p + 7] as i32, silk_resampler_frac_FIR_12[(11 - tableIndex) * 4] as i32);
+            out[o] = truncate<i16>(silkSat16(silkRshiftRound(res, 15)));
+            o += 1;
+            index += increment;
+        }
+        at += nIn;
+        inLen -= nIn;
+        if (inLen > 0) {
+            for (k in 0usize..SILK_ORDER_FIR_12) {
+                buf[k] = buf[(nIn << 1) + k];
+            }
+        } else {
+            break;
+        }
+    }
+    for (k in 0usize..SILK_ORDER_FIR_12) {
+        s.fir[k] = buf[(nIn << 1) + k];
+    }
+}

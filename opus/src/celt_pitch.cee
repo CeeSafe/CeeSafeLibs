@@ -1,0 +1,197 @@
+// CELT's pitch search and LPC for packet-loss concealment (libopus 1.5.2 celt/pitch.c and celt/celt_lpc.c, float
+// build; BSD). Arrays are a buffer and an offset, as C's pointers into them were.
+
+const CELT_LPC_ORDER: usize = 24;
+
+fn findBestPitch(xcorr: Slice<f32>, y: Slice<f32>, yAt: usize, len: usize, maxPitch: usize, best: borrow mut [usize; 2]) {
+    var syy: f32 = 1.0;
+    var bestNum: [f32; 2] = [-1.0, -1.0];
+    var bestDen: [f32; 2] = [0.0, 0.0];
+    best[0] = 0;
+    best[1] = 1;
+    for (j in 0usize..len) {
+        syy += y[yAt + j] * y[yAt + j];
+    }
+    for (i in 0usize..maxPitch) {
+        if (xcorr[i] > 0.0) {
+            var xcorr16 = xcorr[i];
+            xcorr16 *= 1e-12;
+            let num = xcorr16 * xcorr16;
+            if (num * bestDen[1] > bestNum[1] * syy) {
+                if (num * bestDen[0] > bestNum[0] * syy) {
+                    bestNum[1] = bestNum[0];
+                    bestDen[1] = bestDen[0];
+                    best[1] = best[0];
+                    bestNum[0] = num;
+                    bestDen[0] = syy;
+                    best[0] = i;
+                } else {
+                    bestNum[1] = num;
+                    bestDen[1] = syy;
+                    best[1] = i;
+                }
+            }
+        }
+        syy += y[yAt + i + len] * y[yAt + i + len] - y[yAt + i] * y[yAt + i];
+        syy = celtFmax(1.0, syy);
+    }
+}
+
+fn celtFir5(x: SliceMut<f32>, num: borrow [f32; 5], n: usize) {
+    var mem = [0.0f32; 5];
+    for (i in 0usize..n) {
+        var sum = x[i];
+        sum = sum + num[0] * mem[0];
+        sum = sum + num[1] * mem[1];
+        sum = sum + num[2] * mem[2];
+        sum = sum + num[3] * mem[3];
+        sum = sum + num[4] * mem[4];
+        mem[4] = mem[3];
+        mem[3] = mem[2];
+        mem[2] = mem[1];
+        mem[1] = mem[0];
+        mem[0] = x[i];
+        x[i] = sum;
+    }
+}
+
+/// libopus's _celt_autocorr: `ac[0..=lag]` of `x[xAt..xAt + n]`, the ends windowed over `overlap` when it is not 0.
+fn celtAutocorr(x: Slice<f32>, xAt: usize, ac: SliceMut<f32>, overlap: usize, lag: usize, n: usize, scratch: SliceMut<f32>) {
+    for (i in 0usize..n) {
+        scratch[i] = x[xAt + i];
+    }
+    for (i in 0usize..overlap) {
+        scratch[i] = x[xAt + i] * WINDOW120[i];
+        scratch[n - i - 1] = x[xAt + n - i - 1] * WINDOW120[i];
+    }
+    let fastN = n - lag;
+    for (k in 0usize..lag + 1) {
+        var sum: f32 = 0.0;
+        for (j in 0usize..fastN) {
+            sum += scratch[j] * scratch[j + k];
+        }
+        ac[k] = sum;
+    }
+    for (k in 0usize..lag + 1) {
+        var d: f32 = 0.0;
+        for (i in k + fastN..n) {
+            d = d + scratch[i] * scratch[i - k];
+        }
+        ac[k] += d;
+    }
+}
+
+/// libopus's _celt_lpc: `p` LPC coefficients from the autocorrelation.
+fn celtLpc(lpc: SliceMut<f32>, lpcAt: usize, ac: Slice<f32>, p: usize) {
+    var error = ac[0];
+    for (i in 0usize..p) {
+        lpc[lpcAt + i] = 0.0;
+    }
+    if (ac[0] > 1e-10) {
+        for (i in 0usize..p) {
+            var rr: f32 = 0.0;
+            for (j in 0usize..i) {
+                rr += lpc[lpcAt + j] * ac[i - j];
+            }
+            rr += ac[i + 1];
+            let r = -(rr / error);
+            lpc[lpcAt + i] = r;
+            for (j in 0usize..(i + 1) >> 1) {
+                let tmp1 = lpc[lpcAt + j];
+                let tmp2 = lpc[lpcAt + i - 1 - j];
+                lpc[lpcAt + j] = tmp1 + r * tmp2;
+                lpc[lpcAt + i - 1 - j] = tmp2 + r * tmp1;
+            }
+            error = error - (r * r) * error;
+            if (error <= 0.001 * ac[0]) {
+                break;
+            }
+        }
+    }
+}
+
+/// The PLC's pitch: the decoded history downsampled and searched (libopus's celt_plc_pitch_search).
+fn plcPitchSearch(mem: Slice<f32>, stride: usize, c: usize, lp: SliceMut<f32>, scratch: SliceMut<f32>) -> usize {
+    let len: usize = 2048;
+    let half = len >> 1;
+    for (i in 1usize..half) {
+        lp[i] = 0.25 * mem[2 * i - 1] + 0.25 * mem[2 * i + 1] + 0.5 * mem[2 * i];
+    }
+    lp[0] = 0.25 * mem[1] + 0.5 * mem[0];
+    if (c == 2) {
+        for (i in 1usize..half) {
+            lp[i] += 0.25 * mem[stride + 2 * i - 1] + 0.25 * mem[stride + 2 * i + 1] + 0.5 * mem[stride + 2 * i];
+        }
+        lp[0] += 0.25 * mem[stride + 1] + 0.5 * mem[stride];
+    }
+    var ac = [0.0f32; 5];
+    celtAutocorr(lp[..], 0, mut ac[..], 0, 4, half, mut scratch[..]);
+    ac[0] *= 1.0001;
+    for (i in 1usize..5) {
+        let f = 0.008 * round<f32>(truncate<i32>(i));
+        ac[i] -= ac[i] * f * f;
+    }
+    var lpc = [0.0f32; 4];
+    celtLpc(mut lpc[..], 0, ac[..], 4);
+    var tmp: f32 = 1.0;
+    for (i in 0usize..4) {
+        tmp = 0.9 * tmp;
+        lpc[i] = lpc[i] * tmp;
+    }
+    let c1: f32 = 0.8;
+    let lpc2: [f32; 5] = [lpc[0] + 0.8, lpc[1] + c1 * lpc[0], lpc[2] + c1 * lpc[1], lpc[3] + c1 * lpc[2], c1 * lpc[3]];
+    celtFir5(mut lp[..], borrow lpc2, half);
+    // pitch_search(lp + 360, lp, 2048 - 720, 720 - 100)
+    let maxLag: usize = 720;
+    let minLag: usize = 100;
+    let x = maxLag >> 1;
+    let slen = len - maxLag;
+    let maxPitch = maxLag - minLag;
+    let lag = slen + maxPitch;
+    // x_lp4, y_lp4 and xcorr in the scratch: [0, slen/4), [slen/4, slen/4 + lag/4), then xcorr.
+    let x4 = 0usize;
+    let y4 = slen >> 2;
+    let xc = y4 + (lag >> 2);
+    for (j in 0usize..slen >> 2) {
+        scratch[x4 + j] = lp[x + 2 * j];
+    }
+    for (j in 0usize..lag >> 2) {
+        scratch[y4 + j] = lp[2 * j];
+    }
+    for (i in 0usize..maxPitch >> 2) {
+        var sum: f32 = 0.0;
+        for (j in 0usize..slen >> 2) {
+            sum += scratch[x4 + j] * scratch[y4 + i + j];
+        }
+        scratch[xc + i] = sum;
+    }
+    var best = [0usize; 2];
+    findBestPitch(scratch[xc..], scratch[..], y4, slen >> 2, maxPitch >> 2, mut best);
+    for (i in 0usize..maxPitch >> 1) {
+        scratch[xc + i] = 0.0;
+        let d0 = if (i > 2 * best[0]) i - 2 * best[0] else 2 * best[0] - i;
+        let d1 = if (i > 2 * best[1]) i - 2 * best[1] else 2 * best[1] - i;
+        if (d0 > 2 && d1 > 2) {
+            continue;
+        }
+        var sum: f32 = 0.0;
+        for (j in 0usize..slen >> 1) {
+            sum += lp[x + j] * lp[i + j];
+        }
+        scratch[xc + i] = celtFmax(-1.0, sum);
+    }
+    findBestPitch(scratch[xc..], lp[..], 0, slen >> 1, maxPitch >> 1, mut best);
+    var offset: i32 = 0;
+    if (best[0] > 0 && best[0] < (maxPitch >> 1) - 1) {
+        let a = scratch[xc + best[0] - 1];
+        let b = scratch[xc + best[0]];
+        let cc = scratch[xc + best[0] + 1];
+        if ((cc - a) > 0.7 * (b - a)) {
+            offset = 1;
+        } else if ((a - cc) > 0.7 * (b - cc)) {
+            offset = -1;
+        }
+    }
+    let pitch = truncate<i32>(2 * best[0]) - offset;
+    return truncate<usize>(truncate<i32>(maxLag) - pitch);
+}

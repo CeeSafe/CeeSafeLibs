@@ -1,0 +1,20 @@
+// Packets parsed, and the range decoder's final range against libopus on test vector 01's first packets.
+
+@test
+fn packetsAreParsed() -> Result<void, TestFailure> {
+    // Code 0: one frame; CELT FB 20 ms (config 31), stereo.
+    let one = OpusPacket.parse([0xFCu8, 1, 2, 3][..])!;
+    Check.isTrue(one.mode is OpusMode.Celt && one.bandwidth is Bandwidth.Full && one.stereo, "TOC")?;
+    Check.isTrue(one.frameSize == 960 && one.frames.length == 1 && one.frames[0].length == 3, "one frame")?;
+    // Code 1: two equal frames.
+    let two = OpusPacket.parse([0x01u8, 1, 2, 3, 4][..])!;
+    Check.isTrue(two.mode is OpusMode.Silk && two.frames.length == 2 && two.frames[1].start == 3, "two frames")?;
+    Check.isTrue(OpusPacket.parse([0x01u8, 1, 2, 3][..]) == null, "odd: invalid")?;
+    // Code 2: the first frame's length given.
+    let unequal = OpusPacket.parse([0x02u8, 1, 9, 8, 7][..])!;
+    Check.isTrue(unequal.frames[0].length == 1 && unequal.frames[1].length == 2, "two unequal")?;
+    // Code 3, VBR with padding: 3 frames.
+    let three = OpusPacket.parse([0x03u8, 0xC3, 2, 1, 1, 0xAA, 0xBB, 0xCC, 0, 0][..])!;
+    Check.isTrue(three.frames.length == 3 && three.frames[2].length == 1 && three.frames[2].start == 7, "code 3")?;
+    return Check.equalU64(480, samplesPerFrame(0x70, 48000) as u64);
+}

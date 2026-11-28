@@ -1,0 +1,172 @@
+// SILK's fixed-point arithmetic (libopus silk/SigProc_FIX.h, macros.h, Inlines.h), as functions with C's 32-bit
+// two's-complement semantics: additions and multiplications wrap where C's would (so a corrupt packet cannot make the
+// decoder panic), right shifts of signed values are arithmetic. SILK's decoder is bit-exact, so every value here is
+// what libopus computes.
+
+const SILK_I16_MAX: i32 = 32767;
+const SILK_I16_MIN: i32 = -32768;
+const SILK_I32_MAX: i32 = 2147483647;
+const SILK_I32_MIN: i32 = -2147483648;
+
+/// (opus_int16)x: the low 16 bits, sign-extended.
+fn silkS16(x: i32) -> i32 => truncate<i16>(x) as i32;
+
+fn silkAdd32(a: i32, b: i32) -> i32 => a.wrappingAdd(b);
+fn silkSub32(a: i32, b: i32) -> i32 => a.wrappingSub(b);
+fn silkMul32(a: i32, b: i32) -> i32 => a.wrappingMul(b);
+fn silkMla(a: i32, b: i32, c: i32) -> i32 => a.wrappingAdd(b.wrappingMul(c));
+
+fn silkLsh(a: i32, shift: i32) -> i32 => a.wrappingShl(truncate<u32>(shift));
+fn silkRsh(a: i32, shift: i32) -> i32 => a.wrappingShr(truncate<u32>(shift));
+fn silkRsh64(a: i64, shift: i32) -> i64 => a.wrappingShr(truncate<u32>(shift));
+fn silkLsh64(a: i64, shift: i32) -> i64 => a.wrappingShl(truncate<u32>(shift));
+
+/// silk_SMULWB: (a * (int16)b) >> 16.
+fn silkSmulwb(a: i32, b: i32) -> i32 => truncate<i32>(((a as i64) * (silkS16(b) as i64)).wrappingShr(16));
+/// silk_SMLAWB: a + ((b * (int16)c) >> 16).
+fn silkSmlawb(a: i32, b: i32, c: i32) -> i32 => a.wrappingAdd(silkSmulwb(b, c));
+/// silk_SMULWT: (a * (b >> 16)) >> 16.
+fn silkSmulwt(a: i32, b: i32) -> i32 => truncate<i32>(((a as i64) * (silkRsh(b, 16) as i64)).wrappingShr(16));
+fn silkSmlawt(a: i32, b: i32, c: i32) -> i32 => a.wrappingAdd(silkSmulwt(b, c));
+/// silk_SMULBB: (int16)a * (int16)b.
+fn silkSmulbb(a: i32, b: i32) -> i32 => silkS16(a) * silkS16(b);
+fn silkSmlabb(a: i32, b: i32, c: i32) -> i32 => a.wrappingAdd(silkS16(b) * silkS16(c));
+fn silkSmulbt(a: i32, b: i32) -> i32 => silkS16(a).wrappingMul(silkRsh(b, 16));
+fn silkSmlabt(a: i32, b: i32, c: i32) -> i32 => a.wrappingAdd(silkS16(b).wrappingMul(silkRsh(c, 16)));
+fn silkSmultt(a: i32, b: i32) -> i32 => silkRsh(a, 16).wrappingMul(silkRsh(b, 16));
+/// silk_SMULWW: (a * b) >> 16, 64-bit product.
+fn silkSmulww(a: i32, b: i32) -> i32 => truncate<i32>(((a as i64) * (b as i64)).wrappingShr(16));
+fn silkSmlaww(a: i32, b: i32, c: i32) -> i32 => a.wrappingAdd(silkSmulww(b, c));
+/// silk_SMMUL: (a * b) >> 32.
+fn silkSmmul(a: i32, b: i32) -> i32 => truncate<i32>(((a as i64) * (b as i64)).wrappingShr(32));
+fn silkSmull(a: i32, b: i32) -> i64 => (a as i64) * (b as i64);
+fn silkSmlal(a: i64, b: i32, c: i32) -> i64 => a.wrappingAdd((b as i64) * (c as i64));
+
+fn silkRshiftRound(a: i32, shift: i32) -> i32 {
+    if (shift == 1) {
+        return silkRsh(a, 1).wrappingAdd(truncate<i32>(truncate<u32>(a) & 1));
+    }
+    return silkRsh(silkRsh(a, shift - 1).wrappingAdd(1), 1);
+}
+
+fn silkRshiftRound64(a: i64, shift: i32) -> i64 {
+    if (shift == 1) {
+        return silkRsh64(a, 1).wrappingAdd(truncate<i64>(truncate<u64>(a) & 1));
+    }
+    return silkRsh64(silkRsh64(a, shift - 1).wrappingAdd(1), 1);
+}
+
+fn silkSat16(a: i32) -> i32 => if (a > SILK_I16_MAX) SILK_I16_MAX else if (a < SILK_I16_MIN) SILK_I16_MIN else a;
+
+fn silkAddSat32(a: i32, b: i32) -> i32 => a.saturatingAdd(b);
+fn silkSubSat32(a: i32, b: i32) -> i32 => a.saturatingSub(b);
+
+/// silk_ADD_POS_SAT32.
+fn silkAddPosSat32(a: i32, b: i32) -> i32 {
+    let sum = truncate<u32>(a).wrappingAdd(truncate<u32>(b));
+    return if ((sum & 0x80000000) != 0) SILK_I32_MAX else a.wrappingAdd(b);
+}
+
+fn silkLimit(a: i32, l1: i32, l2: i32) -> i32 {
+    if (l1 > l2) {
+        return if (a > l1) l1 else if (a < l2) l2 else a;
+    }
+    return if (a > l2) l2 else if (a < l1) l1 else a;
+}
+
+fn silkLshiftSat32(a: i32, shift: i32) -> i32 => silkLsh(silkLimit(a, silkRsh(SILK_I32_MIN, shift), silkRsh(SILK_I32_MAX, shift)), shift);
+
+fn silkAbs32(a: i32) -> i32 => if (a > 0) a else 0i32.wrappingSub(a);
+
+fn silkMin32(a: i32, b: i32) -> i32 => if (a < b) a else b;
+fn silkMax32(a: i32, b: i32) -> i32 => if (a > b) a else b;
+
+/// silk_CLZ32: leading zeros of the 32 bits.
+fn silkClz32(a: i32) -> i32 => truncate<i32>(truncate<u32>(a).leadingZeros());
+
+fn silkClz16(a: i32) -> i32 => truncate<i32>(truncate<u16>(a).leadingZeros());
+
+fn silkRor32(a: i32, rot: i32) -> i32 {
+    let x = truncate<u32>(a);
+    if (rot == 0) {
+        return a;
+    }
+    if (rot < 0) {
+        let r = truncate<u32>(-rot);
+        return truncate<i32>((x << r) | (x >> (32 - r)));
+    }
+    let r = truncate<u32>(rot);
+    return truncate<i32>((x << (32 - r)) | (x >> r));
+}
+
+/// silk_CLZ_FRAC's fraction: the 7 bits after the leading one.
+fn silkClzFrac(a: i32) -> i32 => truncate<i32>(truncate<u32>(silkRor32(a, 24 - silkClz32(a))) & 0x7F);
+
+fn silkSqrtApprox(x: i32) -> i32 {
+    if (x <= 0) {
+        return 0;
+    }
+    let lz = silkClz32(x);
+    let frac = silkClzFrac(x);
+    var y: i32 = if ((truncate<u32>(lz) & 1) != 0) 32768 else 46214;
+    y = silkRsh(y, silkRsh(lz, 1));
+    return silkSmlawb(y, y, silkSmulbb(213, frac));
+}
+
+fn silkDiv32varQ(a32: i32, b32: i32, qres: i32) -> i32 {
+    let aHead = silkClz32(silkAbs32(a32)) - 1;
+    var aNrm = silkLsh(a32, aHead);
+    let bHead = silkClz32(silkAbs32(b32)) - 1;
+    let bNrm = silkLsh(b32, bHead);
+    let bInv = 536870911 / silkS16(silkRsh(bNrm, 16));
+    var result = silkSmulwb(aNrm, bInv);
+    aNrm = aNrm.wrappingSub(silkLsh(silkSmmul(bNrm, result), 3));
+    result = silkSmlawb(result, aNrm, bInv);
+    let shift = 29 + aHead - bHead - qres;
+    if (shift < 0) {
+        return silkLshiftSat32(result, -shift);
+    }
+    return if (shift < 32) silkRsh(result, shift) else 0;
+}
+
+fn silkInverse32varQ(b32: i32, qres: i32) -> i32 {
+    let bHead = silkClz32(silkAbs32(b32)) - 1;
+    let bNrm = silkLsh(b32, bHead);
+    let bInv = 536870911 / silkS16(silkRsh(bNrm, 16));
+    var result = silkLsh(bInv, 16);
+    let err = silkLsh((536870912).wrappingSub(silkSmulwb(bNrm, bInv)), 3);
+    result = silkSmlaww(result, err, bInv);
+    let shift = 61 - bHead - qres;
+    if (shift <= 0) {
+        return silkLshiftSat32(result, -shift);
+    }
+    return if (shift < 32) silkRsh(result, shift) else 0;
+}
+
+/// silk_RAND.
+fn silkSilkRand(seed: i32) -> i32 => 907633515i32.wrappingAdd(seed.wrappingMul(196314165));
+
+/// silk_log2lin: 2^(x / 128), approximately.
+fn silkLog2lin(inLog: i32) -> i32 {
+    if (inLog < 0) {
+        return 0;
+    }
+    if (inLog >= 3967) {
+        return SILK_I32_MAX;
+    }
+    var out = silkLsh(1, silkRsh(inLog, 7));
+    let frac = truncate<i32>(truncate<u32>(inLog) & 0x7F);
+    if (inLog < 2048) {
+        out = silkAdd32(out, silkRsh(silkMul32(out, silkSmlawb(frac, silkSmulbb(frac, 128 - frac), -174)), 7));
+    } else {
+        out = silkMla(out, silkRsh(out, 7), silkSmlawb(frac, silkSmulbb(frac, 128 - frac), -174));
+    }
+    return out;
+}
+
+/// silk_lin2log: 128 log2(x), approximately.
+fn silkLin2log(inLin: i32) -> i32 {
+    let lz = silkClz32(inLin);
+    let frac = silkClzFrac(inLin);
+    return silkAdd32(silkSmlawb(frac, silkMul32(frac, 128 - frac), 179), silkLsh(31 - lz, 7));
+}

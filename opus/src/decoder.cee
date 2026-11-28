@@ -1,0 +1,549 @@
+// The Opus decoder (RFC 6716; libopus src/opus_decoder.c, float build, 48 kHz output): packets parsed, each frame
+// decoded by SILK, CELT or both (hybrid), with the redundant CELT frames of mode switches, the transitions' cross-fades,
+// packet-loss concealment, and SILK's in-band FEC.
+
+const MODE_NONE: u32 = 0;
+const MODE_SILK: u32 = 1;
+const MODE_HYBRID: u32 = 2;
+const MODE_CELT: u32 = 3;
+
+const RATE: usize = 48000;
+const F20: usize = 960;
+const F10: usize = 480;
+const F5: usize = 240;
+const F2_5: usize = 120;
+/// The most a packet holds: 120 ms.
+public const MAX_FRAME: usize = 5760;
+
+public enum OpusError {
+    BadArgument,
+    BufferTooSmall,
+    InvalidPacket,
+    Internal,
+}
+
+/// An Opus decoder at 48 kHz, mono or stereo output.
+public struct OpusDecoder {
+    public channels: usize;
+    celt: CeltDecoder;
+    silk: SilkDecoder;
+    control: SilkControl;
+    streamChannels: usize;
+    bandwidth: u32;
+    mode: u32;
+    prevMode: u32;
+    frameSize: usize;
+    prevRedundancy: bool;
+    lastDuration: usize;
+    softclip: [f32; 2];
+    /// The final range of the last packet, for checking a decoder against libopus.
+    public finalRange: u32;
+    silkPcm: Vector<i16>;
+    transitionPcm: Vector<f32>;
+    redundantPcm: Vector<f32>;
+    scratch: Vector<f32>;
+
+    public fn create(channels: usize) -> OpusDecoder {
+        var d = OpusDecoder {
+            channels: channels,
+            celt: CeltDecoder.create(channels),
+            silk: SilkDecoder.create(),
+            control: SilkControl {
+                apiChannels: channels,
+                internalChannels: channels,
+                apiRate: 48000,
+                internalRate: 16000,
+                payloadMs: 20,
+                prevPitchLag: 0,
+            },
+            streamChannels: channels,
+            bandwidth: 0,
+            mode: MODE_NONE,
+            prevMode: MODE_NONE,
+            frameSize: RATE / 400,
+            prevRedundancy: false,
+            lastDuration: 0,
+            softclip: [0.0f32; 2],
+            finalRange: 0,
+            silkPcm: Vector<i16>.create(),
+            transitionPcm: Vector<f32>.create(),
+            redundantPcm: Vector<f32>.create(),
+            scratch: Vector<f32>.create(),
+        };
+        let _ = d.silkPcm.resize(F20 * 3 * 2, 0);
+        let _ = d.transitionPcm.resize(F5 * 2, 0.0);
+        let _ = d.redundantPcm.resize(F5 * 2, 0.0);
+        let _ = d.scratch.resize(F5 * 2, 0.0);
+        return d;
+    }
+
+    public fn reset(borrow mut this) {
+        this.celt.reset();
+        this.silk.reset();
+        this.streamChannels = this.channels;
+        this.bandwidth = 0;
+        this.mode = MODE_NONE;
+        this.prevMode = MODE_NONE;
+        this.frameSize = RATE / 400;
+        this.prevRedundancy = false;
+        this.lastDuration = 0;
+        this.softclip = [0.0f32; 2];
+        this.finalRange = 0;
+    }
+
+    /// Samples per channel a packet decodes to; null for an invalid one.
+    public fn samplesIn(packet: Slice<u8>) -> usize? {
+        let p = OpusPacket.parse(packet)?;
+        return Some(p.frameSize * p.frames.length);
+    }
+
+    /// Decodes `packet` into `pcm` (interleaved, ±1.0 full scale), at most `frameSize` samples per channel; a null
+    /// packet (lost) is concealed for `frameSize` samples (a multiple of 2.5 ms). With `fec`, the packet's in-band FEC
+    /// decodes the one before it, which was lost. Returns the samples per channel written.
+    public fn decodeFloat(borrow mut this, packet: Slice<u8>?, pcm: SliceMut<f32>, frameSize: usize, fec: bool) -> Result<usize, OpusError> {
+        let data = match (packet) {
+            Some(p) => {
+                if (p.length == 0) null else Some(p)
+            },
+            null => null,
+        };
+        if ((fec || data == null) && frameSize % (RATE / 400) != 0) {
+            return Err(OpusError.BadArgument);
+        }
+        let bytes = data ?? {
+            var count: usize = 0;
+            while (count < frameSize) {
+                let n = this.decodeFrame(null, mut pcm[count * this.channels..], frameSize - count, false)?;
+                count += n;
+            }
+            this.lastDuration = count;
+            return Ok(count);
+        };
+        let p = OpusPacket.parse(bytes) ?? { return Err(OpusError.InvalidPacket); };
+        let packetMode = modeOf(p.toc);
+        let packetBandwidth = bandwidthOf(p.toc);
+        let packetFrame = p.frameSize;
+        let packetChannels: usize = if (p.stereo) 2 else 1;
+        if (fec) {
+            if (frameSize < packetFrame || packetMode == MODE_CELT || this.mode == MODE_CELT) {
+                return this.decodeFloat(null, pcm, frameSize, false);
+            }
+            if (frameSize > packetFrame) {
+                let _ = this.decodeFloat(null, mut pcm[0..(frameSize - packetFrame) * this.channels], frameSize - packetFrame, false)?;
+            }
+            this.mode = packetMode;
+            this.bandwidth = packetBandwidth;
+            this.frameSize = packetFrame;
+            this.streamChannels = packetChannels;
+            let f = p.frames[0];
+            let _ = this.decodeFrame(Some(bytes[f.start..f.start + f.length]),
+                mut pcm[(frameSize - packetFrame) * this.channels..], packetFrame, true)?;
+            this.lastDuration = frameSize;
+            return Ok(frameSize);
+        }
+        if (p.frames.length * packetFrame > frameSize) {
+            return Err(OpusError.BufferTooSmall);
+        }
+        this.mode = packetMode;
+        this.bandwidth = packetBandwidth;
+        this.frameSize = packetFrame;
+        this.streamChannels = packetChannels;
+        var samples: usize = 0;
+        for (f in p.frames.view()) {
+            let n = this.decodeFrame(Some(bytes[f.start..f.start + f.length]), mut pcm[samples * this.channels..],
+                frameSize - samples, false)?;
+            samples += n;
+        }
+        this.lastDuration = samples;
+        return Ok(samples);
+    }
+
+    /// As `decodeFloat`, into 16-bit samples, soft-clipped as libopus's `opus_decode` does.
+    public fn decode(borrow mut this, packet: Slice<u8>?, pcm: SliceMut<i16>, frameSize: usize, fec: bool) -> Result<usize, OpusError> {
+        var size = frameSize;
+        if (packet is Some(p)) {
+            if (p.length > 0 && !fec) {
+                let n = OpusDecoder.samplesIn(p) ?? { return Err(OpusError.InvalidPacket); };
+                if (n < size) {
+                    size = n;
+                }
+            }
+        }
+        var out = Vector<f32>.create();
+        if (out.resize(size * this.channels, 0.0) is Err(_)) {
+            return Err(OpusError.Internal);
+        }
+        let n = this.decodeFloat(packet, mut out[..], size, fec)?;
+        softClip(mut out, n, this.channels, mut this.softclip);
+        for (i in 0usize..n * this.channels) {
+            var x = out[i] * 32768.0;
+            if (x < -32768.0) {
+                x = -32768.0;
+            }
+            if (x > 32767.0) {
+                x = 32767.0;
+            }
+            pcm[i] = truncate<i16>(saturatingTruncate<i64>(x.roundEven()));
+        }
+        return Ok(n);
+    }
+
+    fn decodeFrame(borrow mut this, frame: Slice<u8>?, pcm: SliceMut<f32>, requested: usize, fec: bool) -> Result<usize, OpusError> {
+        let channels = this.channels;
+        var frameSize = if (requested < MAX_FRAME) requested else MAX_FRAME;
+        if (frameSize < F2_5) {
+            return Err(OpusError.BufferTooSmall);
+        }
+        var data = frame;
+        if (data is Some(d)) {
+            if (d.length <= 1) {
+                data = null;
+            }
+        }
+        if (data == null && this.frameSize < frameSize) {
+            frameSize = this.frameSize;
+        }
+        var audiosize: usize = 0;
+        var mode: u32 = 0;
+        var bandwidth: u32 = 0;
+        match (data) {
+            Some(_) => {
+                audiosize = this.frameSize;
+                mode = this.mode;
+                bandwidth = this.bandwidth;
+            },
+            null => {
+                audiosize = frameSize;
+                mode = if (this.prevRedundancy) MODE_CELT else this.prevMode;
+                if (mode == MODE_NONE) {
+                    for (i in 0usize..audiosize * channels) {
+                        pcm[i] = 0.0;
+                    }
+                    return Ok(audiosize);
+                }
+                if (audiosize > F20) {
+                    var left = audiosize;
+                    var at: usize = 0;
+                    while (left > 0) {
+                        let n = this.decodeFrame(null, mut pcm[at * channels..], if (left < F20) left else F20, false)?;
+                        at += n;
+                        left -= n;
+                    }
+                    return Ok(frameSize);
+                } else if (audiosize < F20) {
+                    if (audiosize > F10) {
+                        audiosize = F10;
+                    } else if (mode != MODE_SILK && audiosize > F5 && audiosize < F10) {
+                        audiosize = F5;
+                    }
+                }
+            },
+        }
+        let empty = [0u8; 1];
+        let bytes: Slice<u8> = match (data) {
+            Some(d) => d,
+            null => empty[0..0],
+        };
+        var len = bytes.length;
+        var dec = RangeDecoder.create(bytes);
+        // A switch between CELT and the others: the old coder's concealment fades into the new one.
+        var transition = data != null && this.prevMode > 0 && ((mode == MODE_CELT && this.prevMode != MODE_CELT
+            && !this.prevRedundancy) || (mode != MODE_CELT && this.prevMode == MODE_CELT));
+        if (transition && mode == MODE_CELT) {
+            let n = if (F5 < audiosize) F5 else audiosize;
+            var t = Vector<f32>.create();
+            let _ = t.resize(F5 * channels, 0.0);
+            let _ = this.decodeFrame(null, mut t[0..n * channels], n, false)?;
+            this.transitionPcm = t;
+        }
+        if (audiosize > frameSize) {
+            return Err(OpusError.BadArgument);
+        }
+        frameSize = audiosize;
+        // SILK.
+        let silkSize = (if (F10 > frameSize) F10 else frameSize) * channels;
+        if (this.silkPcm.length < silkSize) {
+            let _ = this.silkPcm.resize(silkSize, 0);
+        }
+        if (mode != MODE_CELT) {
+            if (this.prevMode == MODE_CELT) {
+                this.silk.reset();
+            }
+            let ms = 1000 * audiosize / RATE;
+            this.control.payloadMs = truncate<u32>(if (ms > 10) ms else 10);
+            if (data != null) {
+                this.control.internalChannels = this.streamChannels;
+                this.control.internalRate = if (mode == MODE_SILK) (match (bandwidth) {
+                    0 => 8000u32,
+                    1 => 12000u32,
+                    _ => 16000u32,
+                }) else 16000;
+            }
+            let lost: u32 = if (data == null) 1 else if (fec) 2 else 0;
+            var decoded: usize = 0;
+            while (decoded < frameSize) {
+                let first = decoded == 0;
+                match (this.silk.decode(mut this.control, lost, first, mut dec, mut this.silkPcm[decoded * channels..])) {
+                    Ok(n) => {
+                        decoded += n;
+                    },
+                    Err(_) => {
+                        if (lost == 0) {
+                            return Err(OpusError.Internal);
+                        }
+                        for (i in decoded * channels..frameSize * channels) {
+                            this.silkPcm[i] = 0;
+                        }
+                        decoded = frameSize;
+                    },
+                }
+            }
+        }
+        // The redundant CELT frame of a switch.
+        var startBand: usize = 0;
+        var redundancy = false;
+        var redundancyBytes: usize = 0;
+        var celtToSilk = false;
+        if (!fec && mode != MODE_CELT && data != null
+            && dec.tell() + 17 + (if (mode == MODE_HYBRID) 20 else 0) <= truncate<i32>(8 * len)) {
+            redundancy = if (mode == MODE_HYBRID) dec.bitLogp(12) else true;
+            if (redundancy) {
+                celtToSilk = dec.bitLogp(1);
+                redundancyBytes = if (mode == MODE_HYBRID) (dec.uint(256) + 2) as usize
+                    else len - truncate<usize>((dec.tell() + 7) / 8);
+                if (redundancyBytes > len) {
+                    len = 0;
+                    redundancyBytes = 0;
+                    redundancy = false;
+                } else {
+                    len -= redundancyBytes;
+                    if (truncate<i32>(len * 8) < dec.tell()) {
+                        len = 0;
+                        redundancyBytes = 0;
+                        redundancy = false;
+                    }
+                    dec.shrink(dec.storageBytes() - truncate<u32>(redundancyBytes));
+                }
+            }
+        }
+        if (mode != MODE_CELT) {
+            startBand = 17;
+        }
+        if (redundancy) {
+            transition = false;
+        }
+        if (transition && mode != MODE_CELT) {
+            let n = if (F5 < audiosize) F5 else audiosize;
+            var t = Vector<f32>.create();
+            let _ = t.resize(F5 * channels, 0.0);
+            let _ = this.decodeFrame(null, mut t[0..n * channels], n, false)?;
+            this.transitionPcm = t;
+        }
+        if (data != null) {
+            this.celt.setEndBand(match (bandwidth) {
+                0 => 13usize,
+                1 => 17usize,
+                2 => 17usize,
+                3 => 19usize,
+                _ => 21usize,
+            });
+        }
+        this.celt.setStreamChannels(this.streamChannels);
+        var redundantRange: u32 = 0;
+        if (redundancy && celtToSilk) {
+            this.celt.setStartBand(0);
+            redundantRange = this.redundantFrame(bytes, len, redundancyBytes)?;
+        }
+        this.celt.setStartBand(startBand);
+        if (mode != MODE_SILK) {
+            let celtFrame = if (F20 < frameSize) F20 else frameSize;
+            if (mode != this.prevMode && this.prevMode > 0 && !this.prevRedundancy) {
+                this.celt.reset();
+            }
+            let r = if (fec || data == null) this.celt.conceal(mut pcm[0..celtFrame * channels], celtFrame)
+                else this.celt.decode(mut dec, len, mut pcm[0..celtFrame * channels], celtFrame);
+            if (r is Err(_)) {
+                return Err(OpusError.Internal);
+            }
+        } else {
+            for (i in 0usize..frameSize * channels) {
+                pcm[i] = 0.0;
+            }
+            if (this.prevMode == MODE_HYBRID && !(redundancy && celtToSilk && this.prevRedundancy)) {
+                this.celt.setStartBand(0);
+                let silence = [0xFFu8, 0xFF];
+                var sd = RangeDecoder.create(silence[..]);
+                let _ = this.celt.decode(mut sd, 2, mut pcm[0..F2_5 * channels], F2_5);
+            }
+        }
+        if (mode != MODE_CELT) {
+            for (i in 0usize..frameSize * channels) {
+                pcm[i] = pcm[i] + (1.0f32 / 32768.0f32) * round<f32>(this.silkPcm[i]);
+            }
+        }
+        let window = celtWindow();
+        if (redundancy && !celtToSilk) {
+            this.celt.reset();
+            this.celt.setStartBand(0);
+            redundantRange = this.redundantFrame(bytes, len, redundancyBytes)?;
+            // The frame's end fades out into the redundant frame's.
+            fadeWith(pcm, channels * (frameSize - F2_5), this.redundantPcm.view(), channels * F2_5, true, channels, window);
+        }
+        if (redundancy && celtToSilk && (this.prevMode != MODE_SILK || this.prevRedundancy)) {
+            for (i in 0usize..channels * F2_5) {
+                pcm[i] = this.redundantPcm[i];
+            }
+            fadeWith(pcm, channels * F2_5, this.redundantPcm.view(), channels * F2_5, false, channels, window);
+        }
+        if (transition) {
+            if (audiosize >= F5) {
+                for (i in 0usize..channels * F2_5) {
+                    pcm[i] = this.transitionPcm[i];
+                }
+                fadeWith(pcm, channels * F2_5, this.transitionPcm.view(), channels * F2_5, false, channels, window);
+            } else {
+                fadeWith(pcm, 0, this.transitionPcm.view(), 0, false, channels, window);
+            }
+        }
+        this.finalRange = if (len <= 1) 0 else dec.range ^ redundantRange;
+        this.prevMode = mode;
+        this.prevRedundancy = redundancy && !celtToSilk;
+        return Ok(audiosize);
+    }
+
+    /// The redundant 5 ms CELT frame at the end of `bytes` (after `len`), into `redundantPcm`; its final range.
+    fn redundantFrame(borrow mut this, bytes: Slice<u8>, len: usize, count: usize) -> Result<u32, OpusError> {
+        let channels = this.channels;
+        var rd = RangeDecoder.create(bytes[len..len + count]);
+        var out = Vector<f32>.create();
+        let _ = out.resize(F5 * channels, 0.0);
+        if (this.celt.decode(mut rd, count, mut out[..], F5) is Err(_)) {
+            return Err(OpusError.Internal);
+        }
+        this.redundantPcm = out;
+        return Ok(this.celt.finalRange());
+    }
+}
+
+/// libopus's smooth_fade over 2.5 ms, in place on pcm[at...]: with `otherFadesIn`, pcm fades out into
+/// other[otherAt...]; without, other fades out into pcm.
+fn fadeWith(pcm: SliceMut<f32>, at: usize, other: Slice<f32>, otherAt: usize, otherFadesIn: bool, channels: usize, window: Slice<f32>) {
+    for (c in 0usize..channels) {
+        for (i in 0usize..F2_5) {
+            let w = window[i] * window[i];
+            let k = at + i * channels + c;
+            let o = other[otherAt + i * channels + c];
+            pcm[k] = if (otherFadesIn) w * o + (1.0 - w) * pcm[k] else w * pcm[k] + (1.0 - w) * o;
+        }
+    }
+}
+
+fn modeOf(toc: u8) -> u32 {
+    if ((toc & 0x80) != 0) {
+        return MODE_CELT;
+    }
+    if ((toc & 0x60) == 0x60) {
+        return MODE_HYBRID;
+    }
+    return MODE_SILK;
+}
+
+/// 0 narrow, 1 medium, 2 wide, 3 super-wide, 4 full (libopus's OPUS_BANDWIDTH_* less 1101).
+fn bandwidthOf(toc: u8) -> u32 {
+    if ((toc & 0x80) != 0) {
+        let b = ((toc >> 5) & 3) as u32;
+        return if (b == 0) 0 else b + 1;
+    }
+    if ((toc & 0x60) == 0x60) {
+        return if ((toc & 0x10) != 0) 4 else 3;
+    }
+    return ((toc >> 5) & 3) as u32;
+}
+
+/// libopus's opus_pcm_soft_clip: a smooth non-linearity for samples beyond ±1, its state kept between frames.
+fn softClip(x: borrow mut Vector<f32>, n: usize, channels: usize, memory: borrow mut [f32; 2]) {
+    if (n == 0) {
+        return;
+    }
+    for (i in 0usize..n * channels) {
+        if (x[i] > 2.0) {
+            x[i] = 2.0;
+        }
+        if (x[i] < -2.0) {
+            x[i] = -2.0;
+        }
+    }
+    for (c in 0usize..channels) {
+        var a = memory[c];
+        for (i in 0usize..n) {
+            let v = x[i * channels + c];
+            if (v * a >= 0.0) {
+                break;
+            }
+            x[i * channels + c] = v + a * v * v;
+        }
+        var curr: usize = 0;
+        let x0 = x[c];
+        loop {
+            var i = curr;
+            while (i < n) {
+                let v = x[i * channels + c];
+                if (v > 1.0 || v < -1.0) {
+                    break;
+                }
+                i += 1;
+            }
+            if (i == n) {
+                a = 0.0;
+                break;
+            }
+            var peak = i;
+            var start = i;
+            var end = i;
+            let xi = x[i * channels + c];
+            var maxval = if (xi < 0.0) -xi else xi;
+            while (start > 0 && xi * x[(start - 1) * channels + c] >= 0.0) {
+                start -= 1;
+            }
+            while (end < n && xi * x[end * channels + c] >= 0.0) {
+                let v = x[end * channels + c];
+                let av = if (v < 0.0) -v else v;
+                if (av > maxval) {
+                    maxval = av;
+                    peak = end;
+                }
+                end += 1;
+            }
+            let special = start == 0 && xi * x[c] >= 0.0;
+            a = (maxval - 1.0) / (maxval * maxval);
+            a += a * 2.4e-7;
+            if (xi > 0.0) {
+                a = -a;
+            }
+            for (k in start..end) {
+                let v = x[k * channels + c];
+                x[k * channels + c] = v + a * v * v;
+            }
+            if (special && peak >= 2) {
+                var offset = x0 - x[c];
+                let delta = offset / round<f32>(peak);
+                for (k in curr..peak) {
+                    offset -= delta;
+                    var v = x[k * channels + c] + offset;
+                    if (v > 1.0) {
+                        v = 1.0;
+                    }
+                    if (v < -1.0) {
+                        v = -1.0;
+                    }
+                    x[k * channels + c] = v;
+                }
+            }
+            curr = end;
+            if (curr == n) {
+                break;
+            }
+        }
+        memory[c] = a;
+    }
+}

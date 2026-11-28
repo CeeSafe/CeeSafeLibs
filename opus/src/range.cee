@@ -1,0 +1,275 @@
+// Opus's range decoder (RFC 6716 §4.1; libopus celt/entdec.c, entcode.c), and the Laplace decoder CELT's energies use
+// (celt/laplace.c). Ported from libopus 1.5.2 (BSD); every value is as libopus computes it, so a packet's final range
+// matches libopus's.
+
+const SYM_BITS: u32 = 8;
+const CODE_BITS: u32 = 32;
+const SYM_MAX: u32 = 255;
+const CODE_TOP: u32 = 0x80000000;
+const CODE_BOT: u32 = 0x800000;
+const CODE_EXTRA: u32 = 7;
+const UINT_BITS: u32 = 8;
+const WINDOW_SIZE: u32 = 32;
+/// Fractional bits of `tellFrac`.
+public const BITRES: u32 = 3;
+
+/// The number of bits `v` needs: 0 for 0, else 1 + floor(log2(v)).
+public fn ilog(v: u32) -> u32 {
+    var n: u32 = 0;
+    var x = v;
+    while (x != 0) {
+        n += 1;
+        x = x >> 1;
+    }
+    return n;
+}
+
+/// A range decoder over one frame's bytes.
+public struct RangeDecoder<region r> {
+    buffer: Slice<r, u8>;
+    storage: u32;
+    endOffset: u32;
+    endWindow: u32;
+    endBits: u32;
+    public totalBits: i32;
+    offset: u32;
+    public range: u32;
+    value: u32;
+    ext: u32;
+    rem: u32;
+    /// A symbol out of range was read (the packet is corrupt).
+    public error: bool;
+
+    public fn create(buffer: Slice<r, u8>) -> RangeDecoder<r> {
+        var d = RangeDecoder {
+            buffer: buffer,
+            storage: truncate<u32>(buffer.length),
+            endOffset: 0,
+            endWindow: 0,
+            endBits: 0,
+            totalBits: truncate<i32>(CODE_BITS + 1 - ((CODE_BITS - CODE_EXTRA) / SYM_BITS) * SYM_BITS),
+            offset: 0,
+            range: 1u32 << CODE_EXTRA,
+            value: 0,
+            ext: 0,
+            rem: 0,
+            error: false,
+        };
+        d.rem = d.readByte();
+        d.value = d.range - 1 - (d.rem >> (SYM_BITS - CODE_EXTRA));
+        d.normalize();
+        return d;
+    }
+
+    /// The storage left for the decoder: a frame may be shortened by what CELT or SILK used of its end.
+    public fn shrink(borrow mut this, storage: u32) {
+        this.storage = storage;
+    }
+
+    public fn storageBytes(borrow this) -> u32 => this.storage;
+
+    fn readByte(borrow mut this) -> u32 {
+        if (this.offset < this.storage) {
+            let b = this.buffer[this.offset as usize] as u32;
+            this.offset += 1;
+            return b;
+        }
+        return 0;
+    }
+
+    fn readByteFromEnd(borrow mut this) -> u32 {
+        if (this.endOffset < this.storage) {
+            this.endOffset += 1;
+            return this.buffer[(this.storage - this.endOffset) as usize] as u32;
+        }
+        return 0;
+    }
+
+    fn normalize(borrow mut this) {
+        while (this.range <= CODE_BOT) {
+            this.totalBits += truncate<i32>(SYM_BITS);
+            this.range = this.range << SYM_BITS;
+            var sym = this.rem;
+            this.rem = this.readByte();
+            sym = ((sym << SYM_BITS) | this.rem) >> (SYM_BITS - CODE_EXTRA);
+            this.value = ((this.value << SYM_BITS) + (SYM_MAX & ~sym)) & (CODE_TOP - 1);
+        }
+    }
+
+    /// The cumulative frequency of the next symbol, of a total of `ft`; then `update`.
+    public fn decode(borrow mut this, ft: u32) -> u32 {
+        this.ext = this.range / ft;
+        let s = this.value / this.ext;
+        return ft - (if (s + 1 < ft) s + 1 else ft);
+    }
+
+    /// As `decode`, with a total of `1 << bits`.
+    public fn decodeBin(borrow mut this, bits: u32) -> u32 {
+        this.ext = this.range >> bits;
+        let s = this.value / this.ext;
+        let ft = 1u32 << bits;
+        return ft - (if (s + 1 < ft) s + 1 else ft);
+    }
+
+    /// Advances past the symbol of frequencies [fl, fh) of a total of `ft`.
+    public fn update(borrow mut this, fl: u32, fh: u32, ft: u32) {
+        let s = this.ext * (ft - fh);
+        this.value -= s;
+        this.range = if (fl > 0) this.ext * (fh - fl) else this.range - s;
+        this.normalize();
+    }
+
+    /// A bit whose probability of being 1 is 1/2^logp.
+    public fn bitLogp(borrow mut this, logp: u32) -> bool {
+        let r = this.range;
+        let d = this.value;
+        let s = r >> logp;
+        let one = d < s;
+        if (!one) {
+            this.value = d - s;
+        }
+        this.range = if (one) s else r - s;
+        this.normalize();
+        return one;
+    }
+
+    /// A symbol from an inverse CDF table of 8-bit entries, its total 1 << ftb.
+    public fn icdf(borrow mut this, table: Slice<u8>, ftb: u32) -> u32 {
+        var s = this.range;
+        let d = this.value;
+        let r = s >> ftb;
+        var k: usize = 0;
+        var t = s;
+        loop {
+            t = s;
+            s = r * (table[k] as u32);
+            if (d >= s) {
+                break;
+            }
+            k += 1;
+        }
+        this.value = d - s;
+        this.range = t - s;
+        this.normalize();
+        return truncate<u32>(k);
+    }
+
+    /// As `icdf`, with 16-bit entries.
+    public fn icdf16(borrow mut this, table: Slice<u16>, ftb: u32) -> u32 {
+        var s = this.range;
+        let d = this.value;
+        let r = s >> ftb;
+        var k: usize = 0;
+        var t = s;
+        loop {
+            t = s;
+            s = r * (table[k] as u32);
+            if (d >= s) {
+                break;
+            }
+            k += 1;
+        }
+        this.value = d - s;
+        this.range = t - s;
+        this.normalize();
+        return truncate<u32>(k);
+    }
+
+    /// A number from 0 to ft - 1, each equally likely (ft > 1).
+    public fn uint(borrow mut this, total: u32) -> u32 {
+        let ft = total - 1;
+        var ftb = ilog(ft);
+        if (ftb > UINT_BITS) {
+            ftb -= UINT_BITS;
+            let top = (ft >> ftb) + 1;
+            let s = this.decode(top);
+            this.update(s, s + 1, top);
+            let t = (s << ftb) | this.bits(ftb);
+            if (t <= ft) {
+                return t;
+            }
+            this.error = true;
+            return ft;
+        }
+        let s = this.decode(total);
+        this.update(s, s + 1, total);
+        return s;
+    }
+
+    /// `n` raw bits, from the end of the frame.
+    public fn bits(borrow mut this, n: u32) -> u32 {
+        var window = this.endWindow;
+        var available = this.endBits;
+        if (available < n) {
+            loop {
+                window = window | (this.readByteFromEnd() << available);
+                available += SYM_BITS;
+                if (available > WINDOW_SIZE - SYM_BITS) {
+                    break;
+                }
+            }
+        }
+        let mask = if (n == 32) 0xFFFFFFFFu32 else (1u32 << n) - 1;
+        let ret = window & mask;
+        window = if (n == 32) 0 else window >> n;
+        available -= n;
+        this.endWindow = window;
+        this.endBits = available;
+        this.totalBits += truncate<i32>(n);
+        return ret;
+    }
+
+    /// The bits read so far, rounded up.
+    public fn tell(borrow this) -> i32 => this.totalBits - truncate<i32>(ilog(this.range));
+
+    /// The bits read so far, in eighths.
+    public fn tellFrac(borrow this) -> u32 {
+        let correction: [u32; 8] = [35733, 38967, 42495, 46340, 50535, 55109, 60097, 65535];
+        let nbits = (truncate<u32>(this.totalBits)) << BITRES;
+        var l = ilog(this.range);
+        let r = this.range >> (l - 16);
+        var b = (r >> 12) - 8;
+        if (r > correction[b as usize]) {
+            b += 1;
+        }
+        l = (l << 3) + b;
+        return nbits - l;
+    }
+
+    /// A Laplace-distributed value (CELT's coarse energy): `fs` the frequency of 0, `decay` the decay, both in Q15.
+    public fn laplace(borrow mut this, fs0: u32, decay: u32) -> i32 {
+        var val: i32 = 0;
+        let fm = this.decodeBin(15);
+        var fl: u32 = 0;
+        var fs = fs0;
+        if (fm >= fs) {
+            val += 1;
+            fl = fs;
+            fs = laplaceFreq1(fs, decay) + 1;
+            while (fs > 1 && fm >= fl + 2 * fs) {
+                fs *= 2;
+                fl += fs;
+                fs = ((fs - 2) * decay) >> 15;
+                fs += 1;
+                val += 1;
+            }
+            if (fs <= 1) {
+                let di = (fm - fl) >> 1;
+                val += truncate<i32>(di);
+                fl += 2 * di;
+            }
+            if (fm < fl + fs) {
+                val = -val;
+            } else {
+                fl += fs;
+            }
+        }
+        this.update(fl, if (fl + fs < 32768) fl + fs else 32768, 32768);
+        return val;
+    }
+}
+
+fn laplaceFreq1(fs0: u32, decay: u32) -> u32 {
+    let ft = 32768 - 32 - fs0;
+    return (ft * (16384 - decay)) >> 15;
+}

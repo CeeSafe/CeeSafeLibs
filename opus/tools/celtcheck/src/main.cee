@@ -1,0 +1,138 @@
+// celtcheck: decodes a CELT-only opus_demo .bit file (each packet: a 4-byte big-endian length, its 4-byte encoder final
+// range, then the packet; a length of 0 is a lost packet) with the package's CeltDecoder, checks each packet's final
+// range, and writes 16-bit little-endian stereo PCM at 48 kHz, for opus_compare.
+//
+//   celtcheck in.bit out.pcm
+
+import opus;
+
+fn readFile(path: StringView) -> Vector<u8>? {
+    var f = File.open(path).ok()?;
+    var out = Vector<u8>.create();
+    var buffer = [0u8; 65536];
+    loop {
+        let n = f.read(mut buffer[..]).ok()?;
+        if (n == 0) {
+            break;
+        }
+        if (out.extend(buffer[..n]) is Err(_)) {
+            return null;
+        }
+    }
+    return Some(out);
+}
+
+fn be32(b: Slice<u8>, at: usize) -> u32 =>
+    ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | (b[at + 3] as u32);
+
+/// libopus's FLOAT2INT16.
+fn toI16(x: f32) -> i16 {
+    var v = x * 32768.0;
+    v = if (v < -32768.0) -32768.0 else v;
+    v = if (v > 32767.0) 32767.0 else v;
+    return saturatingTruncate<i16>(v.roundEven());
+}
+
+fn main() -> i32 {
+    let input = Process.argument(1) ?? "";
+    let output = Process.argument(2) ?? "";
+    let data = readFile(input) ?? {
+        Console.writeLine("celtcheck: cannot read the input");
+        return 2;
+    };
+    var decoder = CeltDecoder.create(2);
+    var pcm = Vector<f32>.create();
+    let _ = pcm.resize(5760 * 2, 0.0);
+    var out = Vector<u8>.create();
+    var at: usize = 0;
+    var packets: u32 = 0;
+    var mismatches: u32 = 0;
+    var errors: u32 = 0;
+    var lastFrame: usize = 960;
+    while (at + 8 <= data.length) {
+        let length = be32(data.view(), at) as usize;
+        let range = be32(data.view(), at + 4);
+        at += 8;
+        if (at + length > data.length) {
+            break;
+        }
+        let packetBytes = data.view()[at..at + length];
+        at += length;
+        packets += 1;
+        if (length == 0) {
+            match (decoder.conceal(mut pcm[..], lastFrame)) {
+                Ok(n) => {
+                    for (i in 0usize..2 * n) {
+                        let v = toI16(pcm[i]);
+                        let u = truncate<u16>(v as i32);
+                        out.push(truncate<u8>(u))!;
+                        out.push(truncate<u8>(u >> 8))!;
+                    }
+                },
+                Err(_) => {
+                    errors += 1;
+                },
+            }
+            continue;
+        }
+        let packet = OpusPacket.parse(packetBytes) ?? {
+            errors += 1;
+            continue;
+        };
+        if (!(packet.mode is OpusMode.Celt)) {
+            Console.writeLine("celtcheck: not a CELT-only packet");
+            return 2;
+        }
+        decoder.setStreamChannels(if (packet.stereo) 2 else 1);
+        decoder.setStartBand(0);
+        decoder.setEndBand(match (packet.bandwidth) {
+            Bandwidth.Narrow => 13,
+            Bandwidth.Medium => 17,
+            Bandwidth.Wide => 17,
+            Bandwidth.SuperWide => 19,
+            Bandwidth.Full => 21,
+        });
+        lastFrame = packet.frameSize;
+        for (f in packet.frames.view()) {
+            var ec = RangeDecoder.create(packetBytes[f.start..f.start + f.length]);
+            match (decoder.decode(mut ec, f.length, mut pcm[..], packet.frameSize)) {
+                Ok(n) => {
+                    for (i in 0usize..2 * n) {
+                        let v = toI16(pcm[i]);
+                        let u = truncate<u16>(v as i32);
+                        out.push(truncate<u8>(u))!;
+                        out.push(truncate<u8>(u >> 8))!;
+                    }
+                },
+                Err(_) => {
+                    errors += 1;
+                },
+            }
+        }
+        if (decoder.finalRange() != range) {
+            mismatches += 1;
+            if (mismatches <= 5) {
+                var s = String.create();
+                s.append("range mismatch at packet ")!;
+                s.appendNumber(packets as i64)!;
+                Console.writeLine(s.view());
+            }
+        }
+    }
+    var f = File.create(output).ok() ?? {
+        Console.writeLine("celtcheck: cannot write the output");
+        return 2;
+    };
+    if (f.write(out.view()) is Err(_)) {
+        return 2;
+    }
+    var s = String.create();
+    s.appendNumber(packets as i64)!;
+    s.append(" packets, ")!;
+    s.appendNumber(mismatches as i64)!;
+    s.append(" range mismatches, ")!;
+    s.appendNumber(errors as i64)!;
+    s.append(" errors")!;
+    Console.writeLine(s.view());
+    return if (mismatches == 0 && errors == 0) 0 else 1;
+}

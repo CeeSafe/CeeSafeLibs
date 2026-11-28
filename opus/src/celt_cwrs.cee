@@ -1,0 +1,104 @@
+// CELT's pulse vectors from their index (libopus 1.5.2 celt/cwrs.c, decode_pulses and cwrsi; BSD).
+
+const PVQ_ROW: [usize; 15] = [0, 176, 351, 525, 698, 870, 1041, 1131, 1178, 1207, 1226, 1240, 1248, 1254, 1257];
+
+/// CELT_PVQ_U_ROW[row][column].
+fn pvqRow(row: i32, column: i32) -> u32 => CELT_PVQ_U_DATA[PVQ_ROW[truncate<usize>(row)] + truncate<usize>(column)];
+
+/// U(n, k): the vectors of n dimensions with k pulses whose first value is nonnegative...
+fn pvqU(n: i32, k: i32) -> u32 => pvqRow(celtImin(n, k), celtImax(n, k));
+
+/// V(n, k): the number of vectors of n dimensions with k pulses.
+fn pvqV(n: i32, k: i32) -> u32 => pvqU(n, k) + pvqU(n, k + 1);
+
+/// The vector of index `index` into `y` (n values, k pulses); gives its squared norm.
+fn cwrsi(n0: i32, k0: i32, index: u32, y: SliceMut<i32>) -> f32 {
+    var n = n0;
+    var k = k0;
+    var i = index;
+    var yy: f32 = 0.0;
+    var at: usize = 0;
+    while (n > 2) {
+        if (k >= n) {
+            var p = pvqRow(n, k + 1);
+            let negative = i >= p;
+            if (negative) {
+                i -= p;
+            }
+            let start = k;
+            let q = pvqRow(n, n);
+            if (q > i) {
+                k = n;
+                loop {
+                    k -= 1;
+                    p = pvqRow(k, n);
+                    if (p <= i) {
+                        break;
+                    }
+                }
+            } else {
+                p = pvqRow(n, k);
+                while (p > i) {
+                    k -= 1;
+                    p = pvqRow(n, k);
+                }
+            }
+            i -= p;
+            let val = if (negative) k - start else start - k;
+            y[at] = val;
+            at += 1;
+            yy += round<f32>(val * val);
+        } else {
+            var p = pvqRow(k, n);
+            let q = pvqRow(k + 1, n);
+            if (p <= i && i < q) {
+                i -= p;
+                y[at] = 0;
+                at += 1;
+            } else {
+                let negative = i >= q;
+                if (negative) {
+                    i -= q;
+                }
+                let start = k;
+                loop {
+                    k -= 1;
+                    p = pvqRow(k, n);
+                    if (p <= i) {
+                        break;
+                    }
+                }
+                i -= p;
+                let val = if (negative) k - start else start - k;
+                y[at] = val;
+                at += 1;
+                yy += round<f32>(val * val);
+            }
+        }
+        n -= 1;
+    }
+    let p = truncate<u32>(2 * k + 1);
+    let negative = i >= p;
+    if (negative) {
+        i -= p;
+    }
+    let start = k;
+    k = truncate<i32>((i + 1) >> 1);
+    if (k != 0) {
+        i -= truncate<u32>(2 * k - 1);
+    }
+    let val = if (negative) k - start else start - k;
+    y[at] = val;
+    at += 1;
+    yy += round<f32>(val * val);
+    let last = if (i != 0) -k else k;
+    y[at] = last;
+    yy += round<f32>(last * last);
+    return yy;
+}
+
+/// Decodes a pulse vector of `n` values with `k` pulses into `y`; gives its squared norm.
+fn decodePulses<region r>(y: SliceMut<i32>, n: i32, k: i32, dec: borrow mut RangeDecoder<r>) -> f32 {
+    let index = dec.uint(pvqV(n, k));
+    return cwrsi(n, k, index, y);
+}

@@ -1,0 +1,74 @@
+// CELT's float math (libopus 1.5.2 celt/mathops.h and mathops.c, float build with FLOAT_APPROX; BSD).
+
+const CELT_PI: f32 = 3.141592653;
+const CELT_VERY_SMALL: f32 = 1e-30;
+const CELT_EPSILON: f32 = 1e-15;
+const CELT_SIG_SCALE: f32 = 32768.0;
+
+/// log2(x), approximated as libopus does (FLOAT_APPROX).
+fn celtLog2(x: f32) -> f32 {
+    var bits = x.bits();
+    let integer = truncate<i32>(bits >> 23) - 127;
+    bits = bits - (truncate<u32>(integer) << 23);
+    var frac = f32.fromBits(bits) - 1.5;
+    frac = -0.41445418 + frac * (0.95909232 + frac * (-0.33951290 + frac * 0.16541097));
+    return 1.0 + round<f32>(integer) + frac;
+}
+
+/// 2^x, approximated as libopus does (FLOAT_APPROX).
+fn celtExp2(x: f32) -> f32 {
+    let integer = saturatingTruncate<i32>(x.floor());
+    if (integer < -50) {
+        return 0.0;
+    }
+    let frac = x - round<f32>(integer);
+    let f = 0.99992522 + frac * (0.69583354 + frac * (0.22606716 + 0.078024523 * frac));
+    let bits = f.bits().wrappingAdd(truncate<u32>(integer) << 23) & 0x7fffffff;
+    return f32.fromBits(bits);
+}
+
+fn celtSqrt(x: f32) -> f32 => x.sqrt();
+
+fn celtRsqrt(x: f32) -> f32 => 1.0 / x.sqrt();
+
+/// libopus's (float)cos((.5f*PI)*x): the product in float, the cosine in double.
+fn celtCosNorm(x: f32) -> f32 => round<f32>(((0.5 * CELT_PI * x) as f64).cos());
+
+/// floor(sqrt(v)) for an integer.
+fn celtIsqrt32(v: u32) -> u32 {
+    var value = v;
+    var g: u32 = 0;
+    var bshift = celtShr(truncate<i32>(ilog(value)) - 1, 1);
+    var b = 1u32 << truncate<u32>(bshift);
+    loop {
+        let t = ((g << 1) + b) << truncate<u32>(bshift);
+        if (t <= value) {
+            g += b;
+            value -= t;
+        }
+        b = b >> 1;
+        bshift -= 1;
+        if (bshift < 0) {
+            break;
+        }
+    }
+    return g;
+}
+
+fn celtImin(a: i32, b: i32) -> i32 => if (a < b) a else b;
+
+fn celtImax(a: i32, b: i32) -> i32 => if (a > b) a else b;
+
+fn celtFmin(a: f32, b: f32) -> f32 => if (a < b) a else b;
+
+fn celtFmax(a: f32, b: f32) -> f32 => if (a > b) a else b;
+
+/// Arithmetic shift right of a signed value (C's >> on an int).
+fn celtShr(a: i32, n: i32) -> i32 {
+    let u = truncate<u32>(a);
+    let k = truncate<u32>(n);
+    return truncate<i32>(if (a < 0) ~((~u) >> k) else u >> k);
+}
+
+/// Shift left of a signed value (C's << on an int, two's complement).
+fn celtShl(a: i32, n: i32) -> i32 => truncate<i32>(truncate<u32>(a) << truncate<u32>(n));

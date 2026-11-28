@@ -1,0 +1,195 @@
+// An Opus packet's table of contents and its frames (RFC 6716 §3; libopus src/opus.c, opus_packet_parse_impl, not
+// self-delimited).
+
+/// Which coder a packet's frames use.
+public enum OpusMode {
+    Silk,
+    Hybrid,
+    Celt,
+}
+
+/// The audio bandwidth a packet codes.
+public enum Bandwidth {
+    Narrow,
+    Medium,
+    Wide,
+    SuperWide,
+    Full,
+}
+
+/// Where a frame is in its packet.
+public struct FrameSpan {
+    public start: usize;
+    public length: usize;
+}
+
+/// A parsed packet: its TOC's fields and its frames.
+public struct OpusPacket {
+    public toc: u8;
+    public mode: OpusMode;
+    public bandwidth: Bandwidth;
+    /// Samples per frame at 48 kHz (120 to 2880).
+    public frameSize: usize;
+    public stereo: bool;
+    public frames: Vector<FrameSpan>;
+
+    /// The packet in `data`; null when it is not a valid one.
+    public fn parse(data: Slice<u8>) -> OpusPacket? {
+        if (data.length == 0) {
+            return null;
+        }
+        let toc = data[0];
+        let frameSize = samplesPerFrame(toc, 48000);
+        var len = data.length - 1;
+        var at: usize = 1;
+        var sizes = [0usize; 48];
+        var count: usize = 1;
+        var lastSize = len;
+        let code = toc & 3;
+        if (code == 1) {
+            count = 2;
+            if (len % 2 != 0) {
+                return null;
+            }
+            lastSize = len / 2;
+            sizes[0] = lastSize;
+        } else if (code == 2) {
+            count = 2;
+            let field = sizeAt(data, at, len)?;
+            let n = field.bytes;
+            let size = field.size;
+            len -= n;
+            if (size > len) {
+                return null;
+            }
+            sizes[0] = size;
+            at += n;
+            lastSize = len - size;
+        } else if (code == 3) {
+            if (len < 1) {
+                return null;
+            }
+            let ch = data[at];
+            at += 1;
+            count = (ch & 0x3F) as usize;
+            if (count == 0 || frameSize * count > 5760) {
+                return null;
+            }
+            len -= 1;
+            if ((ch & 0x40) != 0) {
+                loop {
+                    if (len == 0) {
+                        return null;
+                    }
+                    let p = data[at] as usize;
+                    at += 1;
+                    len -= 1;
+                    let tmp = if (p == 255) 254usize else p;
+                    if (tmp > len) {
+                        return null;
+                    }
+                    len -= tmp;
+                    if (p != 255) {
+                        break;
+                    }
+                }
+            }
+            let cbr = (ch & 0x80) == 0;
+            if (!cbr) {
+                var last = truncate<i64>(len);
+                for (i in 0usize..count - 1) {
+                    let field = sizeAt(data, at, len)?;
+            let n = field.bytes;
+            let size = field.size;
+                    len -= n;
+                    if (size > len) {
+                        return null;
+                    }
+                    sizes[i] = size;
+                    at += n;
+                    last -= truncate<i64>(n + size);
+                }
+                if (last < 0) {
+                    return null;
+                }
+                lastSize = truncate<usize>(last);
+            } else {
+                lastSize = len / count;
+                if (lastSize * count != len) {
+                    return null;
+                }
+                for (i in 0usize..count - 1) {
+                    sizes[i] = lastSize;
+                }
+            }
+        }
+        if (lastSize > 1275) {
+            return null;
+        }
+        sizes[count - 1] = lastSize;
+        var frames = Vector<FrameSpan>.create();
+        for (i in 0usize..count) {
+            if (at + sizes[i] > data.length) {
+                return null;
+            }
+            let _ = frames.push(FrameSpan { start: at, length: sizes[i] });
+            at += sizes[i];
+        }
+        let config = toc >> 3;
+        let mode = if (config < 12) OpusMode.Silk else if (config < 16) OpusMode.Hybrid else OpusMode.Celt;
+        let bandwidth = if (config < 12) match (config / 4) {
+            0 => Bandwidth.Narrow,
+            1 => Bandwidth.Medium,
+            _ => Bandwidth.Wide,
+        } else if (config < 16) (if (config < 14) Bandwidth.SuperWide else Bandwidth.Full)
+        else match ((config - 16) / 4) {
+            0 => Bandwidth.Narrow,
+            1 => Bandwidth.Wide,
+            2 => Bandwidth.SuperWide,
+            _ => Bandwidth.Full,
+        };
+        return Some(OpusPacket {
+            toc: toc,
+            mode: mode,
+            bandwidth: bandwidth,
+            frameSize: frameSize,
+            stereo: (toc & 4) != 0,
+            frames: frames,
+        });
+    }
+}
+
+/// Samples per frame of a packet with `toc`, at `rate` Hz.
+public fn samplesPerFrame(toc: u8, rate: usize) -> usize {
+    if ((toc & 0x80) != 0) {
+        return (rate << (((toc >> 3) & 3) as usize)) / 400;
+    }
+    if ((toc & 0x60) == 0x60) {
+        return if ((toc & 0x08) != 0) rate / 50 else rate / 100;
+    }
+    let size = (toc >> 3) & 3;
+    if (size == 3) {
+        return rate * 60 / 1000;
+    }
+    return (rate << (size as usize)) / 100;
+}
+
+struct SizeField {
+    bytes: usize;
+    size: usize;
+}
+
+/// A frame length's bytes (one, or two from 252) and its value.
+fn sizeAt(data: Slice<u8>, at: usize, len: usize) -> SizeField? {
+    if (len < 1) {
+        return null;
+    }
+    let b = data[at] as usize;
+    if (b < 252) {
+        return Some(SizeField { bytes: 1, size: b });
+    }
+    if (len < 2) {
+        return null;
+    }
+    return Some(SizeField { bytes: 2, size: 4 * (data[at + 1] as usize) + b });
+}
