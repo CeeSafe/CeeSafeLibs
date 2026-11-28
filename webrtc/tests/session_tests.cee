@@ -1,0 +1,69 @@
+// Two sessions, an offerer and an answerer, over an in-memory network: offer, answer, trickled candidates, ICE, DTLS,
+// then SRTP audio both ways.
+
+import stun;
+import rtp;
+
+fn deliver(from: borrow mut PeerSession, fromAt: StunAddress, to: borrow mut PeerSession, toAt: StunAddress, now: u64) {
+    for (k in 0..16) {
+        match (from.poll(now)) {
+            Some(t) => {
+                if (t.to.same(toAt)) {
+                    to.receive(0, fromAt, t.bytes.view(), now);
+                }
+            },
+            null => {
+                break;
+            },
+        }
+    }
+}
+
+@test
+fn twoSessionsCarryAudio() -> Result<void, TestFailure> {
+    var a = PeerSession.create(true, 0)!;
+    var b = PeerSession.create(false, 0)!;
+    let aAt = StunAddress.v4(10, 0, 0, 1, 5000);
+    let bAt = StunAddress.v4(10, 0, 0, 2, 6000);
+    a.agent.addHost(0, aAt);
+    b.agent.addHost(0, bAt);
+    let offer = a.offer();
+    Check.isTrue(offer.view().contains("a=setup:actpass") && offer.view().contains("a=rtpmap:111 opus/48000/2"), "the offer")?;
+    let answer = b.answer(offer.view())!;
+    Check.isTrue(answer.view().contains("a=setup:active"), "the answerer is the DTLS client")?;
+    a.accept(answer.view())!;
+    loop {
+        match (a.takeCandidate()) {
+            Some(c) => {
+                b.addRemoteCandidate(c.view());
+            },
+            null => { break; },
+        }
+    }
+    loop {
+        match (b.takeCandidate()) {
+            Some(c) => {
+                a.addRemoteCandidate(c.view());
+            },
+            null => { break; },
+        }
+    }
+    var now: u64 = 0;
+    while (now < 5000 && !(a.state is PeerState.Connected && b.state is PeerState.Connected)) {
+        deliver(mut a, aAt, mut b, bAt, now);
+        deliver(mut b, bAt, mut a, aAt, now);
+        now += 20;
+    }
+    Check.isTrue(a.state is PeerState.Connected && b.state is PeerState.Connected, "both connected")?;
+    let t = a.sendAudio("frame-one".bytes(), 960)!;
+    b.receive(0, aAt, t.bytes.view(), now);
+    let got = b.takeRtp()!;
+    let h = RtpHeader.read(got.view())!;
+    Check.isTrue(h.payloadType == 111 && h.timestamp == 960 && h.ssrc == a.ssrc, "the header")?;
+    Check.isTrue(got.view()[h.payloadStart..h.payloadEnd] == "frame-one".bytes(), "the frame, decrypted")?;
+    let back = b.sendAudio("frame-two".bytes(), 1920)!;
+    a.receive(0, bAt, back.bytes.view(), now);
+    let reply = a.takeRtp()!;
+    let rh = RtpHeader.read(reply.view())!;
+    return Check.isTrue(reply.view()[rh.payloadStart..rh.payloadEnd] == "frame-two".bytes(), "and back");
+}

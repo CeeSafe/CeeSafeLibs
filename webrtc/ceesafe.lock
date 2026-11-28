@@ -1,0 +1,33 @@
+# Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
+
+[[package]]
+name = "dtls"
+source = "path+../dtls"
+
+[[package]]
+name = "ice"
+source = "path+../ice"
+
+[[package]]
+name = "pkey"
+source = "path+../pkey"
+
+[[package]]
+name = "rtp"
+source = "path+../rtp"
+
+[[package]]
+name = "sdp"
+source = "path+../sdp"
+
+[[package]]
+name = "srtp"
+source = "path+../srtp"
+
+[[package]]
+name = "stun"
+source = "path+../stun"
+
+[[package]]
+name = "tls"
+source = "path+../tls"

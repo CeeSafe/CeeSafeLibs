@@ -1,0 +1,340 @@
+// A WebRTC peer for one audio stream (BUNDLE, rtcp-mux), without I/O: ICE (the `ice` package), then DTLS (`dtls`)
+// for the SRTP keys, then SRTP (`srtp`) around RTP (`rtp`), the offer and answer in SDP (`sdp`). The caller owns the
+// UDP sockets: it gives every datagram to `receive` and sends what `poll` gives, every 20 ms or so; it trickles the
+// candidates `takeCandidate` gives and adds the other side's with `addRemoteCandidate`.
+
+import stun;
+import ice;
+import dtls;
+import srtp;
+import sdp;
+import rtp;
+
+/// Where a session is.
+public enum PeerState {
+    /// Waiting for the other side's description, or for ICE.
+    Connecting,
+    /// ICE found a path; DTLS is agreeing the keys.
+    Securing,
+    /// Media flows.
+    Connected,
+    Failed,
+    Closed,
+}
+
+public enum PeerError {
+    Dtls(DtlsError),
+    /// The other side's description has no audio this session can take, no ICE credentials or no fingerprint.
+    Description,
+}
+
+/// The audio codec the MAUI app and browsers use: Opus at 48 kHz, payload type 111.
+public const OPUS: u8 = 111;
+
+@noncopy
+public struct PeerSession {
+    public offerer: bool;
+    public agent: IceAgent;
+    certificate: DtlsCertificate;
+    endpoint: DtlsEndpoint?;
+    /// Whether this side is the DTLS client (`setup:active`).
+    dtlsClient: bool;
+    remoteFingerprint: String;
+    remoteMid: String;
+    remoteProtocol: String;
+    sendContext: SrtpContext?;
+    receiveContext: SrtpContext?;
+    public ssrc: u32;
+    cname: String;
+    builder: RtpBuilder;
+    incoming: Vector<Vector<u8>>;
+    sessionId: u64;
+    started: bool;
+    public state: PeerState;
+
+    /// A session that will make the offer (`offerer`), or answer one.
+    public fn create(offerer: bool, now: u64) -> Result<PeerSession, PeerError> {
+        let certificate = match (DtlsCertificate.generate()) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(PeerError.Dtls(e));
+            },
+        };
+        var seed = [0u8; 12];
+        let _ = Random.fill(mut seed[..]);
+        let ssrc = ((seed[0] as u32) << 24) | ((seed[1] as u32) << 16) | ((seed[2] as u32) << 8) | (seed[3] as u32);
+        var sessionId: u64 = 0;
+        for (k in 4usize..11) {
+            sessionId = (sessionId << 8) | (seed[k] as u64);
+        }
+        var builder = RtpBuilder.create(OPUS, ssrc);
+        builder.sequence = ((seed[8] as u16) << 8) | (seed[9] as u16);
+        builder.timestamp = ((seed[10] as u32) << 8) | (seed[11] as u32);
+        var cname = String.create();
+        let _ = cname.append("ceesafe-");
+        let _ = cname.appendHex(ssrc as u64, 8, false);
+        return Ok(PeerSession {
+            offerer: offerer,
+            agent: IceAgent.create(offerer, now),
+            certificate: certificate,
+            endpoint: null,
+            dtlsClient: !offerer,
+            remoteFingerprint: String.create(),
+            remoteMid: String.create(),
+            remoteProtocol: String.create(),
+            sendContext: null,
+            receiveContext: null,
+            ssrc: ssrc,
+            cname: cname,
+            builder: builder,
+            incoming: Vector<Vector<u8>>.create(),
+            sessionId: sessionId,
+            started: false,
+            state: PeerState.Connecting,
+        });
+    }
+
+    /// The offer: an audio section, Opus, `setup:actpass`.
+    public fn offer(borrow this) -> String => this.description("actpass", "0", "UDP/TLS/RTP/SAVPF").format();
+
+    /// Takes the other side's offer and gives the answer (`setup:active`: this side is the DTLS client, as RFC 8842
+    /// recommends an answerer be).
+    public fn answer(borrow mut this, offer: StringView) -> Result<String, PeerError> {
+        this.remote(offer)?;
+        this.dtlsClient = true;
+        this.startDtls()?;
+        return Ok(this.description("active", this.remoteMid.view(), this.remoteProtocol.view()).format());
+    }
+
+    /// Takes the other side's answer to this side's offer.
+    public fn accept(borrow mut this, answer: StringView) -> Result<void, PeerError> {
+        let setup = this.remote(answer)?;
+        // The answerer chose: active makes it the client, passive this side.
+        this.dtlsClient = setup == "passive";
+        return this.startDtls();
+    }
+
+    /// One of the other side's candidates, trickled (with or without `candidate:`).
+    public fn addRemoteCandidate(borrow mut this, line: StringView) {
+        if (IceCandidate.parse(line) is Some(c)) {
+            this.agent.addRemote(borrow c);
+        }
+    }
+
+    /// A candidate to trickle, as a `candidate:` line.
+    public fn takeCandidate(borrow mut this) -> String? {
+        let c = this.agent.takeCandidate()?;
+        return Some(c.format());
+    }
+
+    /// A datagram that came to `socket` from `from` (RFC 7983's demultiplexing by its first byte).
+    public fn receive(borrow mut this, socket: usize, from: StunAddress, bytes: Slice<u8>, now: u64) {
+        if (bytes.length == 0 || this.agent.receive(socket, from, bytes, now)) {
+            return;
+        }
+        let first = bytes[0];
+        if (first >= 20 && first <= 63) {
+            match (borrow mut this.endpoint) {
+                Some(e) => {
+                    let _ = e.feed(bytes);
+                },
+                null => {},
+            }
+            this.afterDtls();
+        } else if (first >= 128 && first <= 191) {
+            var packet = Vector<u8>.create();
+            if (packet.extend(bytes) is Err(_)) {
+                return;
+            }
+            if (isRtcp(bytes)) {
+                match (borrow mut this.receiveContext) {
+                    Some(c) => {
+                        let _ = c.unprotectRtcp(mut packet);
+                    },
+                    null => {},
+                }
+                return;
+            }
+            var good = false;
+            match (borrow mut this.receiveContext) {
+                Some(c) => {
+                    good = c.unprotect(mut packet);
+                },
+                null => {},
+            }
+            if (good) {
+                let _ = this.incoming.push(packet);
+            }
+        }
+    }
+
+    /// The next datagram to send, if any.
+    public fn poll(borrow mut this, now: u64) -> Transmit? {
+        if (this.agent.poll(now) is Some(t)) {
+            return Some(t);
+        }
+        match (this.agent.state) {
+            IceState.Failed => {
+                this.state = PeerState.Failed;
+                return null;
+            },
+            IceState.Connected => {
+                if (this.state is PeerState.Connecting) {
+                    this.state = PeerState.Securing;
+                }
+            },
+            IceState.Checking => {},
+        }
+        if (!(this.agent.state is IceState.Connected)) {
+            return null;
+        }
+        var datagram: Vector<u8>? = null;
+        match (borrow mut this.endpoint) {
+            Some(e) => {
+                if (!this.started && e.client) {
+                    let _ = e.advance();
+                }
+                e.tick();
+                datagram = e.takeDatagram();
+            },
+            null => {},
+        }
+        this.started = true;
+        let d = datagram?;
+        return this.agent.send(d.view());
+    }
+
+    /// An RTP packet of `payload` (an Opus frame), its timestamp `timestamp` (48 kHz units), protected and routed;
+    /// null until media flows.
+    public fn sendAudio(borrow mut this, payload: Slice<u8>, timestamp: u32) -> Transmit? {
+        if (!(this.state is PeerState.Connected)) {
+            return null;
+        }
+        this.builder.timestamp = timestamp;
+        var packet = this.builder.build(payload);
+        var ok = false;
+        match (borrow mut this.sendContext) {
+            Some(c) => {
+                ok = c.protect(mut packet);
+            },
+            null => {},
+        }
+        if (!ok) {
+            return null;
+        }
+        return this.agent.send(packet.view());
+    }
+
+    /// An RTP packet that came, decrypted (read it with `RtpHeader.read`).
+    public fn takeRtp(borrow mut this) -> Vector<u8>? {
+        if (this.incoming.length == 0) {
+            return null;
+        }
+        return Some(this.incoming.remove(0));
+    }
+
+    /// Ends the session: DTLS's close_notify goes in the next `poll`.
+    public fn close(borrow mut this) {
+        match (borrow mut this.endpoint) {
+            Some(e) => {
+                e.close();
+            },
+            null => {},
+        }
+        this.state = PeerState.Closed;
+    }
+
+    /// The other side's description: its ICE credentials and candidates, its fingerprint, mid and protocol; gives its
+    /// `setup`.
+    fn remote(borrow mut this, text: StringView) -> Result<String, PeerError> {
+        let d = SessionDescription.parse(text) ?? { return Err(PeerError.Description); };
+        for (m in d.media.view()) {
+            if (m.kind.view() != "audio" || m.port == 0 || m.codecNamed("opus") == null) {
+                continue;
+            }
+            if (m.ufrag.length == 0 || m.password.length == 0 || m.fingerprint.length == 0) {
+                return Err(PeerError.Description);
+            }
+            this.agent.setRemoteCredentials(m.ufrag.view(), m.password.view());
+            this.remoteFingerprint.clear();
+            let _ = this.remoteFingerprint.append(m.fingerprint.view());
+            this.remoteMid.clear();
+            let _ = this.remoteMid.append(m.mid.view());
+            this.remoteProtocol.clear();
+            let _ = this.remoteProtocol.append(m.protocol.view());
+            for (c in m.candidates.view()) {
+                this.addRemoteCandidate(c.view());
+            }
+            var setup = String.create();
+            let _ = setup.append(m.setup.view());
+            return Ok(setup);
+        }
+        return Err(PeerError.Description);
+    }
+
+    fn startDtls(borrow mut this) -> Result<void, PeerError> {
+        match (DtlsEndpoint.create(borrow this.certificate, this.dtlsClient)) {
+            Ok(e) => {
+                this.endpoint = Some(e);
+                return Ok();
+            },
+            Err(e) => {
+                return Err(PeerError.Dtls(e));
+            },
+        }
+    }
+
+    /// Once DTLS is done: the peer's fingerprint checked against its description, then the SRTP contexts.
+    fn afterDtls(borrow mut this) {
+        if (!(this.state is PeerState.Securing || this.state is PeerState.Connecting)) {
+            return;
+        }
+        var keys: SrtpKeys? = null;
+        var trusted = false;
+        match (borrow this.endpoint) {
+            Some(e) => {
+                if (!e.connected) {
+                    return;
+                }
+                if (e.peerFingerprint() is Some(f)) {
+                    trusted = sameFingerprint(f.view(), this.remoteFingerprint.view());
+                }
+                keys = e.srtpKeys();
+            },
+            null => {
+                return;
+            },
+        }
+        let k = keys ?? {
+            this.state = PeerState.Failed;
+            return;
+        };
+        if (!trusted) {
+            this.state = PeerState.Failed;
+            return;
+        }
+        this.sendContext = SrtpContext.create(k.localKey[..], k.localSalt[..]);
+        this.receiveContext = SrtpContext.create(k.remoteKey[..], k.remoteSalt[..]);
+        this.state = PeerState.Connected;
+    }
+
+    fn description(borrow this, setup: StringView, mid: StringView, protocol: StringView) -> SessionDescription {
+        var d = SessionDescription.create(this.sessionId);
+        var bundle = String.create();
+        let _ = bundle.append(mid);
+        let _ = d.bundle.push(bundle);
+        var m = MediaSection.create("audio", mid);
+        m.protocol.clear();
+        let _ = m.protocol.append(if (protocol.length > 0) protocol else "UDP/TLS/RTP/SAVPF");
+        m.addCodec(OPUS, "opus", 48000, 2, "minptime=10;useinbandfec=1");
+        let _ = m.ufrag.append(this.agent.localUfrag.view());
+        let _ = m.password.append(this.agent.localPassword.view());
+        let fingerprint = this.certificate.fingerprint();
+        let _ = m.fingerprint.append(fingerprint.view());
+        let _ = m.setup.append(setup);
+        let _ = m.ssrcs.push(this.ssrc);
+        let _ = m.cname.append(this.cname.view());
+        let _ = d.media.push(m);
+        return d;
+    }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "webrtc"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]
+stun = { path = "../stun" }
+ice = { path = "../ice" }
+dtls = { path = "../dtls" }
+srtp = { path = "../srtp" }
+sdp = { path = "../sdp" }
+rtp = { path = "../rtp" }
